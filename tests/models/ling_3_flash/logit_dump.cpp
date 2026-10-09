@@ -1,7 +1,7 @@
 // Logit dump and oracle comparison for Ling-3.0-flash on the GPU.
 //
 //   logit_dump --model FIRST_SHARD.gguf
-//       [--kl-base kl_base.bin]  [--kl-chunks N]
+//       [--kl-base kl_base.bin]  [--kl-chunks N]  [--kl-decode]
 //       [--floor floor.json]
 //       [--greedy greedy.jsonl]  [--greedy-tokens 64]
 //       [--adjudicated greedy_adjudicated.json --text memorised|novel]
@@ -16,6 +16,14 @@
 //   second half of the chunk is scored. Per position the KL against the base
 //   distribution (llama.cpp definition: sum over base log-prob > -16 of
 //   p_base * (log p_base - log p_gufo)), top-1 ids and log-probs are emitted.
+// * --kl-decode: score the decode path instead of bulk prefill. Each chunk is
+//   still evaluated from an empty context, but the tokens are fed one per
+//   forward (the engine's single-token decode family) and the logits of every
+//   position >= the base's first scored position are taken from
+//   Session::Logits(). The report key `kl` gets "mode": "decode" (else
+//   "prefill"). Report-only: the exit status is non-zero only for non-finite
+//   logits or a short base read, not for the KL gates. Put it after other
+//   options or write --kl-decode=1 (a following non-option word is its value).
 // * --floor: JSON {"kl_mean", "top1_agreement"} of llama.cpp Vulkan against the
 //   same base. The KL gate becomes relative to it: kl_mean <= floor.kl_mean and
 //   top1 >= floor.top1_agreement (instead of the absolute 0.01 / 0.98).
@@ -367,6 +375,7 @@ bool RunKl(const Args& args, Report& report, l3::Model& model, KlBase& base) {
     report.Set("kl_error", error);
     return false;
   }
+  const bool decode = args.Has("--kl-decode");
   const std::int32_t chunks = std::min<std::int32_t>(
       base.n_chunk, static_cast<std::int32_t>(args.Num(
                         "--kl-chunks", static_cast<double>(base.n_chunk))));
@@ -380,9 +389,24 @@ bool RunKl(const Args& args, Report& report, l3::Model& model, KlBase& base) {
         base.tokens.data() +
             std::size_t{base.n_ctx} * static_cast<std::size_t>(c),
         base.n_ctx);
-    if (!session->Feed(tokens,
-                       {.logits_from = base.first, .all_logits = &logits},
-                       &error)) {
+    bool fed = true;
+    if (decode) {
+      // One token per forward; keep the logits of the scored positions.
+      logits.clear();
+      logits.reserve(std::size_t{base.rows_per_chunk} * l3::kVocab);
+      for (std::uint32_t i = 0; fed && i < base.first + base.rows_per_chunk;
+           ++i) {
+        fed = session->Feed(tokens.subspan(i, 1), {}, &error);
+        if (fed && i >= base.first) {
+          const auto last = session->Logits();
+          logits.insert(logits.end(), last.begin(), last.end());
+        }
+      }
+    } else {
+      fed = session->Feed(
+          tokens, {.logits_from = base.first, .all_logits = &logits}, &error);
+    }
+    if (!fed) {
       std::fprintf(stderr, "kl chunk %d failed: %s\n", c, error.c_str());
       report.Set("kl_error", "chunk " + std::to_string(c) + ": " + error);
       report.Set("kl", KlSummary(rows, c, base, gate));
@@ -441,6 +465,7 @@ bool RunKl(const Args& args, Report& report, l3::Model& model, KlBase& base) {
     row.push_back(Round(r.nll_base));
     table.push_back(std::move(row));
   }
+  summary["mode"] = decode ? "decode" : "prefill";
   summary["row_columns"] =
       "chunk,pos,top1_gufo,top1_oracle,kl,gufo_logprob_of_oracle_top1,nll_gufo,"
       "nll_oracle";
@@ -453,8 +478,9 @@ bool RunKl(const Args& args, Report& report, l3::Model& model, KlBase& base) {
     kl_sum += r.kl;
     same += r.top1_test == r.top1_base ? 1 : 0;
   }
-  return chunks != base.n_chunk || (kl_sum / n <= gate.kl_mean &&
-                                    static_cast<double>(same) / n >= gate.top1);
+  return decode || chunks != base.n_chunk ||
+         (kl_sum / n <= gate.kl_mean &&
+          static_cast<double>(same) / n >= gate.top1);
 }
 
 // ---- greedy ----------------------------------------------------------------
