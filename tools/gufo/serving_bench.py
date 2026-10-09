@@ -1156,6 +1156,7 @@ def run_corpus_benchmark(
     prefill_first: bool = False,
     pin_slots: bool = False,
     preparation_tokens: int = 1,
+    replay_tokens: int = 4,
 ) -> dict[str, Any]:
     if not model:
         raise ValueError("model must not be empty")
@@ -1255,8 +1256,10 @@ def run_corpus_benchmark(
                     for sample in rounds[-1].samples:
                         # llama.cpp's recurrent checkpoints end four tokens
                         # before the prompt frontier (server-context.cpp,
-                        # checkpoint_offsets). Reject longer prompt replays.
-                        if sample.cached_prompt_tokens < sample.prompt_tokens - 4 or sample.prefill_tokens > 4:
+                        # checkpoint_offsets); a model's stable chat prefix may
+                        # end earlier (replay_tokens). Reject longer replays.
+                        if (sample.cached_prompt_tokens < sample.prompt_tokens - replay_tokens
+                                or sample.prefill_tokens > replay_tokens):
                             raise RuntimeError(
                                 f"C={concurrency}: prepared session was not reused "
                                 f"(cached={sample.cached_prompt_tokens}, "
@@ -1331,6 +1334,7 @@ def run_corpus_benchmark(
             "endpointProfile": endpoint_profile,
             "cachePrompt": cache_prompt,
             "prefillFirst": prefill_first,
+            "replayTokens": replay_tokens,
             "pinnedReferenceSlots": pin_slots,
         },
         "notes": list(notes or []),
@@ -1420,20 +1424,28 @@ def load_fingerprint(path: Path | None, strix_binary: Path) -> dict[str, Any]:
 
 
 def source_identity(root: Path) -> tuple[str, bool]:
-    revision = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # A source copy without a repository (a container image) names its
+        # revision in the environment.
+        revision = os.environ.get("GUFO_SOURCE_REVISION", "")
+        if not revision:
+            raise
+        return revision, os.environ.get("GUFO_SOURCE_DIRTY", "0") == "1"
     return revision, bool(status.strip())
 
 
