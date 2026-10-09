@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .artifacts import artifact_path, load_artifact
-from .config import BenchConfig, TableSpec
+from .config import BenchConfig, TableSpec, table_id
 
 TODO = "TODO"
 NA = "N/A"  # unavailable comparison (see artifacts/unavailable.json)
@@ -227,13 +227,15 @@ def _row_values(config: BenchConfig, table: TableSpec) -> dict[str, dict[str, st
                 )
         return values
     if kind == "multi":
+        aggregate = table.spec.get("rate") == "aggregate"
         modes = table.spec.get("modes", ["ar"])
         if len(modes) == 1:
             mode = modes[0]
             gufo = load_artifact(artifact_path(config, table, "gufo", mode))
             reference = load_artifact(artifact_path(config, table, "reference", None if mode == "ar" else mode))
             for users in table.spec["concurrency"]:
-                g, r = _serving_rate(gufo, users), _serving_rate(reference, users)
+                g = _serving_rate(gufo, users, aggregate=aggregate)
+                r = _serving_rate(reference, users, aggregate=aggregate)
                 values[str(users)] = {
                     "gufo": None if g is None else _fmt(g),
                     "reference": None if r is None else _fmt(r),
@@ -246,7 +248,7 @@ def _row_values(config: BenchConfig, table: TableSpec) -> dict[str, dict[str, st
         reference = load_artifact(artifact_path(config, table, "reference"))
         ref_spec = load_artifact(artifact_path(config, table, "reference", mode))
         def rate(report: dict[str, Any] | None, users: int) -> str | None:
-            value = _serving_rate(report, users)
+            value = _serving_rate(report, users, aggregate=aggregate)
             return None if value is None else _fmt(value)
 
         for users in table.spec["concurrency"]:
@@ -263,7 +265,7 @@ def _row_values(config: BenchConfig, table: TableSpec) -> dict[str, dict[str, st
 
     gufo = load_artifact(artifact_path(config, table, "gufo"))
     if kind == "single" and table.speculative and not config.reference_speculative:
-        ar_table = config.table("single-ar" + (f"-{table.variant}" if table.variant else ""))
+        ar_table = config.table(table_id("single-ar", table.variant))
         reference = load_artifact(artifact_path(config, ar_table, "reference"))
     else:
         reference = load_artifact(artifact_path(config, table, "reference"))
@@ -297,13 +299,23 @@ def _row_values(config: BenchConfig, table: TableSpec) -> dict[str, dict[str, st
     return values
 
 
-def _serving_rate(report: dict[str, Any] | None, users: int) -> float | None:
-    """Mean of the summed individual decode rates in each measured cohort."""
+def _serving_rate(report: dict[str, Any] | None, users: int, *, aggregate: bool = False) -> float | None:
+    """Mean of the summed individual decode rates in each measured cohort.
+
+    With `aggregate` (table spec `"rate": "aggregate"`) the cohort wall-clock
+    rate is returned instead: completion tokens divided by the measured round
+    spans. An engine that schedules one session per forward reports each
+    request's decode time from its own steps only, so the sum of those rates
+    overstates its throughput; the aggregate counts the real elapsed time.
+    """
     if report is None:
         return None
     result = report.get("results", {}).get(f"c{users}")
     if result is None or "unavailable" in result:
         return None
+    if aggregate:
+        value = result.get("aggregate", {}).get("output_tokens_per_second", {}).get("overall")
+        return float(value) if isinstance(value, (int, float)) and math.isfinite(value) else None
     rounds = result.get("rounds", [])
     samples = result.get("samples", [])
     if not rounds or not samples:
