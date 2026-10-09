@@ -29,6 +29,13 @@ numpy`). Commands:
     kl_base.py compare BASE --logits-dir DIR [--table] [--json OUT]
     kl_base.py compare BASE --logits FILE.f32 --positions 256,257,...
     kl_base.py compare-bases BASE TEST_BASE [--table] [--json OUT]
+    kl_base.py write-base OUT --n-ctx N --logits-dir DIR [--logits-dir DIR2 ...]
+
+`write-base` turns reference_probe dumps into a base file, one chunk per
+DIR (its first n_ctx tokens; logits at in-chunk positions n_ctx/2 .. n_ctx-2
+are required), with llama-perplexity's writer (`log_softmax()` in
+perplexity.cpp). llama-perplexity `--kl-divergence` and logit_dump
+`--kl-base` then score llama.cpp and Gufo against the float32 reference.
 
 `DIR` is a reference_probe dump (index.json + logits.f32) produced with
 `--chunk <n_ctx> --logits-from-pos <n_ctx/2>` on the tokens of BASE.
@@ -308,6 +315,57 @@ def synth_selftest(n_vocab=4096, n_rows=64, seed=1):
     return out
 
 
+def quantise_row(x):
+    """llama-perplexity's `log_softmax(n_vocab, logits, uint16_t*, tok)` row:
+    the 4-value float32 head (scale, min_log_prob) and uint16 codes."""
+    x = np.asarray(x, dtype=F32)
+    mx, mn = x.max(), x.min()
+    mn = max(mn, F32(mx - F32(16)))
+    lse = F32(np.log(float(np.exp(x - mx).astype(np.float64).sum())))
+    min_lp = F32(mn - mx - lse)
+    scale = F32((mx - mn) / F32(65535.0))
+    nv = 2 * ((x.size + 1) // 2) + 4
+    row = np.zeros(nv, dtype="<u2")
+    row[:4] = np.array([scale, min_lp], dtype="<f4").view("<u2")
+    if scale:
+        inv = F32(1) / scale
+        codes = np.where(x > mn, np.rint(inv * (x - mn)), 0)
+        row[4 : 4 + x.size] = codes.astype(np.uint16)
+    return row
+
+
+def write_base(out, n_ctx, dirs):
+    """One chunk per reference dump directory; returns the written geometry."""
+    first = n_ctx // 2
+    chunks = []
+    n_vocab = None
+    for d in dirs:
+        with open(f"{d}/index.json") as f:
+            idx = json.load(f)
+        entry = next(e for e in idx["entries"] if e["name"] == "logits")
+        tokens = [int(t) for t in idx["tokens"]]
+        if len(tokens) < n_ctx:
+            raise ValueError(f"{d}: {len(tokens)} tokens < n_ctx {n_ctx}")
+        n_vocab = entry["shape"][1] if n_vocab is None else n_vocab
+        data = np.memmap(f"{d}/{entry['file']}", dtype="<f4", mode="r",
+                         shape=(len(entry["positions"]), entry["shape"][1]))
+        where = {int(p): k for k, p in enumerate(entry["positions"])}
+        missing = [p for p in range(first, n_ctx - 1) if p not in where]
+        if missing:
+            raise ValueError(f"{d}: no logits for positions {missing[:4]}...")
+        chunks.append((tokens[:n_ctx], data, where))
+    with open(out, "wb") as f:
+        f.write(MAGIC)
+        f.write(np.array([n_ctx], dtype="<u4").tobytes())
+        f.write(np.array([n_vocab, len(chunks)], dtype="<i4").tobytes())
+        for tokens, _, _ in chunks:
+            f.write(np.array(tokens, dtype="<i4").tobytes())
+        for _, data, where in chunks:
+            for p in range(first, n_ctx - 1):
+                f.write(quantise_row(data[where[p]]).tobytes())
+    return {"n_ctx": n_ctx, "n_vocab": n_vocab, "n_chunk": len(chunks)}
+
+
 def load_logits(args):
     if args.logits_dir:
         with open(f"{args.logits_dir}/index.json") as f:
@@ -336,6 +394,10 @@ def main():
     p.add_argument("test_base")
     p.add_argument("--table", action="store_true", help="per-position table")
     p.add_argument("--json", help="write summary and rows as JSON")
+    p = sub.add_parser("write-base")
+    p.add_argument("base", help="output file")
+    p.add_argument("--n-ctx", type=int, required=True)
+    p.add_argument("--logits-dir", action="append", required=True)
     p = sub.add_parser("compare")
     p.add_argument("base")
     p.add_argument("--logits-dir")
@@ -344,6 +406,14 @@ def main():
     p.add_argument("--table", action="store_true", help="per-position table")
     p.add_argument("--json", help="write summary and rows as JSON")
     args = ap.parse_args()
+
+    if args.cmd == "write-base":
+        geometry = write_base(args.base, args.n_ctx, args.logits_dir)
+        base = KlBase(args.base)
+        for d in args.logits_dir:
+            print(f"{d}: n_ctx={geometry['n_ctx']}", end=" ")
+        print(f"-> {args.base}: {geometry} rows/chunk {base.rows_per_chunk}")
+        return 0
 
     base = KlBase(args.base)
     if args.cmd == "info":
