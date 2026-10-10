@@ -7,6 +7,7 @@ import datetime as dt
 import functools
 import hashlib
 import json
+import os
 import struct
 import zlib
 import random
@@ -37,7 +38,9 @@ print = functools.partial(print, flush=True)  # progress must reach redirected l
 
 MODEL_ALIAS = "bench"
 CLIENT_ID = "model-bench"
-REQUEST_TIMEOUT = 3600.0
+# One request may fill a deep context on a slow reference engine (llama.cpp
+# q8_0 needs about an hour for 196k tokens on gfx1151); override per run.
+REQUEST_TIMEOUT = float(os.environ.get("GUFO_MODEL_BENCH_REQUEST_TIMEOUT", "3600"))
 
 WORDS = (
     "the river bends past a quiet town where old mills once ground wheat for "
