@@ -253,9 +253,11 @@ add_library(gufo_http STATIC
   src/cli/serve/asr_websocket.cpp
   src/cli/serve/tts_websocket.cpp
   src/cli/serve/openai_chat.cpp
-  # The DeepSeek tool-call scanner lives with its model; its renderer stays in
-  # the engine library, so no translation unit is linked twice.
+  # The DeepSeek and Bailing tool-call scanners live with their models; their
+  # renderers stay in the engine libraries, so no translation unit is linked
+  # twice.
   src/models/deepseek_v4_flash/tool_calls.cpp
+  src/models/ling_3_flash/tool_calls.cpp
 )
 target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21)
 
@@ -438,11 +440,22 @@ if (BUILD_TESTING)
     src/cli/serve/openai_chat.cpp
     src/models/deepseek_v4_flash/chat_template.cpp
     src/models/deepseek_v4_flash/tool_calls.cpp
+    src/models/ling_3_flash/chat_template.cpp
+    src/models/ling_3_flash/tool_calls.cpp
   )
   target_link_libraries(openai_chat_test PRIVATE gufo_core)
   add_test(NAME openai_chat_test COMMAND openai_chat_test)
   set_tests_properties(openai_chat_test PROPERTIES
     LABELS "cpu;server;api;openai;streaming;tools")
+
+  add_executable(bailing_tool_calls_test
+    tests/cli/bailing_tool_calls_test.cpp
+    src/models/ling_3_flash/tool_calls.cpp
+  )
+  target_link_libraries(bailing_tool_calls_test PRIVATE gufo_core)
+  add_test(NAME bailing_tool_calls_test COMMAND bailing_tool_calls_test)
+  set_tests_properties(bailing_tool_calls_test PROPERTIES
+    LABELS "cpu;server;api;tools;ling")
 
   add_executable(quote_tracker_test tests/cli/quote_tracker_test.cpp)
   target_link_libraries(quote_tracker_test PRIVATE gufo_core)

@@ -294,6 +294,10 @@ public:
       const {
     return sampling::JsonConstraint::ToolFormat::kJson;
   }
+  [[nodiscard]] virtual TextGenerationBackend::ToolCallSyntax ToolSyntax()
+      const {
+    return TextGenerationBackend::ToolCallSyntax::kDefault;
+  }
   /// Reuse a compiled grammar bound to this runner's vocabulary.
   [[nodiscard]] std::shared_ptr<const sampling::TokenConstraint> BindConstraint(
       std::shared_ptr<const sampling::JsonConstraint> grammar) const;

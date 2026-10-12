@@ -8,7 +8,12 @@
 
 namespace gufo::sampling {
 
-enum class TextModelPreset { kUnspecified, kQwen38, kDeepSeekV4Flash };
+enum class TextModelPreset {
+  kUnspecified,
+  kQwen38,
+  kDeepSeekV4Flash,
+  kLing3Flash,
+};
 
 // Presence is independent of value: an explicit zero must override a preset.
 struct SamplingOverrides {
@@ -31,6 +36,8 @@ struct SamplingOverrides {
 inline TextModelPreset TextPreset(const core::ModelConfig& config) {
   if (config.architecture == "deepseek4")
     return TextModelPreset::kDeepSeekV4Flash;
+  if (config.architecture == "bailingmoe3")
+    return TextModelPreset::kLing3Flash;
   if (config.architecture == "qwen4exp" ||
       (config.num_layers == 64 && config.hidden_size == 5120 &&
        config.vocab_size == 248320))
@@ -49,6 +56,15 @@ inline SamplingConfig ResolveTextSampling(TextModelPreset model,
   result.constraint = configured.constraint;
   result.temperature = 1.0F;
   result.top_p = 0.95F;
+  if (model == TextModelPreset::kLing3Flash) {
+    // inclusionAI/Ling-3.0-flash README (Model Card): line 49 "default
+    // parameters for Ling-3.0-flash are ... `temperature=0.6, top_p=0.95,
+    // top_k=20`", repeated at lines 104 and 160 as the recommended values.
+    // Thinking on or off use the same values.
+    result.temperature = 0.6F;
+    result.top_p = 0.95F;
+    result.top_k = 20;
+  }
   if (model == TextModelPreset::kQwen38) {
     result.top_k = 20;
     if (!thinking.value_or(true)) {
