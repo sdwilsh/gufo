@@ -29,4 +29,7 @@ if (ENGINE_ENABLE_HIP)
   # --- WS4a: kda ---
   add_ling_3_flash_test(kda_ops gufo_ling_3_flash "hip;gpu;gfx1151")
   # --- end WS4a ---
+  # --- mla (WS4b) ---
+  add_ling_3_flash_test(mla_ops gufo_ling_3_flash "hip;gpu;gfx1151")
+  # --- end mla ---
 endif()

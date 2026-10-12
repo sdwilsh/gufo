@@ -16,6 +16,9 @@ if (ENGINE_ENABLE_HIP)
   # --- WS4a: kda ---
   list(APPEND LING_HIP_SOURCES ${LING_ROCM_DIR}/kda.hip.cpp)
   # --- end WS4a ---
+  # --- mla (WS4b) ---
+  list(APPEND LING_HIP_SOURCES ${LING_ROCM_DIR}/mla.hip.cpp)
+  # --- end mla ---
   if (LING_HIP_SOURCES)
     target_sources(gufo_ling_3_flash PRIVATE ${LING_HIP_SOURCES})
     set_source_files_properties(${LING_HIP_SOURCES} PROPERTIES LANGUAGE HIP)
