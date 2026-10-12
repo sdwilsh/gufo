@@ -2,11 +2,13 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <iterator>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
@@ -42,7 +44,8 @@ std::string Spell(std::string_view bytes) {
 
 /// Byte tokens 0..255 (ids 0..255 in byte order), then merged tokens, then
 /// specials. Merge order decides the outcome below.
-std::unique_ptr<ling::LingTokenizer> Synthetic() {
+std::unique_ptr<ling::LingTokenizer> Synthetic(
+    const std::vector<std::pair<std::string, std::int32_t>>& more = {}) {
   std::vector<std::string> tokens;
   std::vector<std::int32_t> types;
   // Spelling table identical to GPT-2's.
@@ -73,6 +76,10 @@ std::unique_ptr<ling::LingTokenizer> Synthetic() {
   types[tokens.size() - 3] = 3;  // <|a|>
   types[tokens.size() - 2] = 3;  // <|a|><|b|> (longer: wins by length)
   types[tokens.size() - 1] = 4;  // <|b|>
+  for (const auto& [spelling, type] : more) {
+    tokens.push_back(spelling);
+    types.push_back(type);
+  }
   const std::vector<std::string> merges = {
       "h e", "he l", "hel l", "hell o", sp + " w", sp + "w o", "x y", "xy z"};
   std::string err;
@@ -137,6 +144,32 @@ void TestSynthetic() {
   Expect(ling::LingTokenizer::Utf8CompletePrefix("abc") == 3, "ascii complete");
 }
 
+/// Two tokens may spell the same special. The first in vocabulary order that
+/// is allowed to match wins, so a control token ahead of a user-defined one
+/// is literal text without parse_special and the user-defined one still
+/// matches.
+void TestDuplicateSpecials() {
+  const auto t =
+      Synthetic({{"<|d|>", 3}, {"<|d|>", 4}, {"<|e|>", 4}, {"<|e|>", 3}});
+  if (t == nullptr) {
+    return;
+  }
+  const auto base = static_cast<ling::TokenId>(256 + 10);
+  Expect(t->Encode("x<|d|>y", true) ==
+             (std::vector<ling::TokenId>{t->FindToken("x"), base,
+                                         t->FindToken("y")}),
+         "duplicate special: first id when both may match");
+  Expect(t->Encode("x<|d|>y", false) ==
+             (std::vector<ling::TokenId>{t->FindToken("x"), base + 1,
+                                         t->FindToken("y")}),
+         "duplicate special: the user-defined id matches without "
+         "parse_special");
+  Expect(t->Encode("<|e|>", true) == std::vector<ling::TokenId>{base + 2},
+         "duplicate special: user-defined first");
+  Expect(t->Encode("<|e|>", false) == std::vector<ling::TokenId>{base + 2},
+         "duplicate special: user-defined first, no parse_special");
+}
+
 int TestGolden() {
 #if defined(GUFO_LING_VOCAB_GGUF) && defined(GUFO_LING_TOKENIZER_GOLDENS)
   std::string path = GUFO_LING_VOCAB_GGUF;
@@ -196,10 +229,226 @@ int TestGolden() {
   return 0;
 }
 
+/// Deterministic generator of tokenizer inputs: words, digits, punctuation,
+/// whitespace runs, multi-byte and invalid UTF-8, special tokens and chat
+/// markup, with repeated stretches so the fragment cache is hit.
+struct Corpus {
+  struct Case {
+    std::string text;
+    std::vector<ling::LingTokenizer::LiteralRange> literal;
+    bool parse_special;
+  };
+
+  std::uint64_t state = 0x2545F4914F6CDD1DULL;
+  std::uint64_t Next() {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    return state;
+  }
+  std::size_t Below(std::size_t n) {
+    return static_cast<std::size_t>(Next() % n);
+  }
+
+  std::string Piece() {
+    static const char* const kPieces[] = {"the",
+                                          "quick",
+                                          "Brown",
+                                          "fox's",
+                                          "I'll",
+                                          "we're",
+                                          "x",
+                                          "1",
+                                          "2026",
+                                          "3.14159",
+                                          " ",
+                                          "  ",
+                                          "\t",
+                                          "\n",
+                                          "\r\n",
+                                          "\n\n\n",
+                                          "   \n  ",
+                                          "\xC2\xA0",
+                                          "\xE2\x80\xA8",
+                                          "caf\xC3\xA9",
+                                          "\xE4\xBD\xA0\xE5\xA5\xBD",
+                                          "\xF0\x9F\x98\x80",
+                                          "e\xCC\x81",
+                                          "\xFF",
+                                          "\xC3",
+                                          "\xE2\x82",
+                                          "\x01",
+                                          "{\"a\": [1, 2, {\"b\": null}]}",
+                                          "if (x) { return y; }",
+                                          "a_b-c",
+                                          "...",
+                                          "!?",
+                                          "<|role_end|>",
+                                          "<role>HUMAN</role>",
+                                          "<role>ASSISTANT</role>",
+                                          "<think>",
+                                          "</think>",
+                                          "<tool_call>",
+                                          "</tool_call>",
+                                          "<|a|>",
+                                          "<",
+                                          "</",
+                                          "<role",
+                                          "<|",
+                                          "|>",
+                                          "'",
+                                          "'s",
+                                          "'LL",
+                                          "\\n",
+                                          "    ",
+                                          "def f():",
+                                          "https://example.com/a/b?c=d#e",
+                                          "0x7fffdeadbeef",
+                                          "\xE2\x80\x94"};
+    return kPieces[Below(std::size(kPieces))];
+  }
+
+  std::string Text(std::size_t pieces) {
+    std::string out;
+    for (std::size_t i = 0; i < pieces; ++i) {
+      out += Piece();
+      if (Below(3) != 0) {
+        out += Piece();
+      }
+    }
+    return out;
+  }
+
+  std::vector<Case> Cases(std::size_t count) {
+    std::vector<std::string> shared;  // recurring "messages"
+    for (int i = 0; i < 12; ++i) {
+      shared.push_back(Text(40 + Below(400)));
+    }
+    std::vector<Case> cases;
+    for (std::size_t i = 0; i < count; ++i) {
+      Case c;
+      c.parse_special = Below(5) != 0;
+      const std::size_t parts = 1 + Below(6);
+      for (std::size_t p = 0; p < parts; ++p) {
+        const auto before = c.text.size();
+        const bool markup = Below(3) == 0;
+        if (markup) {
+          c.text += Below(2) == 0 ? "<role>SYSTEM</role>" : "<|role_end|>\n";
+        } else if (Below(2) == 0) {
+          c.text += shared[Below(shared.size())];
+          if (Below(2) == 0) {
+            c.literal.emplace_back(before, c.text.size());
+          }
+        } else {
+          c.text += Text(1 + Below(30));
+          if (Below(3) == 0) {
+            c.literal.emplace_back(before, c.text.size());
+          }
+        }
+      }
+      cases.push_back(std::move(c));
+    }
+    return cases;
+  }
+};
+
+std::uint64_t Fnv(std::uint64_t h, std::uint64_t v) {
+  for (int i = 0; i < 4; ++i) {
+    h = (h ^ ((v >> (8 * i)) & 0xFF)) * 0x100000001B3ULL;
+  }
+  return h;
+}
+
+std::uint64_t Digest(const std::vector<ling::TokenId>& ids, std::uint64_t h) {
+  h = Fnv(h, ids.size());
+  for (const auto id : ids) {
+    h = Fnv(h, id);
+  }
+  return h;
+}
+
+/// Pinned token digest of the generated corpus, computed without the fragment
+/// cache (every fragment run through EncodeText). The cache may not change a
+/// single id.
+constexpr std::uint64_t kCorpusDigest = 0x4bae1143b8928b8eULL;
+
+void TestFragmentCache() {
+#if defined(GUFO_LING_VOCAB_GGUF)
+  std::string err;
+  const auto reader =
+      gufo::core::GgufReader::OpenFile(GUFO_LING_VOCAB_GGUF, &err);
+  if (reader == nullptr) {
+    return;
+  }
+  const auto make = [&] {
+    return ling::LingTokenizer::CreateFromGguf(*reader, &err);
+  };
+  const auto warm = make();
+  const auto uncached = make();
+  if (warm == nullptr || uncached == nullptr) {
+    return;
+  }
+  uncached->SetFragmentCacheBudget(0);  // every fragment is tokenized afresh
+  Corpus corpus;
+  const auto cases = corpus.Cases(1500);
+  std::size_t large = 0;
+  std::vector<std::vector<ling::TokenId>> want;  // from the uncached tokenizer
+  std::uint64_t digest = 0xCBF29CE484222325ULL;
+  for (const auto& c : cases) {
+    large += c.text.size() >= 256;
+    const auto cold = uncached->Encode(c.text, c.parse_special, c.literal);
+    want.push_back(cold);
+    digest = Digest(cold, digest);
+    Expect(warm->Encode(c.text, c.parse_special, c.literal) == cold,
+           "cached encode equals uncached");
+    Expect(warm->Encode(c.text, c.parse_special, c.literal) == cold,
+           "repeated cached encode equals uncached");
+    // Lossless whatever the cache did.
+    Expect(warm->Decode(cold) == c.text, "decode round trip");
+  }
+  Expect(large > 200, "corpus has many cacheable fragments");
+  if (std::getenv("GUFO_PRINT_DIGEST") != nullptr) {
+    std::cout << "corpus digest 0x" << std::hex << digest << std::dec << '\n';
+  }
+  Expect(digest == kCorpusDigest,
+         "token digest equals the pre-cache tokenizer");
+
+  // Evicting and concurrent use: same ids, no crashes or torn entries.
+  const auto shared = make();
+  shared->SetFragmentCacheBudget(200000);
+  std::vector<std::thread> threads;
+  std::vector<int> bad(6, 0);
+  for (std::size_t t = 0; t < bad.size(); ++t) {
+    threads.emplace_back([&, t] {
+      for (std::size_t round = 0; round < 3; ++round) {
+        for (std::size_t i = t; i < cases.size(); i += 1 + t % 3) {
+          const auto& c = cases[i];
+          bad[t] +=
+              shared->Encode(c.text, c.parse_special, c.literal) != want[i];
+        }
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  for (const int b : bad) {
+    Expect(b == 0, "concurrent encodes with eviction equal uncached encodes");
+  }
+  shared->SetFragmentCacheBudget(0);
+  const auto& first = cases.front();
+  Expect(shared->Encode(first.text, first.parse_special, first.literal) ==
+             want.front(),
+         "a zero budget caches nothing and changes nothing");
+#endif
+}
+
 }  // namespace
 
 int main() {
   TestSynthetic();
+  TestDuplicateSpecials();
+  TestFragmentCache();
   const int golden = TestGolden();
   if (failures != 0) {
     return 1;

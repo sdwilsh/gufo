@@ -39,10 +39,14 @@ enum class TokenType : std::int32_t {
 
 /// Byte-level BPE tokenizer for the GGUF `gpt2` model with the `bailingmoe2`
 /// pre-tokenizer (llama.cpp's greedy regex, evaluated with ICU). Mirrors
-/// llama.cpp b11146: every control, user-defined and unknown token found in
-/// the text becomes one token (control/unknown only with parse_special)
-/// (longest text first, as llama.cpp partitions it); the rest is pre-split,
-/// then merged by rank.
+/// llama.cpp b11146. Every user-defined token found in the text becomes one
+/// token, and so does every control or unknown token when parse_special is
+/// set. Specials match longest text first, as llama.cpp partitions it. The
+/// rest is pre-split, then merged by rank. The text between special tokens
+/// tokenizes independently of its surroundings, so Encode remembers the tokens
+/// of large fragments by their exact bytes. A conversation that is rendered and
+/// tokenized again (the next turn, or a shorter variant of the same prompt)
+/// only tokenizes what changed. Encode is safe to call concurrently.
 class LingTokenizer {
 public:
   ~LingTokenizer();
@@ -71,6 +75,10 @@ public:
   [[nodiscard]] std::vector<TokenId> Encode(
       std::string_view text, bool parse_special = true,
       std::span<const LiteralRange> literal_ranges = {}) const;
+
+  /// Bounds the memory (keys plus tokens, default 64 MiB) of the remembered
+  /// fragments and drops what no longer fits. Tests use it to force eviction.
+  void SetFragmentCacheBudget(std::size_t bytes);
 
   /// Concatenated bytes of the tokens. Control tokens render as their text
   /// when `render_special`, otherwise as nothing. The result may end in a
@@ -112,6 +120,12 @@ private:
 
   void MergePiece(std::string_view piece, std::vector<TokenId>& out) const;
   void EncodeText(std::string_view text, std::vector<TokenId>& out) const;
+  /// Which specials_ occur anywhere in `text` (overlaps included).
+  [[nodiscard]] std::vector<bool> SpecialsPresent(std::string_view text) const;
+  /// EncodeText through the fragment cache.
+  void EncodeFragment(std::string_view text, std::vector<TokenId>& out) const;
+
+  class FragmentCache;
 
   std::vector<std::string> id_to_token_;  // vocabulary spelling
   std::vector<std::string> id_to_bytes_;  // byte-decoded
@@ -123,12 +137,23 @@ private:
   std::unordered_map<std::pair<TokenId, TokenId>, Merge, PairHash> merges_;
   /// Specials, longest text first (llama.cpp's cache_special_tokens order).
   std::vector<std::pair<std::string, TokenId>> specials_;
+  /// Prefix tree over the specials' spellings (nodes index into each other;
+  /// the root is node 0), to find which of them occur in a text in one scan.
+  struct SpecialNode {
+    std::vector<std::pair<std::uint8_t, std::uint32_t>> next;  // by byte
+    std::vector<std::int32_t> specials;  // indices into specials_ ending here
+  };
+  std::vector<SpecialNode> special_tree_;
+  bool special_first_[256] = {};
   TokenId byte_token_[256];
   TokenId bos_{kInvalidTokenId};
   TokenId eos_{kInvalidTokenId};
   TokenId pad_{kInvalidTokenId};
   bool add_bos_{false};
   std::unique_ptr<icu::RegexPattern> pattern_;
+  /// Memo of EncodeText for recurring text between special tokens; see
+  /// EncodeFragment. Internally synchronized.
+  std::unique_ptr<FragmentCache> fragments_;
 };
 
 }  // namespace gufo::models::ling_3_flash

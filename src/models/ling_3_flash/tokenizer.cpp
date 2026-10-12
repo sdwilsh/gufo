@@ -6,8 +6,12 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <functional>
+#include <iterator>
 #include <limits>
+#include <list>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <queue>
 #include <stdexcept>
@@ -163,7 +167,98 @@ Utf16Text ToUtf16(std::string_view s) {
 
 }  // namespace
 
-LingTokenizer::LingTokenizer() {
+/// Byte-exact memo of EncodeText results, least recently used first out. The
+/// tokens of a fragment depend on its bytes alone (the pre-tokenizer and the
+/// merges are immutable), so a hit returns precisely what EncodeText would
+/// compute; keys are compared in full, never by hash alone.
+class LingTokenizer::FragmentCache {
+public:
+  /// Shorter fragments cost less to tokenize than to look up.
+  static constexpr std::size_t kMinBytes = 256;
+  /// Keys plus tokens kept (about 2.5 MB per 100k-token conversation).
+  static constexpr std::size_t kDefaultBudgetBytes = std::size_t{64} << 20;
+
+  using Tokens = std::shared_ptr<const std::vector<TokenId>>;
+
+  [[nodiscard]] static std::size_t Hash(std::string_view text) noexcept {
+    return std::hash<std::string_view>{}(text);
+  }
+
+  [[nodiscard]] Tokens Find(std::string_view text, std::size_t hash) {
+    const std::lock_guard lock(mutex_);
+    for (auto [it, end] = index_.equal_range(hash); it != end; ++it) {
+      if (it->second->key == text) {
+        entries_.splice(entries_.begin(), entries_, it->second);
+        return it->second->tokens;
+      }
+    }
+    return nullptr;
+  }
+
+  void SetBudget(std::size_t bytes) {
+    const std::lock_guard lock(mutex_);
+    budget_ = bytes;
+    Trim();
+  }
+
+  void Insert(std::string_view text, std::size_t hash, Tokens tokens) {
+    const std::size_t cost = Cost(text, *tokens);
+    const std::lock_guard lock(mutex_);
+    if (cost > budget_ / 4) {
+      return;
+    }
+    for (auto [it, end] = index_.equal_range(hash); it != end; ++it) {
+      if (it->second->key == text) {
+        return;  // another request computed it first
+      }
+    }
+    entries_.push_front({std::string(text), hash, std::move(tokens), cost});
+    try {
+      index_.emplace(hash, entries_.begin());
+    } catch (...) {
+      entries_.pop_front();  // never keep an entry the index cannot find
+      throw;
+    }
+    bytes_ += cost;
+    Trim();
+  }
+
+private:
+  /// Drops least recently used entries until the budget holds. Locked.
+  void Trim() {
+    while (bytes_ > budget_ && !entries_.empty()) {
+      const auto last = std::prev(entries_.end());
+      for (auto [it, end] = index_.equal_range(last->hash); it != end; ++it) {
+        if (it->second == last) {
+          index_.erase(it);
+          bytes_ -= std::min(bytes_, last->cost);
+          break;
+        }
+      }
+      entries_.erase(last);
+    }
+  }
+
+  struct Entry {
+    std::string key;
+    std::size_t hash;
+    Tokens tokens;
+    std::size_t cost;
+  };
+
+  static std::size_t Cost(std::string_view text,
+                          const std::vector<TokenId>& tokens) {
+    return text.size() + tokens.size() * sizeof(TokenId) + 128;
+  }
+
+  std::mutex mutex_;
+  std::list<Entry> entries_;
+  std::unordered_multimap<std::size_t, std::list<Entry>::iterator> index_;
+  std::size_t budget_{kDefaultBudgetBytes};
+  std::size_t bytes_{0};
+};
+
+LingTokenizer::LingTokenizer() : fragments_(std::make_unique<FragmentCache>()) {
   std::fill(std::begin(byte_token_), std::end(byte_token_), kInvalidTokenId);
 }
 LingTokenizer::~LingTokenizer() = default;
@@ -271,6 +366,27 @@ std::unique_ptr<LingTokenizer> LingTokenizer::CreateFromVocabulary(
                    [](const auto& a, const auto& b) {
                      return a.first.size() > b.first.size();
                    });
+  t->special_tree_.emplace_back();
+  for (std::size_t i = 0; i < t->specials_.size(); ++i) {
+    std::uint32_t node = 0;
+    for (const unsigned char byte : t->specials_[i].first) {
+      auto& next = t->special_tree_[node].next;
+      auto it = std::find_if(next.begin(), next.end(),
+                             [&](const auto& e) { return e.first == byte; });
+      if (it == next.end()) {
+        next.emplace_back(byte,
+                          static_cast<std::uint32_t>(t->special_tree_.size()));
+        t->special_tree_.emplace_back();
+        node = static_cast<std::uint32_t>(t->special_tree_.size() - 1);
+      } else {
+        node = it->second;
+      }
+    }
+    // Spellings can repeat (one per token id); every one stays a candidate.
+    t->special_tree_[node].specials.push_back(static_cast<std::int32_t>(i));
+    t->special_first_[static_cast<unsigned char>(t->specials_[i].first[0])] =
+        true;
+  }
 
   UErrorCode status = U_ZERO_ERROR;
   UParseError parse_error;
@@ -450,6 +566,52 @@ void LingTokenizer::EncodeText(std::string_view text,
   }
 }
 
+std::vector<bool> LingTokenizer::SpecialsPresent(std::string_view text) const {
+  std::vector<bool> present(specials_.size(), false);
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    if (!special_first_[static_cast<unsigned char>(text[i])]) {
+      continue;
+    }
+    std::uint32_t node = 0;
+    for (std::size_t k = i; k < text.size(); ++k) {
+      const auto byte = static_cast<std::uint8_t>(text[k]);
+      const auto& next = special_tree_[node].next;
+      const auto it =
+          std::find_if(next.begin(), next.end(),
+                       [&](const auto& e) { return e.first == byte; });
+      if (it == next.end()) {
+        break;
+      }
+      node = it->second;
+      for (const auto special : special_tree_[node].specials) {
+        present[static_cast<std::size_t>(special)] = true;
+      }
+    }
+  }
+  return present;
+}
+
+void LingTokenizer::SetFragmentCacheBudget(std::size_t bytes) {
+  fragments_->SetBudget(bytes);
+}
+
+void LingTokenizer::EncodeFragment(std::string_view text,
+                                   std::vector<TokenId>& out) const {
+  if (text.size() < FragmentCache::kMinBytes) {
+    EncodeText(text, out);
+    return;
+  }
+  const auto hash = FragmentCache::Hash(text);
+  auto tokens = fragments_->Find(text, hash);
+  if (tokens == nullptr) {
+    std::vector<TokenId> computed;
+    EncodeText(text, computed);
+    tokens = std::make_shared<const std::vector<TokenId>>(std::move(computed));
+    fragments_->Insert(text, hash, tokens);
+  }
+  out.insert(out.end(), tokens->begin(), tokens->end());
+}
+
 std::vector<TokenId> LingTokenizer::Encode(
     std::string_view text, bool parse_special,
     std::span<const LiteralRange> literal_ranges) const {
@@ -468,14 +630,16 @@ std::vector<TokenId> LingTokenizer::Encode(
     return static_cast<TokenType>(token_type_[id]);
   };
   std::vector<Fragment> fragments{{false, 0, 0, text.size()}};
-  for (const auto& [spelling, id] : specials_) {
+  const auto present = SpecialsPresent(text);
+  for (std::size_t index = 0; index < specials_.size(); ++index) {
+    const auto& [spelling, id] = specials_[index];
     // Like llama.cpp, control and unknown tokens are literal text unless
     // parse_special; user-defined tokens (<think>, <tool_call>, ...) always
     // match.
     if (!parse_special && type_of(id) != TokenType::kUserDefined) {
       continue;
     }
-    if (text.find(spelling) == std::string_view::npos) {
+    if (!present[index]) {
       continue;
     }
     std::vector<Fragment> next;
@@ -512,7 +676,7 @@ std::vector<TokenId> LingTokenizer::Encode(
     if (f.is_special) {
       out.push_back(f.id);
     } else {
-      EncodeText(text.substr(f.begin, f.length), out);
+      EncodeFragment(text.substr(f.begin, f.length), out);
     }
   }
   return out;
