@@ -1,6 +1,8 @@
 # Ling-3.0-flash (bailingmoe3) model package.
 add_library(gufo_ling_3_flash STATIC
+  chat_template.cpp
   config.cpp
+  tokenizer.cpp
   weights.cpp)
 
 target_include_directories(gufo_ling_3_flash PUBLIC ${PROJECT_SOURCE_DIR})
