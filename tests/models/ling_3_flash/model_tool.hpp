@@ -9,6 +9,9 @@
 // Common options: --model FILE (absent: exit 77), --max-context N,
 // --max-batch N, --layers N / --layer-first M (debug: only blocks
 // [M, M+N) are uploaded; forward runs need M = 0),
+// --mtp (also upload the MTP block and run the MTP session path),
+// --expanded-kv-bytes N (the sessions' shared persistent expanded K/V budget,
+// default ModelOptions::expanded_kv_bytes),
 // --timeout-seconds S (default 3300), --hold-seconds S (default 0),
 // --partial-file F (default $TMPDIR/<tool>_partial.json: the latest report,
 // rewritten at every update; a fatal signal prints it as {"status":"crashed"}).
@@ -269,7 +272,9 @@ private:
 /// Loads the model with the common options and records memory and timing.
 [[nodiscard]] inline std::shared_ptr<l3::Model> LoadModel(
     const Args& args, Report& report, std::uint32_t default_batch,
-    std::uint32_t default_context) {
+    std::uint32_t default_context, bool force_mtp = false,
+    std::uint64_t default_expanded_kv_bytes =
+        l3::ModelOptions{}.expanded_kv_bytes) {
   l3::ModelOptions options;
   options.max_batch =
       static_cast<std::uint32_t>(args.Num("--max-batch", default_batch));
@@ -278,6 +283,9 @@ private:
   options.layer_first =
       static_cast<std::uint32_t>(args.Num("--layer-first", 0));
   options.layer_limit = static_cast<std::uint32_t>(args.Num("--layers", 0));
+  options.mtp = force_mtp || args.Has("--mtp");
+  options.expanded_kv_bytes = static_cast<std::uint64_t>(args.Num(
+      "--expanded-kv-bytes", static_cast<double>(default_expanded_kv_bytes)));
   std::string error;
   auto model = l3::Model::Load(args.Str("--model"), options, &error);
   if (!model) {

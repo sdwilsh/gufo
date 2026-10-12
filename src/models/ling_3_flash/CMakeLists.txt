@@ -44,7 +44,8 @@ if (ENGINE_ENABLE_HIP)
     ${LING_ROCM_DIR}/dense.hip.cpp
     ${LING_ROCM_DIR}/kda.hip.cpp
     ${LING_ROCM_DIR}/mla.hip.cpp
-    ${LING_ROCM_DIR}/moe.hip.cpp)
+    ${LING_ROCM_DIR}/moe.hip.cpp
+    ${LING_ROCM_DIR}/mtp.hip.cpp)
   target_sources(gufo_ling_3_flash PRIVATE ${LING_HIP_SOURCES}
     ${LING_ROCM_DIR}/device_model.cpp
     ${LING_ROCM_DIR}/executor.cpp

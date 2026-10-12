@@ -142,6 +142,13 @@ struct SessionState {
   float* kda_state{nullptr};  ///< [35 kda layers][kKdaStateFloats]
   float* kda_conv{nullptr};   ///< [35 kda layers][kKdaConvStateFloats]
   void* mla_cache{nullptr};   ///< F16, MlaCacheLayout
+  /// MTP block's own latent cache: one more MLA layer, F16 `[capacity][576]`
+  /// (null without MTP). Row p is computed from (trunk hidden of position p,
+  /// token p + 1); see mtp.hpp.
+  void* mtp_cache{nullptr};
+  /// Output-normed trunk hidden state of the last committed position
+  /// (kHidden floats, null without MTP): the MTP input of the next draft.
+  float* mtp_h{nullptr};
   MlaCacheLayout cache;
   std::uint32_t position{0};  ///< Tokens already consumed (next position).
   /// Persistent expanded K/V of the MLA layers (mla::ExpandedLayerBytes(
@@ -155,23 +162,37 @@ struct SessionState {
   mutable std::uint32_t mla_expanded_to[kMlaLayers]{};
 };
 
+/// MTP (multi-token prediction) draft block, a full MLA + MoE block (block 42)
+/// that predicts the token after next from (trunk hidden, next token). Verify
+/// chunks are at most kMaxVerifyTokens tokens (the small-batch family), so at
+/// most kMaxDrafts drafts per cycle.
+inline constexpr std::uint32_t kMaxVerifyTokens = 8;
+inline constexpr std::uint32_t kMaxDrafts = kMaxVerifyTokens - 1;
+
 /// Byte sizes of the per-sequence state as functions of the max context.
 struct SessionSizes {
   std::size_t kda_state;
   std::size_t kda_conv;
   std::size_t mla_cache;
+  /// MTP latent cache and trunk-hidden carry (0 without MTP).
+  std::size_t mtp_cache;
   /// Rollback snapshot of the recurrent state (KDA state + conv); the MLA
   /// cache needs none, rollback truncates `position`.
   std::size_t snapshot;
   [[nodiscard]] constexpr std::size_t Total() const noexcept {
-    return kda_state + kda_conv + mla_cache;
+    return kda_state + kda_conv + mla_cache + mtp_cache;
   }
 };
-[[nodiscard]] constexpr SessionSizes SessionBytes(
-    std::uint32_t max_context) noexcept {
+[[nodiscard]] constexpr SessionSizes SessionBytes(std::uint32_t max_context,
+                                                  bool mtp = false) noexcept {
   const std::size_t state = kKdaLayers * kKdaStateFloats * sizeof(float);
   const std::size_t conv = kKdaLayers * kKdaConvStateFloats * sizeof(float);
-  return {state, conv, MlaCacheLayout{max_context}.Bytes(), state + conv};
+  const std::size_t mtp_bytes =
+      mtp ? std::size_t{max_context} * kMlaCacheWidth * 2 +
+                kHidden * sizeof(float)
+          : 0;
+  return {state, conv, MlaCacheLayout{max_context}.Bytes(), mtp_bytes,
+          state + conv};
 }
 
 /// Per-token F32 activation rows of the scratch arena a forward pass needs,

@@ -1,0 +1,35 @@
+# Ling-3.0-flash integration (WS10/12/13/14/15), tests phase. One pod, in this order:
+# op tests, B2 (greedy + KL vs the memorised oracle; KL gated relative to the llama.cpp
+# Vulkan floor of each text, greedy divergences may be F64-adjudicated), layer_check --invariance,
+# decode_digest graph-vs-eager, session/snapshot contracts, novel-text KL oracle.
+# Pod: memory 19Gi, amd.com/gpu: 1, /models read-only, /work emptyDir >= 4Gi, NO HSA_OVERRIDE.
+# run-suite exits non-zero on any FAIL/TIMEOUT/MISSING; ling-int-suite also counts a SKIP as a failure.
+@label=dense_ops @timeout=1800 ling_3_flash_dense_ops_test
+@label=kda_ops @timeout=900 ling_3_flash_kda_ops_test
+@label=mla_ops @timeout=1800 ling_3_flash_mla_ops_test
+@label=moe_ops @timeout=3600 ling_3_flash_moe_ops_test
+@label=moe_ops_invariance @timeout=900 ling_3_flash_moe_ops_test --invariance
+@label=b2 @timeout=7200 ling_3_flash_b2 --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --reference-dir /opt/gufo/oracle/cpu_ref --greedy /opt/gufo/oracle/greedy.jsonl --adjudicated /opt/gufo/adjudicated/greedy_adjudicated.json --text memorised --kl-base /opt/gufo/oracle/kl_base.bin --floor /opt/gufo/floor/floor-memorised.json --max-batch 512 --max-context 1024 --timeout-seconds 7000
+@label=invariance @timeout=1800 ling_3_flash_layer_check --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --invariance --n 106 --max-batch 128 --max-context 256 --timeout-seconds 1700
+@label=decode_digest @timeout=3000 ling_3_flash_decode_digest --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --graph-compare --max-context 1200 --prompt-tokens 700 --decode-tokens 6
+@label=decode_digest_long @timeout=3000 ling_3_flash_decode_digest --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --graph-compare --layers 8 --max-batch 512 --max-context 25000 --prompt-tokens 24570 --decode-tokens 12
+@label=session @timeout=3600 ling_3_flash_session_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf
+# session_calib_*: extra session_test prompt lengths; each prints a [calib] line and the
+# JSON fields logits_kl / ref_top1_margin / logits_max_abs / logits_rel_l2 even when it passes.
+@label=session_calib_30_4 @timeout=3600 ling_3_flash_session_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --prompt-tokens 30 --decode-tokens 4
+@label=session_calib_200_8 @timeout=3600 ling_3_flash_session_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --prompt-tokens 200 --decode-tokens 8
+@label=session_calib_240_12 @timeout=3600 ling_3_flash_session_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --prompt-tokens 240 --decode-tokens 12
+@label=snapshot @timeout=3600 ling_3_flash_snapshot_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf
+@label=snapshot_2300 @timeout=3600 ling_3_flash_snapshot_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --prompt-tokens 2300 --max-context 4096
+# Cross-session isolation as the server drives it (cache-concurrency fanout shape: 4 sessions
+# restore one 5,421-token shared prefix, then interleave prefill chunks, worker snapshots and
+# decode-graph captures/replays); every session must equal the same work done alone, bitwise.
+@label=interleave @timeout=3600 ling_3_flash_interleave_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --prefix-tokens 5421 --sessions 4 --rounds 12 --max-context 6144
+# Restore + tail prefill into sessions with full / partial / no persistent expanded K/V store and
+# with stale prior histories (partial re-expansion, rows past the restored position), bitwise
+# against a fresh full-store session: the fan-out shape, a 512-token tail from the unaligned
+# prefix end, and a tail that crosses the end of a partial store.
+@label=restore_tail @timeout=3600 ling_3_flash_restore_tail_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf
+@label=restore_tail_512 @timeout=3600 ling_3_flash_restore_tail_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --tails 512,9
+@label=restore_tail_store_edge @timeout=3600 ling_3_flash_restore_tail_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --prefix-tokens 6130 --partial-blocks 3
+@label=kl_novel @timeout=3600 ling_3_flash_logit_dump --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --greedy /opt/gufo/oracle-novel/greedy.jsonl --adjudicated /opt/gufo/adjudicated/greedy_adjudicated.json --text novel --kl-base /opt/gufo/oracle-novel/kl_base.bin --floor /opt/gufo/floor/floor-novel.json --max-batch 512 --max-context 1024
