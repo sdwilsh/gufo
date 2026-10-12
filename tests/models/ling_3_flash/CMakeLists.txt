@@ -32,4 +32,7 @@ if (ENGINE_ENABLE_HIP)
   # --- mla (WS4b) ---
   add_ling_3_flash_test(mla_ops gufo_ling_3_flash "hip;gpu;gfx1151")
   # --- end mla ---
+  # --- WS4c: MoE routing and routed-expert op tests ---
+  add_ling_3_flash_test(moe_ops gufo_ling_3_flash "hip;gpu;gfx1151")
+  # --- end WS4c ---
 endif()

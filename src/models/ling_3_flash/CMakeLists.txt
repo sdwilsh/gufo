@@ -19,6 +19,9 @@ if (ENGINE_ENABLE_HIP)
   # --- mla (WS4b) ---
   list(APPEND LING_HIP_SOURCES ${LING_ROCM_DIR}/mla.hip.cpp)
   # --- end mla ---
+  # --- WS4c: MoE routing and routed-expert kernels ---
+  list(APPEND LING_HIP_SOURCES ${LING_ROCM_DIR}/moe.hip.cpp)
+  # --- end WS4c ---
   if (LING_HIP_SOURCES)
     target_sources(gufo_ling_3_flash PRIVATE ${LING_HIP_SOURCES})
     set_source_files_properties(${LING_HIP_SOURCES} PROPERTIES LANGUAGE HIP)
