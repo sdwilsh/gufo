@@ -169,6 +169,10 @@ std::uint32_t Model::BatchRowLimit() const noexcept {
   return executor_->batch_row_limit();
 }
 
+void Model::FailDraftBatchForTest(std::uint32_t skip) noexcept {
+  executor_->FailDraftBatchForTest(skip);
+}
+
 void Model::FailBatchesForTest(std::uint32_t count, bool before_wait) noexcept {
   executor_->FailBatchesForTest(
       count, before_wait ? rocm::Executor::BatchFailurePoint::kBeforeSync
@@ -216,7 +220,7 @@ void Session::Invalidate() noexcept {
   // Controller state (successes, retry backoff, measured costs) must not leak
   // into the next request, or seeded sampled replay would depend on history.
   ResetDraftPolicy();
-  draft_position_ = 0;
+  draft_position_ = UINT32_MAX;
   // Host-side position and derived state only: position 0 drops every
   // expanded K/V watermark, and the MTP rows no longer match any tokens.
   session_->set_position(0);
@@ -685,8 +689,9 @@ bool Session::Rollback(std::uint32_t keep, std::string* error_msg) {
     return false;
   }
   const PendingVerify v = pending_;
-  if (!model_->executor_->MtpRollback(*session_, v.first_pos, v.n, keep,
-                                      error_msg)) {
+  if (!model_->executor_->MtpRollback(
+          *session_, v.first_pos, v.n, keep, error_msg,
+          {.ckpt0 = v.ckpt0, .hn0 = v.hn0, .logit_row = v.logit_row})) {
     valid_ = false;
     return false;
   }
@@ -695,7 +700,8 @@ bool Session::Rollback(std::uint32_t keep, std::string* error_msg) {
   if (v.have_rows) {
     std::copy_n(verify_rows_.begin() + std::size_t{keep - 1} * kVocab, kVocab,
                 logits_.begin());
-  } else if (!model_->executor_->ReadLogitRow(keep - 1, logits_, error_msg)) {
+  } else if (!model_->executor_->ReadLogitRow(v.logit_row + keep - 1, logits_,
+                                              error_msg)) {
     valid_ = false;
     logits_.clear();
     return false;
@@ -707,7 +713,8 @@ bool Session::Rollback(std::uint32_t keep, std::string* error_msg) {
 bool Session::Draft(std::int32_t token, bool chain, std::span<float> logits,
                     std::int32_t* argmax, std::string* error_msg,
                     std::vector<OpTiming>* op_profile) {
-  if (!MtpActive() || pending_.active || (chain && draft_position_ == 0)) {
+  if (!MtpActive() || pending_.active ||
+      (chain && draft_position_ == UINT32_MAX)) {
     AssignError(error_msg, "draft needs a valid session with MTP state");
     return false;
   }
@@ -768,7 +775,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
   }
   *result = {};
   const auto is_stop = [&](std::int32_t token) {
-    return stop_at_eos && model_->IsStopToken(token);
+    return stop_at_eos && IsStop(token);
   };
   const std::size_t room = session_->capacity() - session_->position();
   if (room == 0) {
@@ -814,43 +821,62 @@ bool Session::DecodeStep(std::size_t max_tokens,
   }
 
   // Draft chain. A sampled proposal uses its own stream (MtpProposer).
-  std::optional<MtpProposer> proposer;
+  Cycle c;
+  c.anchor = anchor;
+  c.sampled = sampled;
+  c.greedy_fast = greedy_fast;
+  c.stop_at_eos = stop_at_eos;
   if (sampled) {
-    proposer.emplace(sampler, static_cast<sampling::TokenId>(anchor));
+    c.proposer.emplace(sampler, static_cast<sampling::TokenId>(anchor));
   }
-  std::vector<std::int32_t> chain{anchor};
+  c.chain = {anchor};
   if (sampled && draft_logits_.size() != kVocab) {
     draft_logits_.resize(kVocab);
   }
   for (std::uint32_t j = 0; j < drafts; ++j) {
     std::int32_t index = -1;
     if (hooks_.source && !sampled) {
-      chain.push_back(hooks_.source(chain));
+      c.chain.push_back(hooks_.source(c.chain));
       continue;
     }
-    if (!Draft(chain.back(), j > 0,
+    if (!Draft(c.chain.back(), j > 0,
                sampled ? std::span<float>(draft_logits_) : std::span<float>{},
                &index, error_msg)) {
       return false;  // the trunk state is untouched by draft steps
     }
     if (sampled) {
-      index = static_cast<std::int32_t>(proposer->Propose(draft_logits_));
+      index = static_cast<std::int32_t>(c.proposer->Propose(draft_logits_));
     }
-    chain.push_back(index);
+    c.chain.push_back(index);
   }
 
   // Verify [anchor, drafts] as one small-batch chunk.
-  const auto k = static_cast<std::uint32_t>(chain.size());
-  std::array<std::int32_t, kMaxVerifyTokens> argmax{};
   std::vector<float>* rows = greedy_fast ? nullptr : &verify_rows_;
-  if (!Verify(chain, argmax, rows, error_msg)) {
+  if (!Verify(c.chain, c.argmax, rows, error_msg)) {
     return false;
   }
+  return FinishCycle(c, sampler, result, error_msg, &begin);
+}
+
+bool Session::IsStop(std::int32_t token) const noexcept {
+  return model_->IsStopToken(token) ||
+         (hooks_.stop_token >= 0 && token == hooks_.stop_token);
+}
+
+bool Session::FinishCycle(Cycle& c, sampling::SamplerState& sampler,
+                          DecodeResult* result, std::string* error_msg,
+                          const std::chrono::steady_clock::time_point* begin) {
+  const auto is_stop = [&](std::int32_t token) {
+    return c.stop_at_eos && IsStop(token);
+  };
+  const bool sampled = c.sampled;
+  const auto& chain = c.chain;
+  const auto k = static_cast<std::uint32_t>(chain.size());
   const auto row_logits = [&](std::uint32_t row) {
     return std::span<const float>(verify_rows_)
         .subspan(std::size_t{row} * kVocab, kVocab);
   };
-  sampler.Accept(static_cast<sampling::TokenId>(anchor));
+  sampler.Accept(static_cast<sampling::TokenId>(c.anchor));
   std::uint32_t keep = 1;
   std::optional<std::int32_t> correction;
   // Sampling can throw between Verify() and Rollback(); the rejected rows
@@ -862,7 +888,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
     }
     if (sampled) {
       const auto verified =
-          VerifySampledChain(row_logits, proposer->proposals(), sampler,
+          VerifySampledChain(row_logits, c.proposer->proposals(), sampler,
                              [&](sampling::TokenId token) {
                                return is_stop(static_cast<std::int32_t>(token));
                              });
@@ -873,8 +899,8 @@ bool Session::DecodeStep(std::size_t max_tokens,
       }
     }
     while (!sampled && keep < k) {
-      if (greedy_fast) {
-        const std::int32_t predicted = argmax[keep - 1];
+      if (c.greedy_fast) {
+        const std::int32_t predicted = c.argmax[keep - 1];
         if (predicted < 0) {
           AssignError(error_msg,
                       "logit distribution contains no finite values");
@@ -916,14 +942,395 @@ bool Session::DecodeStep(std::size_t max_tokens,
   // proposals as failed predictions.
   draft_length_.Observe(keep - 1, result->stop ? keep - 1 : k - 1, !sampled,
                         session_->position());
-  if (!sampled) {
-    draft_length_.ObserveCost(k - 1, elapsed_ms());
+  if (!sampled && begin != nullptr) {
+    draft_length_.ObserveCost(k - 1,
+                              std::chrono::duration<float, std::milli>(
+                                  std::chrono::steady_clock::now() - *begin)
+                                  .count());
   }
   if (correction) {
     // The residual draw is the next cycle's anchor; resampling would bias it.
     sampler.DeferSample(static_cast<sampling::TokenId>(*correction));
   }
   return true;
+}
+
+void Session::DecodeBatch(std::span<BatchDecode> lanes) {
+  using Clock = std::chrono::steady_clock;
+  const auto ms_since = [](Clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
+  };
+  const auto call_start = Clock::now();
+  struct Work {
+    BatchDecode* d;
+    Session* s;
+    Cycle c;
+    std::uint32_t k{0};
+    bool cohort{false};  // greedy lane taking the cohort's draft width
+    bool live{true};
+  };
+  std::vector<Work> work;
+  work.reserve(lanes.size());
+  struct Ready {
+    BatchDecode* d;
+    Session* s;
+    std::uint32_t cap;
+  };
+  std::vector<Ready> ready;
+  Model* model = nullptr;
+  const auto fail = [](BatchDecode& d, std::string message) {
+    d.ok = false;
+    d.error = std::move(message);
+  };
+  // ---- anchors and draft widths, host only (DecodeStep's own checks) ------
+  for (std::size_t i = 0; i < lanes.size(); ++i) {
+    BatchDecode& d = lanes[i];
+    d.ok = false;
+    d.deferred = false;
+    d.error.clear();
+    d.result = {};
+    d.ms = 0.0;
+    d.width = 1;
+    Session* s = d.session;
+    if (s == nullptr || d.sampler == nullptr) {
+      fail(d, "batch lane needs a session and a sampler");
+      continue;
+    }
+    if (model == nullptr) {
+      model = s->model_.get();
+    }
+    if (s->model_.get() != model) {
+      fail(d, "batch lane belongs to another model");
+      continue;
+    }
+    if (std::any_of(lanes.begin(), lanes.begin() + i,
+                    [&](const BatchDecode& o) { return o.session == s; })) {
+      fail(d, "session appears twice in one batch");
+      continue;
+    }
+    if (ready.size() == model->executor_->batch_row_limit()) {
+      fail(d, "a batch holds at most " +
+                  std::to_string(model->executor_->batch_row_limit()) +
+                  " sessions");
+      d.deferred = true;
+      continue;
+    }
+    const auto t0 = Clock::now();
+    if (!s->valid_ || s->pending_.active) {
+      fail(d, "session needs a successful Sync after a failed operation");
+      continue;
+    }
+    if (d.max_tokens == 0 || s->tokens_.empty() ||
+        s->logits_.size() != kVocab) {
+      fail(d, "decode needs an output, a positive budget and a synced prompt");
+      continue;
+    }
+    const std::size_t room = s->session_->capacity() - s->session_->position();
+    if (room == 0) {
+      d.result.stop = true;
+      d.ok = true;
+      continue;
+    }
+    const auto cap = static_cast<std::uint32_t>(
+        std::min<std::size_t>({d.max_tokens, room, kMaxVerifyTokens}));
+    ready.push_back({.d = &d, .s = s, .cap = cap});
+    d.ms += ms_since(t0);
+  }
+  if (ready.size() == 1) {
+    // One lane: DecodeStep itself (its graph-replayed plain steps).
+    BatchDecode& d = *ready.front().d;
+    const auto t0 = Clock::now();
+    try {
+      d.ok = ready.front().s->DecodeStep(d.max_tokens, *d.sampler, &d.result,
+                                         &d.error, d.stop_at_eos);
+    } catch (const std::exception& e) {
+      fail(d, e.what());
+    }
+    d.ms += ms_since(t0);
+    return;
+  }
+  for (const Ready& r : ready) {
+    BatchDecode& d = *r.d;
+    Session* s = r.s;
+    const std::uint32_t cap = r.cap;
+    const auto t0 = Clock::now();
+    sampling::SamplerState& sampler = *d.sampler;
+    Work w{.d = &d, .s = s};
+    w.c.sampled = sampler.config().uses_random_sampling();
+    w.c.greedy_fast = sampler.config().temperature == 0.0F &&
+                      sampler.config().can_use_unmodified_argmax();
+    w.c.stop_at_eos = d.stop_at_eos;
+    try {
+      w.c.anchor = static_cast<std::int32_t>(sampler.Sample(s->logits_));
+    } catch (const std::exception& e) {
+      fail(d, e.what());
+      continue;
+    }
+    if (d.stop_at_eos && s->IsStop(w.c.anchor)) {
+      d.result.stop = true;
+      d.ok = true;
+      continue;
+    }
+    w.c.chain = {w.c.anchor};
+    if (s->MtpActive() && cap > 1) {
+      if (s->hooks_.fixed_drafts != 0) {
+        w.k = std::min(s->hooks_.fixed_drafts, cap - 1);
+      } else if (w.c.sampled) {
+        // The width of the lane's own history, as DecodeStep (seeded replay).
+        w.k = s->draft_length_.Choose(cap - 1, false, s->session_->position());
+      } else {
+        w.cohort = true;
+        w.k = cap - 1;  // the cohort width, capped below
+      }
+    }
+    d.ms += ms_since(t0);
+    work.push_back(std::move(w));
+  }
+  if (work.empty()) {
+    return;
+  }
+  rocm::Executor& exec = *model->executor_;
+  const std::uint32_t row_limit = exec.batch_row_limit();
+  // ---- the greedy lanes' common width -------------------------------------
+  std::vector<MtpCohortController::Row> rows;
+  std::uint32_t other_rows = 0;
+  std::uint32_t context = 0;
+  for (const Work& w : work) {
+    if (w.cohort) {
+      rows.push_back({&w.s->draft_length_, w.k});
+      context = std::max(context, w.s->session_->position());
+    } else {
+      other_rows += w.k + 1;
+    }
+  }
+  std::uint32_t cohort_width = 0;
+  if (!rows.empty()) {
+    const auto g = static_cast<std::uint32_t>(rows.size());
+    // The greedy lanes' rows fit one forward by themselves at most; whether
+    // they also fit beside the other lanes (one verify forward) or take a
+    // forward of their own is the controller's cost trade (sampled widths
+    // are never cut; the grouping below splits).
+    const std::uint32_t fit = row_limit / g - 1;
+    for (auto& row : rows) {
+      row.budget = std::min(row.budget, fit);
+    }
+    cohort_width = model->cohort_.Choose(rows, work.size(), other_rows,
+                                         row_limit, context);
+    cohort_width = std::min(cohort_width, fit);
+    for (Work& w : work) {
+      if (w.cohort) {
+        w.k = std::min(w.k, cohort_width);
+      }
+    }
+  }
+  // ---- draft chains: one batched draft step per depth ---------------------
+  for (Work& w : work) {
+    const auto t0 = Clock::now();
+    if (w.k > 0 && w.c.sampled) {
+      w.c.proposer.emplace(*w.d->sampler,
+                           static_cast<sampling::TokenId>(w.c.anchor));
+      if (w.s->draft_logits_.size() != kVocab) {
+        w.s->draft_logits_.resize(kVocab);
+      }
+    }
+    if (w.k > 0 && !w.c.sampled && w.s->hooks_.source) {
+      for (std::uint32_t j = 0; j < w.k; ++j) {
+        w.c.chain.push_back(w.s->hooks_.source(w.c.chain));
+      }
+    }
+    w.d->ms += ms_since(t0);
+  }
+  // Chains in descending length, so each depth's lanes are a prefix and keep
+  // their row (the chained hidden input stays at its index).
+  std::vector<Work*> drafting;
+  for (Work& w : work) {
+    if (w.k > 0 && !(!w.c.sampled && w.s->hooks_.source)) {
+      drafting.push_back(&w);
+    }
+  }
+  std::stable_sort(drafting.begin(), drafting.end(),
+                   [](const Work* a, const Work* b) { return a->k > b->k; });
+  std::vector<std::uint32_t> draft_position(drafting.size(), 0);
+  bool step_failed = false;
+  for (std::uint32_t j = 0;
+       !step_failed && !drafting.empty() && j < drafting.front()->k; ++j) {
+    std::vector<rocm::DraftLane> step;
+    std::vector<Work*> members;
+    // A lane whose proposal failed keeps its row as a placeholder (outputs
+    // ignored) so the chains after it keep their rows.
+    for (std::size_t i = 0; i < drafting.size() && drafting[i]->k > j; ++i) {
+      Work& w = *drafting[i];
+      rocm::DraftLane lane;
+      lane.session = w.s->session_.get();
+      lane.token = w.c.chain.back();
+      lane.position =
+          j == 0 ? w.s->session_->position() - 1 : draft_position[i] + 1;
+      lane.chain = j > 0;
+      if (w.c.sampled) {
+        lane.logits = w.s->draft_logits_;
+      }
+      step.push_back(lane);
+      members.push_back(&w);
+    }
+    if (step.empty()) {
+      break;
+    }
+    const auto t0 = Clock::now();
+    std::string error;
+    const bool ok = exec.MtpDraftBatch(step, &error);
+    const double ms = ms_since(t0);
+    step_failed = !ok;
+    for (std::size_t i = 0; i < members.size(); ++i) {
+      Work& w = *members[i];
+      if (!w.live) {
+        draft_position[i] = step[i].position;
+        continue;
+      }
+      w.d->ms += ms;
+      w.d->width = std::max<std::uint32_t>(
+          w.d->width, static_cast<std::uint32_t>(members.size()));
+      if (!ok) {
+        // As DecodeStep: a failed draft leaves the trunk state untouched.
+        fail(*w.d, error);
+        w.live = false;
+        continue;
+      }
+      const auto t1 = Clock::now();
+      draft_position[i] = step[i].position;
+      w.s->draft_position_ = step[i].position;
+      try {
+        w.c.chain.push_back(w.c.sampled
+                                ? static_cast<std::int32_t>(
+                                      w.c.proposer->Propose(w.s->draft_logits_))
+                                : step[i].argmax);
+      } catch (const std::exception& e) {
+        fail(*w.d, e.what());
+        w.live = false;
+      }
+      w.d->ms += ms_since(t1);
+    }
+  }
+  // ---- verify forwards (at most row_limit rows each) and acceptance -------
+  std::vector<std::vector<Work*>> groups;
+  std::vector<std::uint32_t> group_rows;
+  for (Work& w : work) {
+    if (!w.live) {
+      continue;
+    }
+    const auto n = static_cast<std::uint32_t>(w.c.chain.size());
+    std::size_t g = 0;
+    while (g < groups.size() && group_rows[g] + n > row_limit) {
+      ++g;
+    }
+    if (g == groups.size()) {
+      groups.emplace_back();
+      group_rows.push_back(0);
+    }
+    groups[g].push_back(&w);
+    group_rows[g] += n;
+  }
+  bool any_failure = false;
+  for (const auto& group : groups) {
+    std::vector<rocm::BatchSegment> segments;
+    std::vector<Work*> members;
+    for (Work* wp : group) {
+      Work& w = *wp;
+      Session& s = *w.s;
+      const auto n = static_cast<std::uint32_t>(w.c.chain.size());
+      // Verify's (or, for a plain token, Feed's) own checks.
+      if (!s.valid_ || s.pending_.active ||
+          s.session_->position() + n > s.session_->capacity() ||
+          (n > 1 && !s.MtpActive())) {
+        fail(*w.d, n > 1 ? "verify needs a valid session with MTP state"
+                         : "session is invalid after an earlier failure");
+        continue;
+      }
+      rocm::BatchSegment seg;
+      seg.session = s.session_.get();
+      seg.tokens = w.c.chain;
+      if (n == 1) {
+        seg.logits = s.logits_;
+      } else {
+        seg.rollback = true;
+        seg.logits_from = 0;
+        seg.argmax = std::span<std::int32_t>(w.c.argmax.data(), n);
+        if (!w.c.greedy_fast) {
+          s.verify_rows_.resize(std::size_t{n} * kVocab);
+          seg.logits = s.verify_rows_;
+        }
+      }
+      segments.push_back(std::move(seg));
+      members.push_back(&w);
+    }
+    if (segments.empty()) {
+      continue;
+    }
+    const auto t0 = Clock::now();
+    (void)exec.ForwardBatch(segments);
+    const double ms = ms_since(t0);
+    for (std::size_t i = 0; i < members.size(); ++i) {
+      Work& w = *members[i];
+      Session& s = *w.s;
+      BatchDecode& d = *w.d;
+      const rocm::BatchSegment& seg = segments[i];
+      const auto n = static_cast<std::uint32_t>(w.c.chain.size());
+      if (seg.status == rocm::BatchSegment::Status::kRejected) {
+        d.deferred = true;
+        fail(d, seg.error);
+        continue;
+      }
+      d.ms += ms;
+      d.width = std::max<std::uint32_t>(
+          d.width, static_cast<std::uint32_t>(members.size()));
+      if (seg.status != rocm::BatchSegment::Status::kDone) {
+        // Launched and failed: the state is lost and the device may be too.
+        s.Invalidate();
+        fail(d, seg.error.empty() ? "batched verify failed" : seg.error);
+        any_failure = true;
+        continue;
+      }
+      const auto t1 = Clock::now();
+      sampling::SamplerState& sampler = *d.sampler;
+      if (n == 1) {
+        // DecodeStep's plain step (Evaluate).
+        s.tokens_.push_back(w.c.anchor);
+        sampler.Accept(static_cast<sampling::TokenId>(w.c.anchor));
+        d.result.tokens = {w.c.anchor};
+        if (s.MtpActive()) {
+          s.draft_length_.ObservePlainToken();
+        }
+        d.ok = true;
+      } else {
+        // Verify's bookkeeping, then DecodeStep's acceptance and rollback.
+        const std::uint32_t first_pos = s.session_->position() - n;
+        s.tokens_.insert(s.tokens_.end(), w.c.chain.begin(), w.c.chain.end());
+        s.logits_.clear();
+        s.pending_ = {.active = true,
+                      .first_pos = first_pos,
+                      .n = n,
+                      .have_rows = !w.c.greedy_fast,
+                      .ckpt0 = seg.placement.ckpt0,
+                      .hn0 = seg.placement.hn0,
+                      .logit_row = seg.placement.logit_row};
+        std::string error;
+        try {
+          d.ok = s.FinishCycle(w.c, sampler, &d.result, &error, nullptr);
+        } catch (const std::exception& e) {
+          d.ok = false;
+          error = e.what();
+        }
+        if (!d.ok) {
+          fail(d, error);
+          any_failure = true;
+        }
+      }
+      d.ms += ms_since(t1);
+    }
+  }
+  if (!rows.empty() && !any_failure) {
+    model->cohort_.Observe(work.size(), context, cohort_width,
+                           static_cast<float>(ms_since(call_start)));
+  }
 }
 
 // ---- SessionSnapshot -------------------------------------------------------
