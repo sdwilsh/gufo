@@ -13,8 +13,6 @@ endfunction()
 set(LING_FIXTURES "${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 
 add_ling_3_flash_test(config gufo_ling_3_flash "cpu")
-
-set(LING_FIXTURES "${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 add_ling_3_flash_test(tokenizer gufo_ling_3_flash "cpu")
 target_compile_definitions(ling_3_flash_tokenizer_test PRIVATE
   GUFO_LING_VOCAB_GGUF="${LING_FIXTURES}/ling-vocab.gguf.fixture"
@@ -62,3 +60,16 @@ if (ENGINE_ENABLE_HIP)
   endforeach()
   add_custom_target(ling_3_flash_model_tests DEPENDS ${LING_MODEL_BINARIES})
 endif()
+
+# Oracle probe: per-layer dumps and logits of the float32 reference. Built
+# explicitly (`--target ling_3_flash_reference_probe`), never by routine checks.
+add_executable(ling_3_flash_reference_probe EXCLUDE_FROM_ALL reference_probe.cpp)
+target_link_libraries(ling_3_flash_reference_probe PRIVATE
+  gufo_ling_3_flash_reference)
+set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2")
+
+# Synthetic operator checks of the scalar reference; explicit target, run
+# `ling_3_flash_cpu_ops_test` by hand (it is not part of routine ctest).
+add_executable(ling_3_flash_cpu_ops_test EXCLUDE_FROM_ALL cpu_ops_test.cpp)
+target_link_libraries(ling_3_flash_cpu_ops_test PRIVATE
+  gufo_ling_3_flash_reference)
