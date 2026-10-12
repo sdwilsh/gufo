@@ -1080,7 +1080,8 @@ bool Executor::Trunk(std::span<const Lane> lanes, std::uint32_t n,
   if (events) {
     (void)hipEventRecord(events_[0], stream_);
   }
-  dense::EmbedQ4K(model_.token_embd().data, b.tokens, b.h, n, kHidden, stream_);
+  dense::Embed(model_.token_embd().type, model_.token_embd().data, b.tokens,
+               b.h, n, kHidden, stream_);
   Mark("embed", 0);
   DumpFloat(sink, "embd", 0, b.h, n, kHidden);
   // Decode family: fused launches (norm + planes + residual), same bits.
@@ -1650,8 +1651,8 @@ bool Executor::MtpAfterForward(Session& session, std::uint32_t n,
   const std::uint32_t skip = first_pos == 0 ? 1U : 0U;
   const std::uint32_t rows = n - skip;
   if (rows > 0) {
-    dense::EmbedQ4K(model_.token_embd().data, b.tokens + row0 + skip, b.ga,
-                    rows, kHidden, stream_);
+    dense::Embed(model_.token_embd().type, model_.token_embd().data,
+                 b.tokens + row0 + skip, b.ga, rows, kHidden, stream_);
     mtp::ConcatNormRows(b.ga, hn + std::size_t{skip} * kHidden, m.enorm.f32(),
                         m.hnorm.f32(), b.gb, rows, kRmsEps, stream_);
     Q8(m.eh_proj, b.gb, b.h, rows);
@@ -1720,8 +1721,8 @@ bool Executor::MtpDraft(Session& session, const DraftRequest& r,
   if (r.op_profile != nullptr) {
     BeginProfile();
   }
-  dense::EmbedQ4K(model_.token_embd().data, b.tokens, b.ga, 1, kHidden,
-                  stream_);
+  dense::Embed(model_.token_embd().type, model_.token_embd().data, b.tokens,
+               b.ga, 1, kHidden, stream_);
   const float* h_in = r.chain || host_h ? b.mtp_hn : st.mtp_h;
   mtp::ConcatNormRows(b.ga, h_in, m.enorm.f32(), m.hnorm.f32(), b.gb, 1,
                       kRmsEps, stream_);
@@ -1838,8 +1839,8 @@ bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
   (void)hipEventRecord(draft_events_[0], stream_);
   // The launches of MtpDraft over `count` rows: row-wise kernels and GEMVs
   // whose rows do not depend on each other; the hidden input per lane.
-  dense::EmbedQ4K(model_.token_embd().data, b.tokens, b.ga, count, kHidden,
-                  stream_);
+  dense::Embed(model_.token_embd().type, model_.token_embd().data, b.tokens,
+               b.ga, count, kHidden, stream_);
   for (std::uint32_t i = 0; i < count; ++i) {
     const float* h_in = lanes[i].chain ? b.mtp_hn + std::size_t{i} * kHidden
                                        : lanes[i].session->state_.mtp_h;
