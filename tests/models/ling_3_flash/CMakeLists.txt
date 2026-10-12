@@ -19,6 +19,7 @@ target_compile_definitions(ling_3_flash_tokenizer_test PRIVATE
   GUFO_LING_TOKENIZER_GOLDENS="${LING_FIXTURES}/tokenizer_goldens.json")
 add_ling_3_flash_test(snapshot_format gufo_ling_3_flash "cpu")
 add_ling_3_flash_test(mtp_policy gufo_ling_3_flash "cpu")
+add_ling_3_flash_test(prompt_lookup gufo_ling_3_flash "cpu")
 add_ling_3_flash_test(mtp_sampled_chain gufo_ling_3_flash "cpu")
 # Sampled MTP under the server's Bailing tool grammar; parses complete calls
 # with the server's Bailing parser.
