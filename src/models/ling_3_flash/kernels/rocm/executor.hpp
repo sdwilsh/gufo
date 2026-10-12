@@ -22,6 +22,7 @@
 
 #include "src/models/ling_3_flash/gpu_dump.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/device_model.hpp"
+#include "src/models/ling_3_flash/kernels/rocm/host_copy_pool.hpp"
 #include "src/models/ling_3_flash/layout.hpp"
 
 namespace gufo::models::ling_3_flash::rocm {
@@ -68,6 +69,10 @@ private:
 
 /// Pinned staging buffer of the snapshot transfer stream.
 inline constexpr std::size_t kTransferStagingBytes = std::size_t{64} << 20;
+/// Threads (calling thread included) that copy between snapshot host buffers
+/// and the staging buffer. Do not raise it without measuring concurrent decode
+/// during a restore: the host copy, SDMA and decode share one LPDDR5X pool.
+inline constexpr unsigned kHostCopyThreads = 2;
 
 /// Device state of one sequence: KDA recurrent state and conv window of the
 /// 35 KDA layers plus the F16 latent cache of the 7 MLA layers (layout.hpp).
@@ -648,6 +653,9 @@ private:
   /// pageable copies are created per snapshot.
   hipStream_t transfer_stream_{nullptr};
   void* transfer_staging_{nullptr};
+  std::unique_ptr<HostCopyPool> copy_pool_;
+  /// Order the reuse of the two staging halves (state_io.cpp).
+  hipEvent_t transfer_events_[2]{nullptr, nullptr};
   mutable std::mutex transfer_mutex_;
   /// Transfers waiting for `transfer_mutex_` (captures and restores). The
   /// background row copy of a snapshot yields to them between its staging
