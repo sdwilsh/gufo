@@ -8,8 +8,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <iterator>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <span>
 #include <string>
@@ -23,6 +25,9 @@
 namespace gufo::models::ling_3_flash::rocm {
 
 class Executor;
+
+/// Pinned staging buffer of the snapshot transfer stream.
+inline constexpr std::size_t kTransferStagingBytes = std::size_t{64} << 20;
 
 /// Device state of one sequence: KDA recurrent state and conv window of the
 /// 35 KDA layers plus the F16 latent cache of the 7 MLA layers (layout.hpp).
@@ -51,7 +56,25 @@ public:
   /// the per-layer watermarks never stay above it.
   void set_position(std::uint32_t position) noexcept {
     state_.position = position;
+    for (std::uint32_t& rows : state_.mla_expanded_to) {
+      rows = std::min(rows, position);
+    }
   }
+  /// Hook called after the whole session state (recurrent state, conv
+  /// windows, cache rows [0, position)) was replaced outside a forward pass,
+  /// by a snapshot restore. Contract for state that is derived from, or kept
+  /// beside, the session state (it must be rebuilt or updated here, never
+  /// stored in snapshots):
+  ///   * it runs with the session idle, after the copies completed and the
+  ///     position was set to `position`;
+  ///   * device-side positions (WS10) must take `position` as the new next
+  ///     position;
+  ///   * derived caches (WS12 expanded K/V) must lower their valid-rows
+  ///     watermark to 0 and be rebuilt lazily with identical bits; a pool
+  ///     shared between sessions must be updated under its own lock, because
+  ///     a restore may run while another session executes.
+  /// Nothing is derived yet, so it is empty.
+  void OnStateReplaced(std::uint32_t position) noexcept { (void)position; }
 
 private:
   friend class Executor;
@@ -73,22 +96,6 @@ private:
   /// Recorded at the end of every forward pass on this session; snapshot
   /// copies wait on it instead of trusting that the pass has been synchronized.
   hipEvent_t forward_done_{nullptr};
-};
-
-/// Rollback copy of the recurrent state of a Session (device memory). The
-/// MLA cache is not copied; rollback truncates the position instead.
-class RecurrentSnapshot {
-public:
-  ~RecurrentSnapshot();
-  RecurrentSnapshot(const RecurrentSnapshot&) = delete;
-  RecurrentSnapshot& operator=(const RecurrentSnapshot&) = delete;
-  [[nodiscard]] std::size_t bytes() const noexcept;
-
-private:
-  friend class Executor;
-  RecurrentSnapshot() = default;
-  float* state_{nullptr};
-  float* conv_{nullptr};
 };
 
 /// Time spent by the last Forward, from device events.
@@ -157,11 +164,30 @@ public:
                               GpuTensorSink* sink,
                               std::string* error_msg = nullptr);
 
-  [[nodiscard]] std::unique_ptr<RecurrentSnapshot> SaveRecurrent(
-      const Session& session, std::string* error_msg = nullptr);
-  [[nodiscard]] bool RestoreRecurrent(Session& session,
-                                      const RecurrentSnapshot& snapshot,
-                                      std::string* error_msg = nullptr);
+  /// Self-contained state copy (state_io.cpp). `rows` is the position; the
+  /// destinations are the section pointers of a snapshot payload
+  /// (snapshot_format.hpp). Uses a private stream and only the session's own
+  /// buffers, so it may run on a worker while another session executes; the
+  /// session must be idle (its last forward completed).
+  struct SnapshotBuffers {
+    std::uint8_t* kda_state{nullptr};
+    std::uint8_t* kda_conv{nullptr};
+    std::uint8_t* mla{nullptr};
+  };
+  struct ConstSnapshotBuffers {
+    const std::uint8_t* kda_state{nullptr};
+    const std::uint8_t* kda_conv{nullptr};
+    const std::uint8_t* mla{nullptr};
+  };
+  [[nodiscard]] bool SaveSnapshot(const Session& session, std::uint32_t rows,
+                                  const SnapshotBuffers& out,
+                                  std::string* error_msg = nullptr) const;
+  /// Overwrites the session's KDA state, conv window and MLA rows
+  /// [0, rows) bit for bit and invalidates derived caches. The position is
+  /// the caller's to set.
+  [[nodiscard]] bool RestoreSnapshot(Session& session, std::uint32_t rows,
+                                     const ConstSnapshotBuffers& in,
+                                     std::string* error_msg = nullptr) const;
 
   /// Copies one KDA layer's state / one MLA layer's cache rows to the host
   /// (tests compare them across chunkings).
@@ -249,6 +275,12 @@ private:
   const DeviceModel& model_;
   Options options_;
   hipStream_t stream_{nullptr};
+  /// Snapshot transfers: one private stream and one pinned staging buffer per
+  /// executor (state_io.cpp), serialized by `transfer_mutex_`. No streams or
+  /// pageable copies are created per snapshot.
+  hipStream_t transfer_stream_{nullptr};
+  void* transfer_staging_{nullptr};
+  mutable std::mutex transfer_mutex_;
   std::unique_ptr<Buffers> b_;
   std::shared_ptr<std::atomic<std::uint64_t>> expanded_pool_;
   std::size_t scratch_total_{0};
