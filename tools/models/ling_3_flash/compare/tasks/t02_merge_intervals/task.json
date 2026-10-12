@@ -1,0 +1,5 @@
+{
+ "category": "bugfix",
+ "expected_tests": 7,
+ "prompt": "intervals.merge is supposed to merge overlapping OR touching closed intervals (e.g. [1,3] and [3,5] become (1,5)) and return a new sorted list of (start, end) tuples without modifying the caller's list. A test fails; fix the implementation in intervals.py (not the tests). Intervals are given as pairs (tuples or lists) with start <= end."
+}

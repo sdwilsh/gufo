@@ -1,0 +1,5 @@
+{
+ "category": "feature",
+ "expected_tests": 7,
+ "prompt": "ratelimit.TokenBucket is a stub. Implement it as a token bucket. TokenBucket(rate, capacity, clock=time.monotonic): starts full (capacity tokens); tokens refill continuously at `rate` tokens per second, never exceeding capacity; clock() returns the current time in seconds. allow(n=1) returns True and consumes n tokens if at least n are available, otherwise returns False and consumes nothing. n <= 0 raises ValueError; asking for more than capacity always returns False. retry_after(n=1) returns the seconds (float) until n tokens will be available, 0.0 if available now, and float('inf') if n exceeds capacity. Keep the injectable clock so tests can fake time."
+}

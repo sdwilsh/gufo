@@ -1,0 +1,5 @@
+{
+ "category": "refactor",
+ "expected_tests": 8,
+ "prompt": "formats.py has three copy-pasted formatters (to_csv, to_tsv, to_pipe) that differ only in the separator. Refactor: add format_rows(rows, sep) containing the shared logic (any separator string, same quoting rules as today: a field containing the separator, a double quote or a newline is wrapped in double quotes with inner quotes doubled; rows are lists of values converted with str(); lines are joined with '\\n' with no trailing newline) and reduce to_csv/to_tsv/to_pipe to one-line wrappers around it. Behaviour of the three public functions must not change."
+}

@@ -1,0 +1,5 @@
+{
+ "category": "feature",
+ "expected_tests": 9,
+ "prompt": "tmpl.render(template, context) substitutes {{ name }} placeholders (whitespace inside the braces is optional). Add filters: {{ name|upper }}, |lower, |title and |default:TEXT (TEXT is everything after the colon, up to the closing braces or the next '|', stripped). Filters can be chained left to right, e.g. {{ name|default:guest|upper }}. Semantics: a missing key (or a value of None) uses the |default filter's text if present; otherwise a missing key raises KeyError(name) as it does today, and None renders as the empty string. Non-string values are converted with str() before string filters run. An unknown filter name raises ValueError. Text outside placeholders is untouched."
+}
