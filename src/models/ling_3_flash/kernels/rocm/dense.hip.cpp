@@ -870,24 +870,32 @@ int DeviceWgps() {
 }
 
 /// Tile shape from (n, rows) and the device only; the arithmetic per output
-/// element is the same for every shape (see GemmKernel). The 128 x 128 tile
-/// amortises the staging work best but only has ~3 resident blocks per WGP;
-/// the 64 x 64 tile has ~6 and runs at ~0.7 of its rate per FLOP (fitted to
-/// the gfx1151 per-shape table of WS13 round 1). The cost is the padded
-/// tile area of all blocks, with at least one full round of resident blocks
-/// (a smaller grid leaves the GPU partly idle).
-int PickGemmShape(std::uint32_t n_tokens, std::uint32_t rows) {
-  if (n_tokens <= 16)
-    return 3;
-  if (n_tokens <= 32)
-    return 2;
+/// element is the same for every shape (see GemmKernel). Chunks of up to 32
+/// tokens take the 16 / 32 x 128 tiles while the 128-row grid still gives
+/// every WGP a block; with fewer row blocks than WGPs (768 rows: 6 blocks on
+/// 20) the 64 x 64 tile's twice as tall grid wins despite its token padding
+/// (gfx1151, WS13 round 4: 768 x 2560 n=16 0.0452 ms against 0.0504 for
+/// 16 x 128 and 0.0555 for 32 x 128, whose padded work is that of n=32;
+/// 2560 rows keep 16 x 128, 0.0183 against 0.0214). Above 64 tokens the
+/// 128 x 128 tile amortises the staging work best but only has ~3 resident
+/// blocks per WGP; the 64 x 64 tile has ~6 and runs at ~0.7 of its rate per
+/// FLOP (fitted to the gfx1151 per-shape table of WS13 round 1). The cost is
+/// the padded tile area of all blocks, with at least one full round of
+/// resident blocks (a smaller grid leaves the GPU partly idle).
+int PickGemmShape(std::uint32_t n_tokens, std::uint32_t rows, int wgps_in) {
+  const int wgps = wgps_in > 0 ? wgps_in : DeviceWgps();
+  if (n_tokens <= 32) {
+    if ((rows + 127) / 128 < static_cast<std::uint32_t>(wgps))
+      return 1;
+    return n_tokens <= 16 ? 3 : 2;
+  }
   if (n_tokens <= 64)
     return 1;
-  const double wgps = DeviceWgps();
   const auto cost = [&](int bn, int bm, double per_wgp, double eff) {
     const double blocks = std::ceil(n_tokens / static_cast<double>(bn)) *
                           std::ceil(rows / static_cast<double>(bm));
-    return std::max(blocks, wgps * per_wgp) * bn * bm / eff;
+    return std::max(blocks, static_cast<double>(wgps) * per_wgp) * bn * bm /
+           eff;
   };
   return cost(128, 128, 3, 1.0) <= cost(64, 64, 6, 0.7) ? 0 : 1;
 }
@@ -925,7 +933,7 @@ void LaunchGemm(bool q8, const void* w, const float* x, float* y,
   if (n_tokens == 0 || rows == 0)
     return;
   if (shape < 0)
-    shape = PickGemmShape(n_tokens, rows);
+    shape = PickGemmShape(n_tokens, rows, 0);
   const auto* wb = static_cast<const std::uint8_t*>(w);
   if (x_half != nullptr) {
     const std::size_t total = std::size_t{n_tokens} * k;
@@ -1105,8 +1113,8 @@ void GemmQ8_0Strided(const void* w, const float* x, float* y,
   LaunchGemm(true, w, x, y, n_tokens, k, rows, ldy, -1, scratch, stream);
 }
 
-int GemmShapeFor(std::uint32_t n_tokens, std::uint32_t rows) {
-  return PickGemmShape(n_tokens, rows);
+int GemmShapeFor(std::uint32_t n_tokens, std::uint32_t rows, int wgps) {
+  return PickGemmShape(n_tokens, rows, wgps);
 }
 
 void GemmQ8_0Shape(const void* w, const float* x, float* y,

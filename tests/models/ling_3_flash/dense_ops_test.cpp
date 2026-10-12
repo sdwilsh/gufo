@@ -694,7 +694,7 @@ void RunBench() {
       {2560, 6144},  {768, 2560},  {2560, 768}};
   for (const auto& [rows, k] : shapes) {
     const auto wq = QuantizeQ8_0(Randn(std::size_t{rows} * k, 0.5F), k);
-    for (std::uint32_t n : {16U, 64U, 128U, 512U, 2048U})
+    for (std::uint32_t n : {16U, 32U, 64U, 128U, 512U, 2048U})
       BenchGemm(true, rows, k, n, wq);
   }
 }
@@ -974,19 +974,48 @@ int main(int argc, char** argv) {
   for (const auto& [rows, k] : q8_shapes)
     TestQ8(rows, k);
   // Dispatch contract: small chunks (agent turns of 50-150 tokens) must not
-  // take the 128x128 tile.
-  for (std::uint32_t rows : {768U, 2560U, 6144U, 20512U}) {
-    const int want[][2] = {{9, 3}, {16, 3}, {17, 2}, {32, 2}, {33, 1}, {64, 1}};
-    for (const auto& [n, shape] : want) {
-      const bool ok = dn::GemmShapeFor(n, rows) == shape;
-      std::printf("%-4s GemmShapeFor(n=%d, rows=%u) == %d\n",
-                  ok ? "PASS" : "FAIL", n, rows, shape);
-      if (!ok)
-        ++g_failures;
+  // take the 128x128 tile; chunks of up to 32 tokens take the 128-row tiles
+  // only when those give every WGP a block (gfx1151: 20 WGPs, so 768 rows
+  // take 64 x 64), as on this device.
+  int device_wgps = 0;
+  HIP_OK(hipDeviceGetAttribute(&device_wgps,
+                               hipDeviceAttributeMultiprocessorCount, 0));
+  for (const int wgps : {20, 4, device_wgps}) {
+    for (std::uint32_t rows : {576U, 768U, 2560U, 6144U, 20512U}) {
+      const bool tall = (rows + 127) / 128 >= static_cast<std::uint32_t>(wgps);
+      const int want[][2] = {{9, tall ? 3 : 1},
+                             {16, tall ? 3 : 1},
+                             {17, tall ? 2 : 1},
+                             {32, tall ? 2 : 1},
+                             {33, 1},
+                             {64, 1}};
+      for (const auto& [n, shape] : want) {
+        const int got = wgps == device_wgps ? dn::GemmShapeFor(n, rows)
+                                            : dn::GemmShapeFor(n, rows, wgps);
+        const bool ok = got == shape;
+        std::printf("%-4s GemmShapeFor(n=%d, rows=%u, wgps=%d) == %d\n",
+                    ok ? "PASS" : "FAIL", n, rows, wgps, shape);
+        if (!ok)
+          ++g_failures;
+      }
     }
+  }
+  {  // gfx1151 at the bench shapes: 768 x 2560 n=16 is the 64 x 64 tile.
+    const bool ok = dn::GemmShapeFor(16, 768, 20) == 1 &&
+                    dn::GemmShapeFor(16, 2560, 20) == 3;
+    std::printf("%-4s GemmShapeFor gfx1151 n=16: 768 rows -> 1, 2560 -> 3\n",
+                ok ? "PASS" : "FAIL");
+    if (!ok)
+      ++g_failures;
   }
   // Prefill GEMM at real shapes and n in {9, 64, 512, 2048}: tile-shape and
   // split invariance (bit-exact) plus sampled accuracy.
+  // Small chunks whose dispatch depends on the WGP count: every shape gives
+  // the same bits there too.
+  for (std::uint32_t n : {16U, 32U}) {
+    TestGemmInvariance(true, 768, 2560, n);
+    TestGemmInvariance(true, 576, 2560, n);
+  }
   for (std::uint32_t n : {9U, 64U, 512U, 2048U}) {
     TestGemmInvariance(true, 20512, 2560, n);
     TestGemmInvariance(true, 2560, 4096, n);
