@@ -51,7 +51,7 @@ endif()
 # exist only when a model is named: -DGUFO_LING_MODEL=/path/first-shard.gguf.
 if (ENGINE_ENABLE_HIP)
   set(LING_MODEL_BINARIES)
-  foreach(name IN ITEMS session_test snapshot_test interleave_test
+  foreach(name IN ITEMS session_test snapshot_test snapshot_ttft_bench interleave_test
                        restore_tail_test logit_dump
                        layer_check b2 decode_digest handoff_study mtp_test
                        mtp_distribution batch_test batch_segments_test
@@ -86,7 +86,8 @@ if (ENGINE_ENABLE_HIP)
       target_sources(${target} PRIVATE
         ${PROJECT_SOURCE_DIR}/src/models/ling_3_flash/tool_calls.cpp)
     endif()
-    if (GUFO_LING_MODEL)
+    # snapshot_ttft_bench is a timing tool, not a pass/fail check.
+    if (GUFO_LING_MODEL AND NOT name STREQUAL "snapshot_ttft_bench")
       add_test(NAME ling_3_flash.model_${name}
         COMMAND ${target} ${model_args})
       set_tests_properties(ling_3_flash.model_${name} PROPERTIES

@@ -2994,7 +2994,21 @@ public:
   [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
     return snapshot == nullptr ? 0 : snapshot->SizeBytes();
   }
+  // The latent rows are copied in the background after capture; restoring
+  // or serializing waits for them, and a failed copy leaves nothing to use.
+  [[nodiscard]] bool Usable() const noexcept override {
+    return snapshot != nullptr && !snapshot->Failed();
+  }
+  /// The complete payload. Waits for the background copy.
+  [[nodiscard]] std::span<const std::uint8_t> Payload() const {
+    std::string error;
+    if (snapshot == nullptr || !snapshot->Wait(&error)) {
+      throw std::runtime_error("Ling-3.0-flash snapshot copy failed: " + error);
+    }
+    return snapshot->bytes();
+  }
 
+  // Declared before `snapshot`: destroyed after its copy thread is joined.
   std::shared_ptr<LingModel> model;
   std::unique_ptr<models::ling_3_flash::SessionSnapshot> snapshot;
 };
@@ -3503,7 +3517,7 @@ public:
   [[nodiscard]] std::size_t SerializePersistentSnapshot(
       const TextRunnerSnapshot& snapshot,
       std::span<std::uint8_t> destination) const override {
-    const auto bytes = RequireLingSnapshot(snapshot).snapshot->bytes();
+    const auto bytes = RequireLingSnapshot(snapshot).Payload();
     if (destination.size() != bytes.size()) {
       throw std::invalid_argument(
           "Ling-3.0-flash persistent snapshot serialization failed");
@@ -3514,7 +3528,7 @@ public:
 
   void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
                                 const SnapshotSink& sink) const override {
-    sink(RequireLingSnapshot(snapshot).snapshot->bytes());
+    sink(RequireLingSnapshot(snapshot).Payload());
   }
 
   void RestorePersistentSnapshot(

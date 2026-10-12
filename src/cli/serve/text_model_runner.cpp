@@ -274,6 +274,8 @@ std::string_view SnapshotEventReasonName(SnapshotEventReason reason) noexcept {
       return "capture_failure";
     case SnapshotEventReason::kReservationMismatch:
       return "reservation_mismatch";
+    case SnapshotEventReason::kUnusable:
+      return "snapshot_unusable";
   }
   return "unknown";
 }
@@ -285,7 +287,8 @@ void EmitSnapshotEvent(const SnapshotEvent& event) noexcept {
   // fewer conversations than the workload rotates through, so it is doing
   // avoidable full re-prefills. Failed captures also need attention.
   if (event.action == SnapshotEventAction::kRemoved &&
-      event.reason != SnapshotEventReason::kEntryCapacity)
+      event.reason != SnapshotEventReason::kEntryCapacity &&
+      event.reason != SnapshotEventReason::kUnusable)
     return;
   try {
     std::ostringstream line;
