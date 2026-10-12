@@ -11,6 +11,8 @@ RUN dnf -y install --setopt=install_weak_deps=False \
   && find /usr/lib64/rocblas/library /usr/lib64/hipblaslt/library -type f -name '*gfx[0-9]*' ! -name '*gfx1151*' -delete
 COPY run-suite /usr/local/bin/run-suite
 COPY tests/ /opt/gufo/tests/
+COPY base/ /opt/gufo/base/
+COPY lib/ /opt/gufo/lib/
 COPY suites/ /opt/gufo/suites/
 COPY oracle/ /opt/gufo/oracle/
 COPY oracle-novel/ /opt/gufo/oracle-novel/
@@ -32,6 +34,6 @@ USER 1000:1000
 WORKDIR /work
 ENV HOME=/work XDG_CACHE_HOME=/work/cache TMPDIR=/work/tmp PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 PATH=/usr/local/bin:/usr/bin:/bin
-ARG IMAGE=localhost/gufo:ling-int2
+ARG IMAGE=localhost/gufo-ling-int2r7
 ENV GUFO_IMAGE=${IMAGE}
 CMD ["ling-int-suite"]

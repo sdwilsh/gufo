@@ -42,6 +42,11 @@ struct ChatTemplateOptions {
   /// value renders no <think> in the generation prompt). Default "on".
   std::optional<std::string> thinking_option;
   bool add_generation_prompt{true};
+  /// When set, receives the byte ranges of the rendered text that are
+  /// conversation data (message bodies, reasoning, tool names, arguments, tool
+  /// definitions). Pass them to LingTokenizer::Encode as literal ranges so
+  /// that only the template's own markup can become control tokens.
+  std::vector<std::pair<std::size_t, std::size_t>>* literal_spans{nullptr};
 };
 
 /// Renders the pinned Bailing V3 template (see ArtifactTemplateSha256) with
