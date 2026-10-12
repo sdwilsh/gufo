@@ -93,6 +93,40 @@ __device__ __forceinline__ void QuantizeLane(float v, std::size_t i,
 }
 
 // ---------------------------------------------------------------------------
+// F16 -> Q8_0 weight re-encoding (load time, MTP draft head).
+// ---------------------------------------------------------------------------
+// One thread per 32-value block: ggml's quantize_row_q8_0_ref (d = absmax /
+// 127 in F32, id = 1 / d, q = roundf(x * id), d stored as F16). The 34-byte
+// blocks are only 2-byte aligned, so the block is written as ushorts.
+__global__ __launch_bounds__(256) void QuantizeF16ToQ8_0Kernel(
+    const __half* __restrict__ w, std::uint16_t* __restrict__ out,
+    std::uint64_t blocks) {
+  const std::uint64_t b = std::uint64_t{blockIdx.x} * 256 + threadIdx.x;
+  if (b >= blocks)
+    return;
+  const __half* src = w + b * 32;
+  float v[32];
+  float amax = 0.0F;
+#pragma unroll
+  for (int i = 0; i < 32; ++i) {
+    v[i] = __half2float(src[i]);
+    amax = fmaxf(amax, fabsf(v[i]));
+  }
+  const float d = amax / 127.0F;
+  const float id = d != 0.0F ? 1.0F / d : 0.0F;
+  std::uint16_t* dst = out + b * 17;
+  dst[0] = __half_as_ushort(__float2half(d));
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    const auto lo = static_cast<std::uint8_t>(
+        static_cast<std::int8_t>(roundf(v[2 * i] * id)));
+    const auto hi = static_cast<std::uint8_t>(
+        static_cast<std::int8_t>(roundf(v[2 * i + 1] * id)));
+    dst[1 + i] = static_cast<std::uint16_t>(lo | (hi << 8));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Q8_0 GEMV. y[t * rows + r]; k % 64 == 0.
 // ---------------------------------------------------------------------------
 template<int NT>
@@ -987,6 +1021,14 @@ std::size_t QuantActBytes(std::uint32_t n_tokens, std::uint32_t k) {
 bool GemvQ8_0Fits(std::uint32_t n_tokens, std::uint32_t k) {
   return n_tokens >= 1 && n_tokens <= kMaxGemvTokens && k % 64 == 0 &&
          kGemvLdsBytes / (2 * std::size_t{k} + k / 32 * 4) >= 1;
+}
+
+void QuantizeF16ToQ8_0(const __half* w, void* out, std::uint64_t rows,
+                       std::uint32_t k, hipStream_t stream) {
+  const std::uint64_t blocks = rows * (k / 32);
+  QuantizeF16ToQ8_0Kernel<<<static_cast<unsigned>((blocks + 255) / 256), 256, 0,
+                            stream>>>(w, static_cast<std::uint16_t*>(out),
+                                      blocks);
 }
 
 void QuantizeActivations(const float* x, std::uint32_t n_tokens,

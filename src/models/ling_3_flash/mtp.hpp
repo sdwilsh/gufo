@@ -26,7 +26,8 @@
 ///                                    cache (row i written, rows 0..i attended)
 ///   x  += moe(rmsnorm(x; ffn_norm))      512 experts, shared expert, no clamps
 ///   h'  = rmsnorm(x; layer_output_norm)  (the shared-head norm)
-///   logits = output . h'                 (the trunk's F16 lm_head)
+///   logits = output . h'                 (draft: a Q8_0 copy of the F16
+///                                         lm_head; verify: the F16 head)
 ///
 /// The block is exactly a trunk MLA + MoE block (same kernels), preceded by the
 /// eh_proj input stage and followed by its own norm; the residual stream starts
@@ -44,6 +45,19 @@
 /// lowers the position. Draft cost per step: eh_proj 13 MB + block 42 weights
 /// (MLA 0.24 GB, 8 routed experts + shared expert and router per token) + the
 /// 0.8 GB lm_head, about a quarter of a trunk step.
+///
+/// Draft head. The draft's numerics only decide ACCEPTANCE: every emitted token
+/// is scored by the verify step with the trunk's F16 head, and a sampled
+/// request's proposal q is computed from the very logits row the draft token
+/// was drawn from (MtpProposer), so any head keeps both greedy output and the
+/// p/q rejection test exact. The draft step is bandwidth bound on that head
+/// (157,184 x 2,560 F16 = 805 MB, ~3.4 ms of a ~4.2 ms step), so the draft owns
+/// a Q8_0 copy (DeviceMtp::draft_head, 427 MB, re-encoded from the resident F16
+/// weights at load when MTP is enabled; ggml Q8_0 rounding) read by the
+/// existing two-plane int8 Q8_0 GEMV that already serves the other draft
+/// projections. Weights +0.40 GiB (see Memory). Not stored in snapshots or in
+/// any numerics identity (drafts are recomputed). Model::SetMtpDraftHeadQ8
+/// switches back to the F16 head for A/B measurements.
 ///
 /// Cycle (Session::DecodeStep). The session holds the trunk logits of the last
 /// committed position. anchor = sample(logits) (always committed). k drafts
@@ -73,8 +87,8 @@
 /// Memory: 0.5 GiB shared checkpoint scratch, per session 1152 bytes per
 /// context token (the MTP latent cache, 75 MiB at 64k) plus 10 KiB, and the
 /// block-42 weights (about 1.2 GiB: Q8_0 MLA/shared/eh_proj, IQ4_XS/Q4_K
-/// experts). Snapshots carry the MTP rows and hidden carry so restored sessions
-/// keep drafting.
+/// experts) plus the 0.40 GiB Q8_0 draft head. Snapshots carry the MTP rows and
+/// hidden carry so restored sessions keep drafting.
 ///
 /// Wiring. The block lives in the main GGUF, so `--speculative mtp` needs no
 /// `--mtp-model` for Ling (the option is refused for this architecture): the

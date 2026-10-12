@@ -59,6 +59,11 @@ struct DeviceMtp {
   DeviceTensor eh_proj;            ///< Q8_0 [5120 -> 2560]
   DeviceTensor enorm, hnorm;       ///< F32 [2560]
   DeviceTensor layer_output_norm;  ///< F32 [2560], the shared-head norm
+  /// Q8_0 [2560 -> 157184] copy of the trunk's F16 output head, built at load
+  /// from the resident F16 weights (+0.4 GB). Only the draft step reads it:
+  /// draft numerics change acceptance, never the emitted tokens (the verify
+  /// step scores with the F16 head). See mtp.hpp.
+  DeviceTensor draft_head;
 };
 
 struct UploadStats {
@@ -108,6 +113,9 @@ public:
 
 private:
   DeviceModel() = default;
+  /// Builds mtp_.draft_head from the resident output head.
+  [[nodiscard]] static bool BuildDraftHead(DeviceModel& m,
+                                           std::string* error_msg);
 
   Config config_;
   DeviceTensor token_embd_, output_norm_, output_;

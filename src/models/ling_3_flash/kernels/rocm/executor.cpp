@@ -1396,9 +1396,18 @@ bool Executor::MtpDraft(Session& session, const DraftRequest& r,
   }
   dense::RmsNormRows(b.h, m.layer_output_norm.f32(), b.mtp_hn, 1, kHidden, 1,
                      kRmsEps, stream_);
-  dense::GemvF16(model_.output().f16(), b.mtp_hn, b.logits, 1, kHidden,
-                 kVocabRows, b.scratch, stream_);
-  Mark("draft.head_logits_gemv", TensorBytes(model_.output()));
+  // The draft scores with its own Q8_0 copy of the head (acceptance only: the
+  // verify step and the sampled p use the F16 head); logits, argmax and the
+  // proposal q all come from this one row.
+  if (draft_head_q8_) {
+    dense::GemvQ8_0(m.draft_head.data, b.mtp_hn, b.logits, 1, kHidden,
+                    kVocabRows, b.scratch, stream_);
+    Mark("draft.head_logits_gemv", TensorBytes(m.draft_head));
+  } else {
+    dense::GemvF16(model_.output().f16(), b.mtp_hn, b.logits, 1, kHidden,
+                   kVocabRows, b.scratch, stream_);
+    Mark("draft.head_logits_gemv", TensorBytes(model_.output()));
+  }
   mtp::ArgmaxRows(b.logits, 1, kVocabRows, b.argmax_idx, b.argmax_val, stream_);
   Mark("draft.argmax", 0);
   (void)hipEventRecord(draft_events_[1], stream_);
