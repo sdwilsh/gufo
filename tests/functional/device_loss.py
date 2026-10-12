@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 import socket
 import subprocess
+import threading
 import time
 
 
@@ -37,9 +38,27 @@ def require(condition, message):
         raise AssertionError(message)
 
 
+# The server process and wall-clock bound of the running case. A wedged server
+# must fail the case, not hang the pod. It may hold a stream open with
+# keepalives, which keep every socket read inside its 15 s timeout, or it may
+# never answer. The timer kills the server, which unblocks every read.
+GUARD = {"process": None, "request_timeout": 120.0, "timed_out": None}
+
+
+def kill_on_timeout(what):
+    GUARD["timed_out"] = what
+    process = GUARD["process"]
+    if process is not None and process.poll() is None:
+        process.kill()
+
+
 def request(port, method, path, body=None):
     start = time.monotonic()
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+    timer = threading.Timer(GUARD["request_timeout"], kill_on_timeout,
+                            [f"{method} {path} exceeded {GUARD['request_timeout']}s"])
+    timer.daemon = True
+    timer.start()
     try:
         connection.request(
             method, path, None if body is None else json.dumps(body),
@@ -53,6 +72,7 @@ def request(port, method, path, body=None):
             "wall_s": time.monotonic() - start,
         }
     finally:
+        timer.cancel()
         connection.close()
 
 
@@ -129,6 +149,11 @@ def run_case(args, name):
     peer = None
     with log_path.open("w") as log:
         process = subprocess.Popen(command, env=environment, stdout=log, stderr=log)
+        GUARD.update(process=process, timed_out=None, request_timeout=args.request_timeout)
+        case_timer = threading.Timer(args.case_timeout, kill_on_timeout,
+                                     [f"case exceeded {args.case_timeout}s"])
+        case_timer.daemon = True
+        case_timer.start()
         try:
             def ready():
                 try:
@@ -193,6 +218,10 @@ def run_case(args, name):
                     record["exit_code"] = process.wait(timeout=13)
             elif name == "loss-after-token-chat":
                 connection = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+                stream_timer = threading.Timer(args.request_timeout, kill_on_timeout,
+                                               [f"stream exceeded {args.request_timeout}s"])
+                stream_timer.daemon = True
+                stream_timer.start()
                 connection.request("POST", path, json.dumps(body),
                                    {"Content-Type": "application/json"})
                 response = connection.getresponse()
@@ -210,6 +239,7 @@ def run_case(args, name):
                 started = time.monotonic()
                 (output / "armed").touch()
                 pieces.append(response.read().decode())
+                stream_timer.cancel()
                 connection.close()
                 record["failure"] = {"status": response.status, "body": "".join(pieces)}
                 require('"code":"device_lost"' in record["failure"]["body"],
@@ -332,7 +362,10 @@ def run_case(args, name):
         except Exception as error:
             record["status"] = "fail"
             record["error"] = f"{type(error).__name__}: {error}"
+            if GUARD["timed_out"]:
+                record["error"] = f"timeout, server killed ({GUARD['timed_out']}): " + record["error"]
         finally:
+            case_timer.cancel()
             if peer is not None:
                 peer.close()
             if process.poll() is None:
@@ -360,6 +393,10 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--case", choices=CASES, action="append")
     parser.add_argument("--startup-timeout", type=float, default=120)
+    parser.add_argument("--request-timeout", type=float, default=120,
+                        help="seconds per HTTP request or stream before the server is killed")
+    parser.add_argument("--case-timeout", type=float, default=600,
+                        help="seconds per case (startup included) before the server is killed")
     parser.add_argument("server", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.server and args.server[0] == "--":

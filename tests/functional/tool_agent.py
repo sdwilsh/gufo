@@ -9,8 +9,15 @@ from tool_reasoning import response_result
 from cache_growth import check_unchanged_retry, log_offset
 
 
-def check_tool_history(client, model, checks, chat_result, vision, image_content, server_log=None):
-    """Old names do not declare new tools or prevent the next turn (#357)."""
+def check_tool_history(client, model, checks, chat_result, vision, image_content,
+                       server_log=None, checkpoint_tail=0):
+    """Old names do not declare new tools or prevent the next turn (#357).
+
+    A retry restores the whole prompt. A runner that may restore only the
+    stable boundary instead (see CHECKPOINT_TAIL_TOKENS) keeps it before the
+    final user turn, which follows tool results (#407), and `checkpoint_tail`
+    tokens back from its end: the retry then prefills that turn again, at most
+    one token per byte."""
     import openai
 
     tools = [{"type": "function", "function": {
@@ -34,6 +41,8 @@ def check_tool_history(client, model, checks, chat_result, vision, image_content
     chat = dict(model=model, messages=messages, tools=tools, tool_choice="required",
                 parallel_tool_calls=False, temperature=0, seed=41,
                 reasoning_effort="none", max_completion_tokens=128)
+    retry_tail = (checkpoint_tail + len(messages[-1]["content"].encode())
+                  if checkpoint_tail else 0)
     # Use actual Responses function_call items, not Chat-shaped message items.
     items = deepcopy(messages[:-4])
     if vision:
@@ -76,7 +85,8 @@ def check_tool_history(client, model, checks, chat_result, vision, image_content
             total = usage.get("input_tokens", usage.get("prompt_tokens"))
             check_unchanged_retry(name, result, total - details["cached_tokens"],
                                   server_log, replay_start, replay_end,
-                                  mutable_suffix_tokens=mutable_suffix_tokens)
+                                  mutable_suffix_tokens=mutable_suffix_tokens,
+                                  checkpoint_tail=retry_tail)
         return function
 
     for endpoint, request in (("chat", chat), ("responses", responses)):
@@ -497,7 +507,8 @@ def check_union_continuation(client, model, checks, chat_result):
               "Replaced one block.")
 
 
-def check_tool_schema_edges(client, model, checks, chat_result, vision, image_content, server_log=None):
+def check_tool_schema_edges(client, model, checks, chat_result, vision, image_content,
+                            server_log=None, checkpoint_tail=0):
     """Admitted arguments preserve JSON types; invalid schemas cannot dead-end."""
     wildcard = {"type": "object", "properties": {"value": {"type": "string"}},
                 "required": ["value"], "patternProperties": {"^x_": {}}}
@@ -583,7 +594,8 @@ def check_tool_schema_edges(client, model, checks, chat_result, vision, image_co
             repeated = save(name + "_cached", chat_result(client, chat, True), arguments)
             check_unchanged_retry("schema_edges_uri_cached", repeated,
                                   repeated["usage"]["gufo"]["prefill_tokens"],
-                                  server_log, replay_start, replay_end)
+                                  server_log, replay_start, replay_end,
+                                  checkpoint_tail=checkpoint_tail)
             for label, update, finish in (
                     ("limit", {"max_completion_tokens": 2}, "length"),
                     ("stop", {"stop": "example.org"}, "stop")):
