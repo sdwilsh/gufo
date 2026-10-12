@@ -18,7 +18,10 @@
 //     decoding and sampled speculative decoding commits only grammar tokens.
 //   * serving_strict_tool_*: InferenceBackend with MTP answers a forced
 //     strict tool (the const value holds `</tool_call>`) with exactly that
-//     value through the Bailing parser.
+//     value through the Bailing parser; count_chat_tokens (Messages
+//     count_tokens) equals the prompt it prefills.
+//   * serving_images_refused: an image in a user turn or a tool result is
+//     refused by count_chat_tokens and chat (Ling reads text only).
 //   * serving_cached_replay_thinking_*: InferenceBackend with MTP restores a
 //     repeated >= 128-token prompt whole (no prefill) after uncached requests
 //     with other samplers, and replays the first answer (the openai_sdk
@@ -39,6 +42,8 @@
 //            [--max-batch N] [--timeout-seconds S] [--hold-seconds S]
 
 #include <array>
+#include <memory>
+#include <optional>
 #include <random>
 #include <stdexcept>
 
@@ -595,6 +600,64 @@ int Execute(const Args& args, Report& report,
       request.tool_choice = server::ChatRequest::ToolChoice::kRequired;
       request.forced_tool_name = "record";
       request.parallel_tool_calls = false;
+      // /v1/messages/count_tokens (#512): the count renders the same Bailing
+      // tool prompt through the Ling template, before any work, and equals
+      // the prompt the request then prefills. An image in a user turn or a
+      // tool result (#510) is refused by both, as Ling reads text only.
+      std::optional<std::size_t> counted;
+      std::string count_error;
+      try {
+        counted = backend.count_chat_tokens(request);
+      } catch (const std::exception& exception) {
+        count_error = exception.what();
+      }
+      std::size_t served_prompt_tokens = 0;
+      const auto refused = [&](server::ChatRequest image_request,
+                               bool count) -> std::string {
+        try {
+          if (count) {
+            (void)backend.count_chat_tokens(image_request);
+          } else {
+            (void)backend.chat(image_request, 8, {});
+          }
+        } catch (const std::invalid_argument& exception) {
+          return exception.what();
+        }
+        return "accepted";
+      };
+      const auto with_image = [&](bool tool_result) {
+        auto image_request = request;
+        if (tool_result) {
+          gufo::tokenization::ChatMessage call(
+              gufo::tokenization::ChatRole::kAssistant, "");
+          call.tool_calls.push_back(
+              {.id = "c1",
+               .name = "record",
+               .arguments = {{.name = "value", .value = "x"}}});
+          gufo::tokenization::ChatMessage result(
+              gufo::tokenization::ChatRole::kTool, "pixels:");
+          result.tool_call_id = "c1";
+          image_request.messages.push_back(std::move(call));
+          image_request.messages.push_back(std::move(result));
+        }
+        image_request.messages.back().images.push_back(
+            {.offset = 0,
+             .bytes = std::make_shared<const std::vector<std::uint8_t>>(
+                 std::vector<std::uint8_t>{1, 2, 3})});
+        return image_request;
+      };
+      auto image_checks = json::Value::object();
+      bool images_refused = true;
+      for (const bool tool_result : {false, true}) {
+        for (const bool count : {true, false}) {
+          const auto what = refused(with_image(tool_result), count);
+          image_checks[std::string(tool_result ? "tool_result" : "user") +
+                       (count ? "_count" : "_chat")] = what;
+          images_refused =
+              images_refused && what == "model does not support image input";
+        }
+      }
+      check("serving_images_refused", images_refused, std::move(image_checks));
       for (const float temperature : {0.0F, 0.8F}) {
         sampling::SamplingConfig config;
         config.temperature = temperature;
@@ -613,10 +676,19 @@ int Execute(const Args& args, Report& report,
         serving["completion_tokens"] = U(result.completion_tokens);
         serving["draft_tokens"] = U(result.draft_tokens);
         serving["text_head"] = result.text.substr(0, 400);
+        served_prompt_tokens = result.prompt_tokens;
         check(std::string("serving_strict_tool_") +
                   (temperature == 0.0F ? "greedy" : "sampled"),
               exact, std::move(serving));
       }
+      auto counting = json::Value::object();
+      counting["counted"] = U(counted.value_or(0));
+      counting["prompt_tokens"] = U(served_prompt_tokens);
+      counting["error"] = count_error;
+      check("serving_count_tokens_equals_prompt",
+            counted.has_value() && *counted > 0 &&
+                *counted == served_prompt_tokens,
+            std::move(counting));
     }
   }
 

@@ -89,6 +89,76 @@ class FunctionalRunnerTest(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(AssertionError):
                 assert_prompt_count(318, {"input_tokens": value})
 
+    def test_messages_count_tokens_lifts_plain_prompt_above_snapshot_floor(self):
+        # A Ling-like server keeps no snapshot below 128 prompt tokens, so the
+        # unchanged plain repeat can read the cache only behind the neutral
+        # system context the ling3 preset passes.
+        import types
+        import messages_count_tokens as counting
+
+        class APIStatusError(Exception):
+            def __init__(self, status, body):
+                super().__init__(status)
+                self.status_code, self.body = status, body
+
+        class Metrics:
+            def __init__(self, base_url):
+                pass
+
+            def read(self):
+                return {key: 0 for key in (*COUNTERS, PROCESSING, counting.DEFERRED)}
+
+            def wait(self, predicate, label):
+                return self.read()
+
+        class Client:
+            base_url = "http://fake/v1"
+
+            def __init__(self):
+                self.seen, self.bodies = set(), []
+
+            @staticmethod
+            def tokens(body):
+                prompt = {key: body.get(key) for key in (
+                    "system", "messages", "tools", "tool_choice", "thinking", "output_config")}
+                if isinstance(prompt["system"], list):
+                    prompt["system"] = "".join(block["text"] for block in prompt["system"])
+                return len(json.dumps(prompt, ensure_ascii=False)) // 4
+
+            def post(self, path, body, cast_to):
+                self.bodies.append((path, body))
+                if not body.get("messages") or body.get("thinking") is True or body.get("stream"):
+                    raise APIStatusError(400, {})
+                if body["model"] != "m":
+                    raise APIStatusError(404, {})
+                total = self.tokens(body)
+                if path == "/messages/count_tokens":
+                    return {"input_tokens": total}
+                if total > 4096:
+                    raise APIStatusError(400, {})
+                key = json.dumps({k: v for k, v in body.items() if k != "max_tokens"},
+                                 sort_keys=True)
+                cached = total - 9 if key in self.seen and total >= 128 else 0
+                self.seen.add(key)
+                return {"content": [{"type": "text", "text": "COUNT_OK"}],
+                        "timings": {"prompt_n": total - cached},
+                        "usage": {"input_tokens": total - cached,
+                                  "cache_read_input_tokens": cached,
+                                  "cache_creation_input_tokens": 0, "output_tokens": 3}}
+
+        fake_openai = types.SimpleNamespace(APIStatusError=APIStatusError)
+        context = "Reference note: the build uses CMake presets.\n" * 16
+        with patch.dict(sys.modules, {"openai": fake_openai}), \
+                patch.object(counting, "ServerMetrics", Metrics), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(AssertionError):
+                counting.check_messages_count_tokens(Client(), "m", {}, 4096)
+            client, checks = Client(), {}
+            counting.check_messages_count_tokens(client, "m", checks, 4096, context)
+        self.assertEqual(client.bodies[0][1]["system"], context)
+        self.assertGreater(checks["messages_count_tokens_plain_cached"]
+                           ["usage"]["cache_read_input_tokens"], 0)
+
     def test_harness_hash_covers_imported_modules(self):
         # Baselines are matched by harness_sha256, so modules reached only
         # through imports must change the hash too.
