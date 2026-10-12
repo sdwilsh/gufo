@@ -1,0 +1,30 @@
+# Ling-3.0-flash sampled MTP over LONG outputs and under the Bailing tool grammar (WS30).
+# Pod: memory 19Gi, amd.com/gpu: 1, /models read-only, /work emptyDir >= 4Gi, NO HSA_OVERRIDE.
+# run-suite --suite /opt/gufo/suites/mtp-long-tests.txt --timeout 7200 (or name one label).
+# Every MTP sequence is teacher-forced: PIT/KS (pooled and per position), stop/top-1
+# calibration, no p = 0 token, final logits == teacher forcing bit for bit after the whole
+# sequence; two-sample permutation tests against ar (first 32 positions, stop rate, length,
+# pooled token frequencies, mean log p, repeated 4-gram rate); tool prompts: every complete
+# call parsed by the Bailing parser must give back the raw argument text, and under the
+# grammar every sequence must re-validate from scratch and the mask must have bound (mtp_distribution.cpp).
+# Host only (~1 min): sampled MTP cycle under the real Bailing grammar, synthetic model,
+# 300 x <=640 tokens per case, plus 7 injected bugs that must be detected.
+@label=mtp_constrained_chain @timeout=1800 ling_3_flash_mtp_constrained_chain_test
+# Forced-call binding turn (prompts 6/7: only a strict write_file with enum `mode`, integer
+# `mode_bits` and raw string `content`; short file requested). grammar_bind forces the call from
+# the first token, so the grammar must remove probability mass at the key, enum and integer
+# positions before the content; --require-binding fails a row with no call opened, no tokens in
+# a call or no masked step, --require-calls one without complete calls (mode and mode_bits
+# parsed). preset is the unconstrained control. 120 x 320 tokens, ~75 min.
+@label=mtp_long_tool @timeout=6000 ling_3_flash_mtp_distribution --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --prompt-ids 6 --configs grammar_bind,preset --modes ar,mtp --samples 120 --tokens 320 --require-binding --require-calls --max-context 2048 --permutations 20000 --timeout-seconds 5900
+# The same turn with thinking on (a two-sentence reasoning, then the forced call).
+# 60 x 700 tokens. ~40 min.
+@label=mtp_long_think @timeout=3600 ling_3_flash_mtp_distribution --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --prompt-ids 7 --configs grammar_bind --modes ar,mtp --samples 60 --tokens 700 --require-binding --require-calls --max-context 2048 --permutations 20000 --timeout-seconds 3500
+# Code continuation without a grammar, fixed 3 drafts, and the prompt-cache round trip every
+# 48 tokens (snapshot, restore into another session, fresh draft policy): its sequences must
+# equal mtp_fixed's token for token. 60 x 400 tokens. ~35 min.
+@label=mtp_long_restore @timeout=3600 ling_3_flash_mtp_distribution --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --prompt-ids 2 --configs preset --modes ar,mtp_fixed,mtp_fixed_restore --restore-every 48 --samples 60 --tokens 400 --max-context 2048 --permutations 20000 --timeout-seconds 3500
+# Long-run consistency: 6 sampled MTP continuations of 3000 tokens (prose, adaptive drafts);
+# the MTP session's final logits must equal teacher forcing of the committed 3000 tokens bit
+# for bit (KDA rollback, MTP rows and hidden carry over ~1000 cycles); PIT over 18000 values.
+@label=mtp_long_run_consistency @timeout=1800 ling_3_flash_mtp_distribution --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --prompt-ids 0 --configs preset --modes mtp --samples 6 --tokens 3000 --max-context 4096 --timeout-seconds 1700

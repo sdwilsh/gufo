@@ -105,6 +105,10 @@ public:
   /// A lazy tool grammar can admit the entire vocabulary before a call.
   /// Retain ordinary CPU/GPU sampling while its mask makes no restriction.
   [[nodiscard]] bool NeedsConstraintMask() const;
+  /// The grammar state after the accepted tokens (empty without a grammar).
+  [[nodiscard]] const JsonConstraint::State& constraint_state() const noexcept {
+    return constraint_state_;
+  }
   [[nodiscard]] std::span<const TokenId> history() const noexcept;
   [[nodiscard]] std::span<const TokenPenalty> penalties() const noexcept {
     return penalty_counts_;

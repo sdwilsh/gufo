@@ -4,6 +4,7 @@
 usage: ling-cache-suite [--model PATH] [--suites a,b,...] [--skip-hermes] [--speculative off|mtp]
                         [--skip-functional] [--context N] [--sessions N]
                         [--cache-ram-bytes N] [--hermes-steps N] [--timeout SEC]
+                        [--work DIR]
 Environment equivalents: MODEL, LING_SUITES, LING_CONTEXT, LING_SESSIONS,
 LING_CACHE_RAM_BYTES, LING_HERMES_STEPS.
 
@@ -19,9 +20,13 @@ Phases (progress on stderr with the prefix [ling-cache]):
 Summary: per phase status, per-suite request/cached/prefill token totals, the
 server's own per-request cache outcomes (memory/disk/miss with miss reasons
 parsed from the terminal log lines) and the Hermes per-step prefill tokens.
-Exit 0 only when every selected phase passed. Only /work is written.
+Exit 0 only when every selected phase passed; a child that exits non-zero fails
+its phase whatever its report says. Only /work is written: each invocation uses
+its own directory WORK/run-<time>-<pid> (WORK defaults to /work/ling-cache), so
+the suite can run again in the same pod. The disk caches are removed once their
+phase is done; logs and reports stay.
 """
-import argparse, glob, json, os, re, signal, socket, subprocess, sys, time, http.client
+import argparse, glob, json, os, re, shutil, signal, socket, subprocess, sys, time, http.client
 
 HOME = os.environ.get("HOME", "/work")
 # GGUF digest cache: point LING_DIGEST_CACHE (or XDG_CACHE_HOME) at a persistent
@@ -164,6 +169,8 @@ def main():
     ap.add_argument("--speculative", choices=("off", "mtp"), default="mtp",
                     help="speculative mode of every server this suite starts, passed explicitly "
                          "(Ling's default is mtp)")
+    ap.add_argument("--work", default=os.path.join(HOME, "ling-cache"),
+                    help="parent of this invocation's fresh run directory")
     args = ap.parse_args()
     t0 = time.monotonic()
     summary = {"tool": "ling-cache-suite", "image": os.environ.get("GUFO_IMAGE"),
@@ -176,6 +183,14 @@ def main():
         print(json.dumps(summary, separators=(",", ":")), flush=True)
         return 77
     os.makedirs(HOME + "/tmp", exist_ok=True)
+    # A fresh directory per invocation: run.py refuses an existing output
+    # directory, and a stale report or disk cache must never stand in for this
+    # run's results.
+    os.makedirs(args.work, exist_ok=True)
+    run_dir = os.path.join(args.work, "run-%s-%d" % (time.strftime("%Y%m%dT%H%M%S"), os.getpid()))
+    os.makedirs(run_dir)
+    summary["run_dir"] = run_dir
+    log("run directory " + run_dir)
     server_args = ["serve", "llm", "--model", args.model, "--sessions", str(args.sessions),
                    "--context", str(args.context), "--speculative", args.speculative,
                    "--cache-ram-bytes", str(args.cache_ram_bytes)]
@@ -183,13 +198,14 @@ def main():
 
     if not args.skip_hermes:
         phase = summary["phases"]["hermes"] = {}
-        out = HOME + "/hermes"
-        os.makedirs(out, exist_ok=True)
+        out = run_dir + "/hermes"
+        os.makedirs(out)
+        disk = run_dir + "/disk-hermes"
         port = free_port()
         logp = out + "/server.log"
         cmd = ["gufo", *server_args, "--host", "127.0.0.1", "--port", str(port),
                "--served-model-name", "functional-test", "--max-pending-per-client", "8",
-               "--cache-disk", HOME + "/disk-hermes", "--cache-disk-bytes", str(8 << 30),
+               "--cache-disk", disk, "--cache-disk-bytes", str(8 << 30),
                # Staging must hold at least one snapshot of the longest context
                # (0.5 GiB at 60k tokens) with room to spare.
                "--cache-disk-staging-bytes", str(1 << 30)]
@@ -213,6 +229,10 @@ def main():
                     report = json.load(open(out + "/hermes.json"))
                     phase["status"] = report["status"]
                     phase["failures"] = report["failures"]
+                    if r.returncode != 0:
+                        phase["status"] = "failed"
+                        phase["failures"] = phase["failures"] + [
+                            "cache_hermes.py exited %d" % r.returncode]
                     phase["variants"] = {
                         v: {"prefill_tokens_per_step": d["tokens_prefilled_per_step"],
                             "reused_tokens_per_step": d["tokens_reused_per_step"],
@@ -273,11 +293,12 @@ def main():
         phase["server_cache"] = cache_lines(*(logp if isinstance(logp, list) else [logp]))
         phase["server_events"] = snapshot_events(*(logp if isinstance(logp, list) else [logp]))
         phase["seconds"] = round(time.monotonic() - started, 1)
+        shutil.rmtree(disk, ignore_errors=True)
         ok &= phase.get("status") == "passed"
 
     if not args.skip_functional:
         phase = summary["phases"]["functional"] = {}
-        out = HOME + "/functional"
+        out = run_dir + "/functional"
         started = time.monotonic()
         cmd = [sys.executable, TESTS + "/run.py", "--output", out, "--sampling-preset", "ling3",
                "--record-baseline", "--suite-timeout", "3000"]
@@ -312,6 +333,11 @@ def main():
         except (OSError, ValueError, KeyError) as e:
             phase["status"] = "failed"
             phase["error"] = str(e)
+        if r.returncode != 0:
+            # The report can be partial (or absent) after a non-zero exit.
+            phase["status"] = "failed"
+            phase["error"] = ("run.py exited %d" % r.returncode
+                              + ("; " + phase["error"] if phase.get("error") else ""))[:500]
         failed_conditions, failed_logs = [], []
         for name, row in report.get("suites", {}).items():
             if row["status"] != "passed":
@@ -333,6 +359,7 @@ def main():
         phase["server_cache"] = cache_lines(*logs)
         phase["server_events"] = snapshot_events(*logs)
         phase["seconds"] = round(time.monotonic() - started, 1)
+        shutil.rmtree(out + "/disk", ignore_errors=True)
         ok &= phase.get("status") == "passed" and r.returncode == 0
 
     summary["env_after"] = gpu_and_memory()

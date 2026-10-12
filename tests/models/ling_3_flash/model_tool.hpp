@@ -145,6 +145,10 @@ public:
   /// Best-effort dump of the latest report from a fatal signal handler: a
   /// crashed or killed run still returns whatever was measured so far.
   static void WriteCrashDump(int signal_number) {
+    const std::string& marker = StdoutMarker();
+    if (!marker.empty()) {
+      (void)!::write(1, marker.data(), marker.size());
+    }
     const char head[] = "{\"status\":\"crashed\",\"signal\":";
     const std::string num = std::to_string(signal_number);
     const char mid[] = ",\"partial\":";
@@ -162,6 +166,13 @@ public:
   static std::string& LastRender() {
     static std::string text;
     return text;
+  }
+  /// When set, the report is written once, on stdout only, as one line that
+  /// starts with this marker (run-suite strips it); otherwise it is written to
+  /// stdout and echoed to stderr after `[report-json] `.
+  static std::string& StdoutMarker() {
+    static std::string marker;
+    return marker;
   }
   static std::string& PartialFile() {
     static std::string path;
@@ -189,9 +200,14 @@ public:
       text = std::string("{\"status\":\"error\",\"error\":\"report: ") +
              e.what() + "\"}";
     }
+    std::fflush(stderr);
+    std::fputs(StdoutMarker().c_str(), stdout);
     std::fwrite(text.data(), 1, text.size(), stdout);
     std::fputc('\n', stdout);
     std::fflush(stdout);
+    if (!StdoutMarker().empty()) {
+      return true;
+    }
     // run-suite keeps a tool's stdout until the whole suite ends; echo the
     // report to stderr (pod logs) so it is readable before any hold.
     std::fputs("[report-json] ", stderr);

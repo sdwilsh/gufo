@@ -291,12 +291,21 @@ void TestReferencesAndConst() {
   auto scan = ScanBailingToolCalls(
       One("record", Pair("n", "42") + Pair("b", "true") + Pair("s", "42") +
                         Pair("z", "null") + Pair("a", "[1]") +
-                        Pair("missing", "[2]")),
+                        Pair("missing", "1")),
       tools, false, false);
   Expect(scan.calls.size() == 1 &&
              Arguments(scan.calls[0]) ==
-                 R"({"n":42,"b":true,"s":"42","z":null,"a":[1],"missing":[2]})",
-         "referenced parameters keep their JSON types");
+                 R"({"n":42,"b":true,"s":"42","z":null,"a":[1],"missing":"1"})",
+         "referenced parameters keep their JSON types; an unresolvable one is "
+         "a string");
+  for (const char* raw : {"1", "true", "[]"}) {
+    scan = ScanBailingToolCalls(One("record", Pair("missing", raw)), tools,
+                                false, false);
+    Expect(scan.calls.size() == 1 &&
+               Arguments(scan.calls[0]) ==
+                   std::string(R"({"missing":")") + raw + "\"}",
+           "an unresolvable reference stays a string");
+  }
   scan = ScanBailingToolCalls(
       One("finite", Pair("text", "42") + Pair("union", "42") +
                         Pair("mixed", "17") + Pair("node", "5")),
@@ -316,6 +325,20 @@ void TestReferencesAndConst() {
                               false);
   Expect(Arguments(scan.calls.at(0)) == R"({"node":"leaf"})",
          "a recursive reference falls back to text");
+}
+
+// A declared key may begin or end with spaces; that exact spelling survives,
+// other keys are stripped.
+void TestSpacedKeys() {
+  const std::vector<BailingTool> tools{
+      Tool("record", R"({"type":"object","properties":{
+        " value ":{"type":"string"},"n":{"type":"integer"}}})")};
+  const auto scan = ScanBailingToolCalls(
+      One("record", Pair(" value ", "alpha") + Pair(" n ", "3")), tools, false,
+      false);
+  Expect(scan.calls.size() == 1 &&
+             Arguments(scan.calls[0]) == R"({" value ":"alpha","n":3})",
+         "a declared spaced key keeps its spelling");
 }
 
 void TestUndeclaredAndHuge() {
@@ -352,6 +375,7 @@ int main() {
   TestStructure();
   TestTruncation();
   TestReferencesAndConst();
+  TestSpacedKeys();
   std::cout << "bailing_tool_calls_test passed\n";
   return 0;
 }

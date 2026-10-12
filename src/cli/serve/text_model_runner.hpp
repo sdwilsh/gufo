@@ -265,6 +265,9 @@ public:
       const {
     return sampling::JsonConstraint::ToolFormat::kJson;
   }
+  /// How this model writes tool calls. kBailing calls are grammar-steered in
+  /// their native markup (JsonConstraint::ToolFormat::kBailing) and parsed by
+  /// ScanBailingToolCalls.
   [[nodiscard]] virtual TextGenerationBackend::ToolCallSyntax ToolSyntax()
       const {
     return TextGenerationBackend::ToolCallSyntax::kDefault;
