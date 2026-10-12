@@ -1,0 +1,5 @@
+{
+ "category": "feature",
+ "expected_tests": 7,
+ "prompt": "config.parse_ini(text) returns {section: {key: value}} (all strings). Extend it: (1) lines whose first non-blank character is ';' or '#' are comments and ignored; (2) inline comments: an unquoted value ends at ' ;' or ' #' (a comment marker preceded by whitespace); markers inside a value without preceding whitespace (e.g. 'a#b') are part of the value; (3) values wrapped in matching double quotes keep everything inside verbatim (including ';', '#' and surrounding spaces) and the quotes are removed; (4) keys before any [section] header go in the section named '' ; (5) a malformed line (no '=' and not a header or comment) raises ValueError mentioning the 1-based line number. Keys and section names are stripped; blank lines are ignored."
+}

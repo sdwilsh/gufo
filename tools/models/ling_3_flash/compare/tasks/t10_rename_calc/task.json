@@ -1,0 +1,5 @@
+{
+ "category": "refactor",
+ "expected_tests": 7,
+ "prompt": "Refactor: the function shop.calc.calc(items) is badly named. Rename it to compute_total (same module, same behaviour: sum of price * quantity over (name, price, quantity) tuples, rounded to 2 decimals) and update every caller in the project to use the new name. Keep a backward-compatible shop.calc.calc that calls compute_total and emits a DeprecationWarning (warnings.warn with DeprecationWarning). No module other than shop/calc.py may reference the old name 'calc' as an imported or called function anymore. All existing tests must still pass."
+}
