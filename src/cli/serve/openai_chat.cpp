@@ -60,6 +60,8 @@ namespace {
 
 struct ParsedChatRequest {
   ChatRequest chat;
+  // HTTP request id, for the debug generation log.
+  std::string request_id;
   std::string model;
   std::size_t max_tokens{0};
   sampling::SamplingConfig sampling;
@@ -108,6 +110,7 @@ ToolMarkerSet ToolMarkers(
     ToolSyntax syntax = ToolSyntax::kDefault) {
   using Format = sampling::JsonConstraint::ToolFormat;
   static constexpr const auto& qwen = kQwenMarkers;
+  // Bailing output admits only its own opener, constrained or not.
   if (syntax == ToolSyntax::kBailing)
     return kBailingMarkers;
   // The template writes "\n\n" before the call block. As in llama.cpp
@@ -2271,6 +2274,18 @@ ParsedGeneration ParseStructuredGeneration(
   }
   const auto content = tool_only ? raw : Trim(raw);
   quotes.Reset(content);
+  // Bailing calls beside a response schema: the grammar admits one call or
+  // the JSON answer, which cannot begin with the opener, so a leading opener
+  // is a call in the model's own syntax.
+  if (syntax == ToolSyntax::kBailing && !tools.empty() &&
+      choice != ChatRequest::ToolChoice::kNone &&
+      EarliestMarker(content, markers, quotes) == 0) {
+    auto native = ParseGeneration(
+        content, TextGenerationBackend::InitialOutputState::kContent, tools,
+        choice, enforce_required, markers, closers, quotes, syntax, end);
+    native.reasoning_content = std::move(parsed.reasoning_content);
+    return native;
+  }
   if (const auto marker = EarliestMarker(content, markers, quotes);
       !tools.empty() && choice != ChatRequest::ToolChoice::kNone &&
       (tool_only || marker == 0) && marker != std::string_view::npos &&
@@ -2447,6 +2462,48 @@ json::Value ToolCallsJson(std::span<const ParsedToolCall> calls) {
     output.push_back(std::move(item));
   }
   return output;
+}
+
+// Debug only: what the model wrote, then what the parser made of it, so a
+// failed client check can be traced from the server log. The raw line comes
+// first: a parse that rejects the output (tool_choice unsatisfied) still has
+// it.
+constexpr std::size_t kLoggedGenerationBytes = 32768;
+
+std::string LoggedText(std::string_view text) {
+  if (text.size() <= kLoggedGenerationBytes)
+    return json::Value(std::string(text)).dump();
+  return json::Value(std::string(text.substr(0, kLoggedGenerationBytes)))
+             .dump() +
+         "...[+" + std::to_string(text.size() - kLoggedGenerationBytes) +
+         " bytes]";
+}
+
+void LogRawGeneration(std::string_view request_id, std::string_view raw,
+                      TextGenerationBackend::FinishReason finish) {
+  if (!Logger::Enabled(LogLevel::kDebug))
+    return;
+  using Finish = TextGenerationBackend::FinishReason;
+  const char* reason = finish == Finish::kStop           ? "stop"
+                       : finish == Finish::kStopSequence ? "stop_sequence"
+                       : finish == Finish::kLength       ? "length"
+                                                         : "cancelled";
+  Logger::Debug("chat", "request=" + std::string(request_id) +
+                            " event=generation finish=" + reason +
+                            " raw=" + LoggedText(raw));
+}
+
+void LogParsedGeneration(std::string_view request_id,
+                         const ParsedGeneration& parsed) {
+  if (!Logger::Enabled(LogLevel::kDebug))
+    return;
+  Logger::Debug("chat",
+                "request=" + std::string(request_id) +
+                    " event=parsed content=" + LoggedText(parsed.text) +
+                    " trailing=" + LoggedText(parsed.trailing_text) +
+                    " reasoning_bytes=" +
+                    std::to_string(parsed.reasoning_content.size()) +
+                    " tool_calls=" + ToolCallsJson(parsed.tool_calls).dump());
 }
 
 std::string Sse(const json::Value& value) {
@@ -3207,6 +3264,7 @@ HttpResponse NonStreamingResponse(
   const auto closers = ToolClosers(format, syntax);
   core::Utf8Decoder decoder;
   const auto decoded = decoder.Push(result.text, true);
+  LogRawGeneration(request.request_id, decoded, result.finish_reason);
   QuoteTracker quotes;
   ParsedGeneration generated =
       request.chat.response_format || request.chat.constrained_tools
@@ -3216,7 +3274,7 @@ HttpResponse NonStreamingResponse(
                 result.finish_reason ==
                     TextGenerationBackend::FinishReason::kStop,
                 request.chat.constrained_tools && !request.chat.response_format,
-                markers, closers, quotes)
+                markers, closers, quotes, syntax, EndOf(result.finish_reason))
           : ParseGeneration(decoded, initial_output_state, request.chat.tools,
                             request.chat.tool_choice,
                             result.finish_reason ==
@@ -3227,6 +3285,7 @@ HttpResponse NonStreamingResponse(
     generated.text =
         std::string(Trim(generated.text + generated.trailing_text));
   }
+  LogParsedGeneration(request.request_id, generated);
 
   json::Value response = json::Value::object();
   response["id"] = RandomId("chatcmpl-");
@@ -3394,12 +3453,15 @@ HttpResponse StreamingResponse(
               if (!filter.Push({}, true))
                 return;
 
+              LogRawGeneration(request.request_id, filter.raw(),
+                               result.finish_reason);
               const bool interrupted =
                   result.finish_reason !=
                   TextGenerationBackend::FinishReason::kStop;
               const auto generated = StreamingGeneration(
                   filter, request.chat, initial_output_state, markers, closers,
                   quotes, !interrupted, syntax, EndOf(result.finish_reason));
+              LogParsedGeneration(request.request_id, generated);
               if (!tools.Finish(generated.tool_calls, interrupted))
                 return;
               if (!filter.Finish(generated.hide_tool_markup, generated.text,
@@ -4099,6 +4161,8 @@ HttpResponse CreateCompatibilityResponse(
     const ChatRequest& requested_chat, std::size_t max_tokens,
     const sampling::SamplingConfig& sampling, bool stream) {
   ChatRequest chat = requested_chat;
+  // Native-syntax models are parsed by their own call parser, not the
+  // constrained-JSON path, whether or not a grammar steered the calls.
   if (backend.tool_call_syntax() != ToolSyntax::kDefault)
     chat.constrained_tools = false;
   const auto initial = backend.initial_output_state(chat);
@@ -4276,6 +4340,7 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
   if (auto error = ParseRequest(request, backend, &parsed); error.has_value()) {
     return std::move(*error);
   }
+  parsed.request_id = request.request_id;
   if (backend.tool_call_syntax() != ToolSyntax::kDefault)
     parsed.chat.constrained_tools = false;
   try {

@@ -20,6 +20,13 @@ target_compile_definitions(ling_3_flash_tokenizer_test PRIVATE
 add_ling_3_flash_test(snapshot_format gufo_ling_3_flash "cpu")
 add_ling_3_flash_test(mtp_policy gufo_ling_3_flash "cpu")
 add_ling_3_flash_test(mtp_sampled_chain gufo_ling_3_flash "cpu")
+# Sampled MTP under the server's Bailing tool grammar; parses complete calls
+# with the server's Bailing parser.
+add_ling_3_flash_test(mtp_constrained_chain gufo_ling_3_flash "cpu")
+target_sources(ling_3_flash_mtp_constrained_chain_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/cli/serve/bailing_tool_calls.cpp)
+target_link_libraries(ling_3_flash_mtp_constrained_chain_test PRIVATE gufo_core)
+set_tests_properties(ling_3_flash.mtp_constrained_chain PROPERTIES TIMEOUT 1800)
 add_ling_3_flash_test(chat_template gufo_ling_3_flash "cpu")
 target_compile_definitions(ling_3_flash_chat_template_test PRIVATE
   GUFO_LING_VOCAB_GGUF="${LING_FIXTURES}/ling-vocab.gguf.fixture"

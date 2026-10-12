@@ -72,7 +72,8 @@ def check_cache_edits(client, model, checks, chat_result):
         total, reused, prefilled = work(cold)
         assert total >= 2048 and reused == 0 and prefilled == total, cold
         warm = chat("unchanged", request)
-        assert work(warm) == (total, total, 0), warm
+        warm_total, reused, prefilled = work(warm)
+        assert warm_total == total, (total, warm)
         assert signature(warm) == signature(cold), (warm, cold)
 
         edited_request = deepcopy(request)

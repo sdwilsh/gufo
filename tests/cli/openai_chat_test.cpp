@@ -5750,6 +5750,132 @@ void TestBracketDenseContent() {
   }
 }
 
+// Text the Bailing tool grammar admits must parse into the call it encodes,
+// including the openai_sdk check_strict_tools const value that holds the
+// call closer and reasoning tags, and calls that end reasoning implicitly.
+void TestBailingGrammarOutputParses() {
+  using Constraint = gufo::sampling::JsonConstraint;
+  using Format = Constraint::ToolFormat;
+  constexpr std::string_view kLiteral = "<think>literal</think></tool_call>";
+  auto parameters = gufo::json::parse(R"({"type":"object","properties":{
+    "value":{"type":"string"},"n":{"type":"integer","minimum":1,"maximum":5},
+    "note":{"type":["string","null"]}},
+    "required":["value","n","note"],"additionalProperties":false})");
+  parameters["properties"]["value"]["const"] = std::string(kLiteral);
+  auto tool = gufo::json::parse(R"({"type":"function","function":{
+    "name":"record","strict":true}})");
+  tool["function"]["parameters"] = parameters;
+  const auto grammar_with_reasoning =
+      Constraint::WithReasoning(Constraint::WithTools(
+          nullptr,
+          {{"record",
+            Constraint::ToolParameters(parameters, true, Format::kBailing)}},
+          true, false, Format::kBailing));
+  const std::string value = "<arg_key>value</arg_key>\n<arg_value>" +
+                            std::string(kLiteral) + "</arg_value>";
+  const std::string n = "<arg_key>n</arg_key>\n<arg_value>3</arg_value>";
+  const std::string note =
+      "<arg_key>note</arg_key>\n<arg_value>null</arg_value>";
+  const std::string call =
+      "<tool_call>record\n" + value + "\n" + n + "\n" + note + "\n</tool_call>";
+  const std::string tidy =
+      "<tool_call>record" + note + n + value + "</tool_call>";
+  const auto content_grammar = Constraint::WithTools(
+      nullptr,
+      {{"record",
+        Constraint::ToolParameters(parameters, true, Format::kBailing)}},
+      true, false, Format::kBailing);
+  const std::vector<std::pair<std::string, bool>> outputs{
+      {"Plan.</think>\n" + call, true},
+      {"Plan.\n" + call, true},
+      {"Plan.\n" + call + "</think>", true},
+      {"Plan.</think>" + tidy, true},
+      {call, false},
+      {"\n" + tidy, false}};
+  for (const auto& [text, thinking] : outputs) {
+    const auto& grammar = thinking ? grammar_with_reasoning : content_grammar;
+    auto state = grammar->Start();
+    for (const unsigned char byte : text)
+      state = grammar->Advance(state, byte);
+    Expect(grammar->Complete(state), "the Bailing grammar admits the call");
+    for (const bool stream : {false, true}) {
+      FakeBackend backend;
+      backend.syntax =
+          gufo::server::TextGenerationBackend::ToolCallSyntax::kBailing;
+      backend.pieces = Chars(text);
+      backend.tool_format = Format::kBailing;
+      auto body = gufo::json::parse(
+          R"({"model":"test-model","messages":[{"role":"user",
+          "content":"Call record once with the required value."}],
+          "tool_choice":"required","parallel_tool_calls":false})");
+      body["stream"] = stream;
+      body["chat_template_kwargs"] = gufo::json::Value::object();
+      body["chat_template_kwargs"]["enable_thinking"] = thinking;
+      body["tools"] = gufo::json::Value::array();
+      body["tools"].push_back(tool);
+      const auto response =
+          gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+      Expect(response.status == 200, "the grammar's call is a valid answer");
+      std::string output = response.body;
+      if (response.streaming_body)
+        response.streaming_body([&](std::string_view part) {
+          output += part;
+          return true;
+        });
+      gufo::json::Value arguments;
+      std::size_t calls = 0;
+      std::string content;
+      const auto read = [&](const gufo::json::Value& message) {
+        content += message.member_str("content");
+        if (const auto* list = message.find("tool_calls"))
+          for (const auto& item : list->items()) {
+            const auto* function = item.find("function");
+            if (!function)
+              continue;
+            if (function->find("name")) {
+              ++calls;
+              Expect(function->member_str("name") == "record",
+                     "the call keeps its declared name");
+            }
+            if (const auto* text = function->find("arguments");
+                text && !text->get_str().empty())
+              arguments = gufo::json::parse(text->get_str());
+          }
+      };
+      if (!stream) {
+        read(*gufo::json::parse(output).find("choices")->items()[0].find(
+            "message"));
+      } else {
+        for (std::size_t at = 0;
+             (at = output.find("data: ", at)) != std::string::npos;) {
+          const auto end = output.find('\n', at);
+          const auto payload = output.substr(at + 6, end - at - 6);
+          at = end;
+          if (payload == "[DONE]")
+            break;
+          const auto event = gufo::json::parse(payload);
+          if (const auto* choices = event.find("choices");
+              choices && !choices->empty())
+            if (const auto* delta = choices->items()[0].find("delta"))
+              read(*delta);
+        }
+      }
+      Expect(calls == 1, "exactly one Bailing call is reported");
+      Expect(arguments.member_str("value") == kLiteral,
+             "the const value survives the parser unchanged");
+      Expect(arguments.find("n") && arguments.find("n")->is_number() &&
+                 arguments.find("n")->as_double() == 3,
+             "integer arguments are JSON numbers");
+      Expect(arguments.find("note") && arguments.find("note")->is_null(),
+             "a nullable string reads null as null");
+      if (!content.empty())
+        std::cerr << "content: " << content << "\n";
+      Expect(content.empty(),
+             "reasoning and call markup stay out of the content");
+    }
+  }
+}
+
 struct ToolBoundaryOutput {
   std::string content, reasoning, finish;
   std::vector<std::string> arguments, names;
@@ -6412,6 +6538,7 @@ void TestIncrementalToolArguments() {
 
 int main() {
   TestBailingMessagesTools();
+  TestBailingGrammarOutputParses();
   TestBailingModes();
   TestBailingCutSecondCall();
   TestBailingResponses();

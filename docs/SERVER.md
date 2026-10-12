@@ -673,7 +673,8 @@ ordinary continuation.
 - `model`
 - `messages`: `system` and `developer` messages may appear at any position.
   Agent clients such as Codex send them mid-conversation after context
-  compaction or when session settings change. DeepSeek renders them in place.
+  compaction or when session settings change. DeepSeek and Ling render them
+  in place, so the prompt before them stays reusable.
   Qwen's template accepts only one leading system turn, so Qwen models hoist
   them into it in their original relative order. That changes the prompt head:
   the request that introduces such a message is prefilled again, and later
@@ -752,8 +753,8 @@ requirements. Union and untyped arguments keep the native syntax, as in
 llama.cpp: when the union admits strings the value is raw text, and its typed
 alternatives (such as `null` or an object) are tried before the string, so Qwen
 cannot return the literal string `"null"` for a string/null union.
-A model with a native call syntax (Qwen, DeepSeek) never switches to a JSON
-envelope, whatever the schema, strict flag or tool choice: as in llama.cpp
+A model with a native call syntax (Qwen, DeepSeek, Ling) never switches to a
+JSON envelope, whatever the schema, strict flag or tool choice: as in llama.cpp
 `common/parsers/qwen3-coder.cpp` and `deepseek.cpp`, every call uses the chat
 template's syntax and no instruction is added to the prompt. Native tags enforce
 what they can carry. A string parameter whose `pattern` cannot be enforced is
@@ -809,8 +810,9 @@ and counts toward the output budget. Changing the schema changes the cache prefi
 `</think>` ends reasoning before constrained JSON. Native tools also accept an
 unquoted function header as the boundary when the model omits `</think>`.
 Bare marker mentions and quoted examples remain reasoning; markers inside
-arguments remain data. Buffered and streamed Chat Completions and Responses
-use the same boundaries.
+arguments remain data. Ling's header has no fixed text after `<tool_call>`, so
+an unquoted `<tool_call>` there starts a call to a declared name. Buffered and
+streamed Chat Completions and Responses use the same boundaries.
 
 Parse the returned content: leading whitespace is valid JSON, and stops or token
 limits can leave it incomplete. `finish_reason: "stop"` includes matched stop

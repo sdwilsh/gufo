@@ -167,6 +167,9 @@ public:
   };
 
   /// Dialect of tool calls the loaded model writes. kDefault models are
+  /// parsed in the grammar's format; kBailing models (Ling-3.0-flash) write
+  /// their chat template's `<tool_call>name<arg_key>..` format, steered by the
+  /// Bailing tool grammar and read by the Bailing parser.
   enum class ToolCallSyntax : std::uint8_t {
     kDefault,
     kBailing,

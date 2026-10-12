@@ -69,9 +69,10 @@ bool Finite(const json::Value& value) {
 // finite value has its JSON kind, as enum members do) and local `$ref`s, which
 // the Bailing grammar follows too (JsonConstraint::ResolveReference): a
 // referenced parameter must not lose its type to the text fallback. A
-// reference that cannot be resolved, cycles, or points back at the tool's own
-// parameters (a recursive schema) sets `unknown`: the value has no definite
-// kind.
+// reference that points back at the tool's own parameters (a recursive
+// schema) sets `unknown`: the value has no definite kind. An unresolvable
+// reference adds no type, so the value reads as a string, as the grammar's raw
+// text and vLLM do.
 constexpr int kMaxSchemaDepth = 16;
 
 void AddValueType(const json::Value& value, std::set<std::string>* types) {
@@ -118,9 +119,10 @@ void CollectTypes(const json::Value& root, const json::Value& schema,
       target = sampling::JsonConstraint::ResolveReference(root, *reference);
     } catch (const std::invalid_argument&) {
     }
-    if (!target || target == &root)
+    // An unresolvable target adds no type: the grammar sends it to raw text.
+    if (target == &root)
       *unknown = true;
-    else
+    else if (target)
       CollectTypes(root, *target, types, unknown, depth + 1);
   }
   for (const char* choice : {"anyOf", "oneOf", "allOf"})
@@ -417,12 +419,14 @@ struct Parsed {
 
 // <arg_key>K</arg_key>\s*<arg_value>V</arg_value> pairs in `body`; text that
 // does not belong to a pair is ignored, a repeated key keeps its first
-// position and takes the last value (Python dict semantics).
+// position and takes the last value (Python dict semantics). Keys are
+// stripped as in vLLM, except a key spelled exactly as one of the declared
+// `properties` (which may begin or end with spaces) keeps that spelling.
 // Cost: every `find` resumes at the cursor and a pair that fails to close
 // breaks out, so the scan is linear except that an `<arg_key>` without its
 // partner rescans the tail once per such key: O(n * k) for k unmatched keys in
 // one call body. Generation length bounds both.
-Parsed ParseArguments(std::string_view body) {
+Parsed ParseArguments(std::string_view body, const json::Value* properties) {
   Parsed parsed;
   std::size_t cursor = 0;
   std::size_t last_end = 0;
@@ -444,7 +448,11 @@ Parsed ParseArguments(std::string_view body) {
     const auto value_close = FindValueClose(body, value_begin);
     if (value_close == std::string_view::npos)
       break;
-    const std::string key(Strip(body.substr(key_begin, key_close - key_begin)));
+    const auto spelled = body.substr(key_begin, key_close - key_begin);
+    const std::string key(properties &&
+                                  properties->contains(std::string(spelled))
+                              ? spelled
+                              : Strip(spelled));
     std::string value(body.substr(value_begin, value_close - value_begin));
     const auto existing = std::ranges::find(
         parsed.arguments, key, [](const auto& item) { return item.first; });
@@ -521,7 +529,11 @@ BailingScan ScanBailingToolCalls(
         !name.empty() && name.find_first_of("<>\n\r") == std::string::npos;
     const bool declared =
         plausible && (tools.empty() || tool != nullptr || emit_undeclared);
-    auto parsed = ParseArguments(body);
+    std::optional<json::Value> schema;
+    if (tool)
+      schema = TryParse(tool->parameters_json);
+    const auto* properties = schema ? FindProperties(*schema) : nullptr;
+    auto parsed = ParseArguments(body, properties);
     // A call with no tag at all after its name is `name {}`, as in vLLM.
     const bool bare = name_end == std::string_view::npos;
     const bool complete =
@@ -532,10 +544,6 @@ BailingScan ScanBailingToolCalls(
       scan.rejected.emplace_back(begin, end);
       continue;
     }
-    std::optional<json::Value> schema;
-    if (tool)
-      schema = TryParse(tool->parameters_json);
-    const auto* properties = schema ? FindProperties(*schema) : nullptr;
     BailingScan::Call call;
     call.name = name;
     call.begin = begin;

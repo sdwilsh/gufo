@@ -43,6 +43,8 @@
 #include <stdexcept>
 
 #define LING_TOOL_NO_MAIN
+#include "src/cli/serve/bailing_tool_calls.hpp"
+#include "src/cli/serve/inference_backend.hpp"
 #include "tests/models/ling_3_flash/session_test.cpp"
 
 namespace gufo::tests::ling::mtp_tool {
@@ -485,7 +487,7 @@ int Execute(const Args& args, Report& report,
     const auto grammar = Constraint::WithTools(
         nullptr,
         {{"record", Constraint::ToolParameters(
-                        schema, true, Constraint::ToolFormat::kBailing, true)}},
+                        schema, true, Constraint::ToolFormat::kBailing)}},
         true, false, Constraint::ToolFormat::kBailing);
     auto binding = std::make_shared<sampling::TokenConstraint>();
     binding->grammar = grammar;

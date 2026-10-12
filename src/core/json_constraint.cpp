@@ -60,6 +60,33 @@ bool ClosedProperties(const json::Value& schema, bool best_effort) {
          !unevaluated->as_bool();
 }
 
+// Bailing (Ling) argument markup, as src/cli/serve/bailing_tool_calls.cpp
+// parses it.
+constexpr std::string_view kBailingKeyOpen = "<arg_key>";
+constexpr std::string_view kBailingKeyClose = "</arg_key>";
+constexpr std::string_view kBailingValueOpen = "<arg_value>";
+constexpr std::string_view kBailingValueClose = "</arg_value>";
+
+// Whether a literal string value survives the Bailing parser unchanged. Free
+// values never contain the closer: the grammar ends them at the first one. A
+// literal (enum/const) may, because the parser's FindValueClose skips a closer
+// unless whitespace and then `<arg_key>` or `</tool_call>` follow it; only that
+// spelling would end the value early.
+bool BailingLiteralSafe(std::string_view text) {
+  for (auto at = text.find(kBailingValueClose); at != std::string_view::npos;
+       at = text.find(kBailingValueClose, at + 1)) {
+    auto after = at + kBailingValueClose.size();
+    while (after < text.size() &&
+           std::string_view(" \t\n\v\f\r").find(text[after]) !=
+               std::string_view::npos)
+      ++after;
+    const auto rest = text.substr(after);
+    if (rest.starts_with(kBailingKeyOpen) || rest.starts_with("</tool_call>"))
+      return false;
+  }
+  return true;
+}
+
 std::string RegexLiteral(std::string_view text) {
   std::string result;
   for (unsigned char byte : text) {
@@ -202,6 +229,10 @@ private:
     // an impossible required field can admit its tag and then dead-end.
     // A recursive schema must have a finite witness. References that recurse
     // without first consuming input are invalid for a predictive grammar.
+    // These checks index rules: a root that is a single lexeme or byte, as a
+    // probed raw Bailing value with minLength or a pattern is, becomes a rule.
+    if (grammar_->root_ & kLeaf)
+      grammar_->root_ = Seq({grammar_->root_});
     std::vector<bool> productive(grammar_->rules_.size()), nullable(productive);
     bool changed = true;
     while (changed) {
@@ -257,6 +288,8 @@ public:
   std::shared_ptr<const JsonConstraint> ToolParameters(
       JsonConstraint::ToolFormat format, bool best_effort = false) {
     ignore_unknown_keys_ = best_effort && !strict_;
+    if (format == JsonConstraint::ToolFormat::kBailing)
+      return BailingToolParameters(best_effort);
     // Native envelope/typed-parameter approach: llama.cpp common/parsers/
     // qwen3-coder.cpp and deepseek.cpp at
     // 6a2743f028f78bfb88a7189607b49bde30df3769. Unlike an injected JSON
@@ -430,6 +463,8 @@ public:
       JsonConstraint::ToolFormat format) {
     using Format = JsonConstraint::ToolFormat;
     ignore_unknown_keys_ = true;
+    if (format == Format::kBailing)
+      return BailingLooseArguments();
     const bool qwen = format == Format::kQwen;
     const std::string close =
         qwen ? "\n</parameter>\n" : "</｜DSML｜parameter>";
@@ -546,11 +581,364 @@ public:
 
   std::shared_ptr<const JsonConstraint> OpenToolParameters(
       JsonConstraint::ToolFormat format) {
-    grammar_->root_ = Repeat(OpenToolParameter(format, json::Value::object()));
+    grammar_->root_ =
+        format == JsonConstraint::ToolFormat::kBailing
+            ? Repeat(BailingOpenParameter(json::Value::object()))
+            : Repeat(OpenToolParameter(format, json::Value::object()));
     return Finish();
   }
 
 private:
+  // Bailing V3 arguments, as vLLM's ling3 parser (vllm/parser/ling3.py) and
+  // src/cli/serve/bailing_tool_calls.cpp read them: one
+  // `<arg_key>K</arg_key>\n<arg_value>V</arg_value>` pair per argument, string
+  // values as raw text and every other value as JSON. Newlines between the
+  // tags are optional, as the chat template writes them both ways (its tool
+  // prompt separates pairs with a newline, its rendered history does not).
+  struct BailingUnrepresentable {};
+  std::shared_ptr<const JsonConstraint> BailingToolParameters(
+      bool best_effort) {
+    try {
+      return BailingArguments(best_effort);
+    } catch (const BailingUnrepresentable&) {
+      return {};
+    }
+  }
+  std::shared_ptr<const JsonConstraint> BailingArguments(bool best_effort) {
+    const auto* root = NativeSchema(schema_);
+    // Object-level unions and finite objects have no pair representation.
+    if (!root || root->member_str("type") != "object" ||
+        root->contains("anyOf") || root->contains("const") ||
+        root->contains("enum"))
+      return {};
+    const auto* properties = root->find("properties");
+    if (!properties || !properties->is_object())
+      return {};
+    // As for Qwen (ToolParameters): undeclared names are text in the parser,
+    // so open pairs would turn 1/true/null/[]/{} into strings. The loose
+    // route generates declared names only, as llama.cpp does.
+    if (!strict_ && !ClosedProperties(*root, best_effort) &&
+        (root->contains("additionalProperties") ||
+         (best_effort && AdmitsExtraProperties(*root))))
+      return {};
+    std::set<std::string> required;
+    if (const auto* fields = root->find("required")) {
+      if (!fields->is_array())
+        return {};
+      for (const auto& field : fields->items()) {
+        if (!field.is_string() || !properties->contains(field.str()))
+          return {};
+        required.insert(field.str());
+      }
+    }
+    const auto newline = Optional(Byte('\n'));
+    std::vector<std::pair<std::string, std::uint32_t>> members;
+    for (const auto& [name, original] : properties->members()) {
+      // The parser ends keys at the first `</arg_key>` and keeps a declared
+      // key's exact spelling, surrounding spaces included.
+      if (name.empty() || name.find_first_of("<>\r\n") != std::string::npos)
+        return {};
+      // An unsatisfiable parameter is an empty rule: optional ones drop out
+      // and a required one leaves no finite call (Finish reports it).
+      const auto compile = [&] {
+        try {
+          return BailingValue(original, 1);
+        } catch (const JsonSchemaEmpty&) {
+          return New();
+        }
+      };
+      std::uint32_t value;
+      if (strict_) {
+        value = compile();
+      } else {
+        // Probe separately: a failed compilation can leave unfinished
+        // recursive rules in its compiler.
+        bool supported = true;
+        try {
+          auto probe = JsonConstraintCompiler(schema_, strict_, true);
+          probe.ignore_unknown_keys_ = ignore_unknown_keys_;
+          try {
+            (void)probe.BailingValue(original, 1);
+          } catch (const JsonSchemaEmpty&) {
+          }
+        } catch (const std::invalid_argument&) {
+          supported = false;
+        }
+        value = supported ? compile() : BailingLooseValue(original);
+      }
+      members.emplace_back(name,
+                           Seq({newline,
+                                Literal(std::string(kBailingKeyOpen) + name +
+                                        std::string(kBailingKeyClose)),
+                                newline, Literal(kBailingValueOpen), value,
+                                Literal(kBailingValueClose)}));
+    }
+    grammar_->root_ = Arguments(members, required);
+    return Finish();
+  }
+
+  // The Bailing counterpart of LooseToolParameters, for schemas that
+  // BailingArguments cannot enforce exactly: only the root object's declared
+  // properties are arguments, a parameter admitting strings is raw text, and
+  // other values follow the supported parts of their schema.
+  std::shared_ptr<const JsonConstraint> BailingLooseArguments() {
+    const auto* root = &schema_;
+    std::set<const json::Value*> seen;
+    while (const auto* reference = root->find("$ref")) {
+      if (!seen.insert(root).second)
+        break;
+      try {
+        root = Reference(*reference);
+      } catch (const std::invalid_argument&) {
+        break;
+      }
+    }
+    const auto* properties = root->find("properties");
+    if (!properties || !properties->is_object() || root->contains("anyOf") ||
+        root->contains("oneOf") || root->contains("const") ||
+        root->contains("enum"))
+      properties = nullptr;
+    std::set<std::string> required;
+    if (const auto* fields = root->find("required");
+        properties && fields && fields->is_array())
+      for (const auto& field : fields->items())
+        if (field.is_string() && properties->contains(field.str()))
+          required.insert(field.str());
+    static const auto kNone = json::Value::object();
+    const auto newline = Optional(Byte('\n'));
+    std::vector<std::pair<std::string, std::uint32_t>> members;
+    for (const auto& [name, original] :
+         (properties ? *properties : kNone).members()) {
+      // The parser ends keys at the first `</arg_key>`: such a name cannot be
+      // read back.
+      if (name.empty() || name.find_first_of("<>\r\n") != std::string::npos) {
+        required.erase(name);
+        continue;
+      }
+      // Probe separately, including productivity: an unsatisfiable or
+      // unrepresentable value is guidance here and must not make the whole
+      // tool uncallable.
+      bool supported = !ValueTypes(original, 0).none();
+      if (supported) {
+        try {
+          auto probe = JsonConstraintCompiler(schema_, strict_, true);
+          probe.ignore_unknown_keys_ = true;
+          probe.grammar_->root_ = probe.BailingValue(original, 1);
+          (void)probe.Finish();
+        } catch (const std::invalid_argument&) {
+          supported = false;
+        } catch (const BailingUnrepresentable&) {
+          supported = false;
+        }
+      }
+      std::uint32_t value;
+      if (supported)
+        value = BailingValue(original, 1);
+      else if (ValueTypes(original, 0).none())
+        value = BailingRawValue(json::Value::object());
+      else
+        try {
+          value = BailingLooseValue(original);
+        } catch (const std::invalid_argument&) {
+          value = BailingRawValue(json::Value::object());
+        }
+      members.emplace_back(name,
+                           Seq({newline,
+                                Literal(std::string(kBailingKeyOpen) + name +
+                                        std::string(kBailingKeyClose)),
+                                newline, Literal(kBailingValueOpen), value,
+                                Literal(kBailingValueClose)}));
+    }
+    grammar_->root_ = Arguments(members, required);
+    return Finish();
+  }
+
+  // A declared parameter whose schema this compiler cannot represent keeps its
+  // native framing. Text is the parser's reading of an unknown type.
+  std::uint32_t BailingLooseValue(const json::Value& original) {
+    const auto types = ValueTypes(original, 0);
+    if (types.none())
+      Invalid("parameter admits no value");
+    if (types[kStringType])
+      return BailingRawValue(json::Value::object());
+    const auto* schema = NativeSchema(original);
+    // A parameter referring back to the tool's own schema is recursive: as on
+    // the Qwen route (and in the parser), the outer container gives it no
+    // definite type.
+    if (schema == &schema_)
+      return GenericValue(kMaxDepth);
+    const auto* type = schema ? schema->find("type") : nullptr;
+    if (type && type->is_string() && types.count() == 1)
+      return type->str() == "array"    ? GenericArray(kMaxDepth)
+             : type->str() == "object" ? GenericObject(kMaxDepth)
+                                       : Primitive(type->str());
+    return GenericValue(kMaxDepth);
+  }
+
+  std::uint32_t BailingRawValue(const json::Value& schema) {
+    auto predicate = json::Value::object();
+    for (const char* key : {"pattern", "format", "minLength", "maxLength"})
+      if (const auto* value = schema.find(key))
+        predicate[key] = *value;
+    const auto matcher = JsonSchemaLexeme::RawString(
+        StringPredicate(predicate), std::string(kBailingValueClose));
+    const auto value = Lexeme(matcher);
+    return matcher->Check("").complete ? Optional(value) : value;
+  }
+
+  // The value grammar of one argument: raw text where the parser reads text,
+  // JSON elsewhere. Unions split per branch; a string branch is raw text.
+  std::uint32_t BailingValue(const json::Value& original, std::size_t depth) {
+    if (depth > kMaxDepth)
+      Invalid("maximum schema depth is 16");
+    const json::Value* schema = &original;
+    std::set<const json::Value*> seen;
+    while (schema->is_object()) {
+      const auto* reference = schema->find("$ref");
+      if (!reference)
+        break;
+      if (!seen.insert(schema).second)
+        Invalid("reference cycle does not consume input");
+      const auto siblings =
+          Without(*schema, {"$ref", "$defs", "title", "description"});
+      schema = siblings.empty()
+                   ? Reference(*reference)
+                   : &Store(Conjoin(*Reference(*reference), siblings));
+    }
+    if (schema->is_bool()) {
+      if (!schema->as_bool())
+        throw JsonSchemaEmpty("JSON Schema: false admits no value");
+      return BailingRawValue(json::Value::object());
+    }
+    const auto types = ValueTypes(*schema, 0);
+    if (types.none())
+      throw JsonSchemaEmpty("JSON Schema: parameter admits no value");
+    if (!types[kStringType])
+      return Visit(*schema, depth);
+    Keys(*schema);
+    if (schema->contains("enum") || schema->contains("const")) {
+      const auto& base = Store(Without(*schema, {"enum", "const", "$defs"}));
+      json::Value::Array values;
+      if (const auto* enumeration = schema->find("enum")) {
+        if (!enumeration->is_array() || enumeration->size() == 0)
+          Invalid("enum must be a nonempty array");
+        values = enumeration->items();
+      } else
+        values.push_back(*schema->find("const"));
+      enum_values_ += values.size();
+      if (enum_values_ > 1000)
+        Invalid("maximum enum/const value count is 1000");
+      Sequence choices;
+      for (const auto& value : values) {
+        CountValueStrings(value);
+        if (const auto* constant = schema->find("const");
+            constant && !EqualValue(value, *constant))
+          continue;
+        std::optional<json::Value> canonical;
+        try {
+          canonical = ValueFor(base, value);
+        } catch (const JsonSchemaEmpty&) {
+        }
+        if (!canonical)
+          continue;
+        if (!canonical->is_string()) {
+          choices.push_back(ValueLiteral(*canonical));
+        } else if (BailingLiteralSafe(canonical->str())) {
+          choices.push_back(
+              canonical->str().empty() ? Seq({}) : Literal(canonical->str()));
+        } else if (strict_) {
+          // Dropping it would narrow a strict schema; keep the envelope only.
+          throw BailingUnrepresentable();
+        }
+      }
+      if (choices.empty())
+        throw JsonSchemaEmpty(
+            "JSON Schema: enum/const has no value satisfying its constraints");
+      return Alt(choices);
+    }
+    if (const auto* any = schema->find("anyOf")) {
+      if (!any->is_array() || any->size() == 0)
+        Invalid("anyOf needs at least one branch");
+      const auto siblings =
+          Without(*schema, {"anyOf", "$defs", "title", "description"});
+      Sequence branches;
+      for (const auto& branch : any->items()) {
+        try {
+          branches.push_back(BailingValue(
+              siblings.empty() ? branch : Store(Conjoin(branch, siblings)),
+              depth + 1));
+        } catch (const JsonSchemaEmpty&) {
+        }
+      }
+      if (branches.empty())
+        throw JsonSchemaEmpty("JSON Schema: anyOf has no satisfiable branch");
+      return Alt(branches);
+    }
+    const auto* type = schema->find("type");
+    // Untyped parameters are text in the parser.
+    if (!type)
+      return BailingRawValue(*schema);
+    std::vector<std::string> names;
+    if (type->is_string())
+      names.push_back(type->str());
+    else if (type->is_array())
+      for (const auto& item : type->items()) {
+        if (!item.is_string())
+          Invalid("type members must be strings");
+        names.push_back(item.str());
+      }
+    else
+      Invalid("type must be a string or an array of strings");
+    Sequence alternatives;
+    for (const auto& name : names) {
+      if (name == "string") {
+        alternatives.push_back(BailingRawValue(*schema));
+        continue;
+      }
+      // One JSON branch per remaining type, without the other types' keywords.
+      auto branch = Without(
+          *schema, {"pattern", "format", "minLength", "maxLength", "type"});
+      if (name != "object")
+        branch =
+            Without(branch, {"properties", "required", "additionalProperties"});
+      if (name != "array")
+        branch = Without(branch, {"items", "minItems", "maxItems"});
+      if (name != "integer" && name != "number")
+        branch = Without(branch, {"minimum", "maximum", "exclusiveMinimum",
+                                  "exclusiveMaximum", "multipleOf"});
+      branch["type"] = name;
+      alternatives.push_back(Visit(Store(std::move(branch)), depth));
+    }
+    return Alt(alternatives);
+  }
+
+  // An undeclared argument: a name the parser keeps intact and a text value.
+  std::uint32_t BailingOpenParameter(const json::Value& properties) {
+    auto name_schema = json::parse(
+        R"({"type":"string","pattern":"^[^<>\"=\\s](?:[^<>\"=\\r\\n]*[^<>\"=\\s])?$"})");
+    if (!properties.empty()) {
+      std::string excluded = "^(?!(?:";
+      bool separator = false;
+      for (const auto& [name, value] : properties.members()) {
+        (void)value;
+        if (separator)
+          excluded += '|';
+        separator = true;
+        excluded += RegexLiteral(name);
+      }
+      excluded += ")$)";
+      name_schema["pattern"] =
+          excluded + name_schema.find("pattern")->str().substr(1);
+    }
+    const auto name = Lexeme(JsonSchemaLexeme::RawString(
+        name_schema, std::string(kBailingKeyClose)));
+    const auto newline = Optional(Byte('\n'));
+    return Seq({newline, Literal(kBailingKeyOpen), name,
+                Literal(kBailingKeyClose), newline, Literal(kBailingValueOpen),
+                BailingRawValue(json::Value::object()),
+                Literal(kBailingValueClose)});
+  }
+
   // Native Qwen may choose argument order. Share subset suffixes for small
   // objects; bound compilation for large schemas by retaining schema order.
   std::uint32_t Arguments(
@@ -1776,7 +2164,8 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::ToolParameters(
   const bool open_untyped =
       grammar && untyped && !preserve_root &&
       !ClosedProperties(schema, best_effort) && (best_effort || open) &&
-      !(format == ToolFormat::kQwen && HasPropertySchemas(schema));
+      !((format == ToolFormat::kQwen || format == ToolFormat::kBailing) &&
+        HasPropertySchemas(schema));
   if (open_untyped) {
     grammar = OpenToolParameters(format);
   } else if (grammar && format != ToolFormat::kJson) {
@@ -1825,7 +2214,14 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::OpenToolParameters(
     return JsonConstraintCompiler(schema, false)
         .OpenToolParameters(ToolFormat::kDeepSeek);
   }();
-  return format == ToolFormat::kQwen ? qwen : deepseek;
+  static const auto bailing = [] {
+    const auto schema = json::Value::object();
+    return JsonConstraintCompiler(schema, false)
+        .OpenToolParameters(ToolFormat::kBailing);
+  }();
+  return format == ToolFormat::kQwen      ? qwen
+         : format == ToolFormat::kBailing ? bailing
+                                          : deepseek;
 }
 
 std::shared_ptr<const JsonConstraint> JsonConstraint::WithReasoning(
@@ -1945,11 +2341,24 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
     return id;
   };
   const bool deepseek = format == ToolFormat::kDeepSeek;
+  const bool bailing = format == ToolFormat::kBailing;
   const std::string_view marker =
       deepseek ? "<｜DSML｜tool_calls>" : "<tool_call>";
-  const auto end = literal(format == ToolFormat::kJson ? "}</tool_call>"
-                           : deepseek                  ? "</｜DSML｜invoke>"
-                                      : "</function>\n</tool_call>");
+  std::uint32_t end;
+  if (bailing) {
+    // `NAME\n\n</tool_call>` is how the template renders a call without
+    // arguments; after an argument the template writes one newline.
+    check_capacity(2, 0, 0);
+    const auto newline = static_cast<std::uint32_t>(grammar->rules_.size());
+    grammar->rules_.push_back({{}, {kTerminal | '\n'}});
+    const auto close = literal("</tool_call>");
+    end = static_cast<std::uint32_t>(grammar->rules_.size());
+    grammar->rules_.push_back({{newline, newline, close}});
+  } else {
+    end = literal(format == ToolFormat::kJson ? "}</tool_call>"
+                  : deepseek                  ? "</｜DSML｜invoke>"
+                                              : "</function>\n</tool_call>");
+  }
   const auto calls = static_cast<std::uint32_t>(grammar->rules_.size());
   grammar->rules_.push_back({});
   // In tool-only mode ordinary text remains unconstrained until a canonical
@@ -2041,9 +2450,12 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
   if (answer)
     imported.emplace(answer.get(), answer->root_);
   if (format != ToolFormat::kJson) {
+    // Bailing has no fixed header after its opener: the declared names that
+    // follow it complete the header, as the Bailing parser reads it.
     grammar->reasoning_tool_prefix_ =
-        deepseek ? "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\""
-                 : "<tool_call>\n<function=";
+        deepseek  ? "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\""
+        : bailing ? "<tool_call>"
+                  : "<tool_call>\n<function=";
     grammar->reasoning_tool_root_ = grammar->rules_.size();
     grammar->rules_.push_back({});
   }
@@ -2052,12 +2464,14 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
         format == ToolFormat::kJson
             ? "{\"name\":" + json::Value(name).dump() + ",\"arguments\":"
         : deepseek ? "\n<｜DSML｜invoke name=\"" + name + "\">\n"
+        : bailing  ? name
                    : "\n<function=" + name + ">\n");
     if (const auto found = imported.find(arguments.get());
         found != imported.end()) {
       grammar->rules_[calls].push_back({begin, found->second, end, after});
       if (format != ToolFormat::kJson) {
-        const auto named = literal(name + (deepseek ? "\">\n" : ">\n"));
+        const auto named =
+            bailing ? begin : literal(name + (deepseek ? "\">\n" : ">\n"));
         grammar->rules_[grammar->reasoning_tool_root_].push_back(
             {named, found->second, end, after});
       }
@@ -2088,7 +2502,8 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
     imported.emplace(arguments.get(), root);
     grammar->rules_[calls].push_back({begin, root, end, after});
     if (format != ToolFormat::kJson) {
-      const auto named = literal(name + (deepseek ? "\">\n" : ">\n"));
+      const auto named =
+          bailing ? begin : literal(name + (deepseek ? "\">\n" : ">\n"));
       grammar->rules_[grammar->reasoning_tool_root_].push_back(
           {named, root, end, after});
     }
@@ -2105,7 +2520,19 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
         static_cast<std::uint32_t>(kTerminal | grammar->classes_.size());
     grammar->classes_.push_back(whitespace);
     const auto ws = static_cast<std::uint32_t>(grammar->rules_.size());
-    grammar->rules_.push_back({{}, {terminal, ws}});
+    if (bailing) {
+      // A bounded lead-in: a required call must start, not be deferred by
+      // whitespace until the token limit (the template writes at most a
+      // newline or two after `</think>`).
+      constexpr std::uint32_t kLeadIn = 4;
+      check_capacity(kLeadIn, 0, 0);
+      for (std::uint32_t i = 0; i < kLeadIn; ++i)
+        grammar->rules_.push_back(i + 1 < kLeadIn
+                                      ? Rule{{}, {terminal, ws + i + 1}}
+                                      : Rule{{}, {terminal}});
+    } else {
+      grammar->rules_.push_back({{}, {terminal, ws}});
+    }
     alternatives.push_back({ws, literal(marker), calls});
   }
   check_capacity(1, 0, 0);

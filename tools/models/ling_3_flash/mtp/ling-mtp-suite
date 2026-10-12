@@ -231,6 +231,26 @@ def part_serve_mtp(args):
     stages = {st.get("name"): {k: st.get(k) for k in ("status", "failed_cases", "failures", "error",
                                                         "exit_reason", "suites", "seconds")
                                if st.get(k) not in (None, {}, [])} for st in doc.get("stages", [])}
+    for st in doc.get("stages", []):
+        if st.get("status") == "passed":
+            continue
+        # Failure reasons: the child's stderr/stdout tails, `check=` lines and the
+        # error lines of every failed-run log (the document used to be filtered
+        # down to status only, hiding why a stage failed).
+        row = stages.setdefault(st.get("name"), {})
+        for k in ("stderr_tail", "stdout_tail", "exit_code", "failed_generations"):
+            if st.get(k) not in (None, "", {}, []):
+                row[k] = st[k]
+        reasons = {}
+        for name, info in (st.get("failed_run_logs") or {}).items():
+            text = info.get("tail", "")
+            lines = list(info.get("error_lines") or [])
+            lines += [l[:600] for l in text.splitlines() if "check=" in l or "FAIL" in l][:40]
+            if lines:
+                reasons[name] = lines
+        if reasons:
+            row["failure_lines"] = reasons
+        log("stage %s failed: %s" % (st.get("name"), json.dumps(row)[:6000]))
     drafts = doc.get("draft_requests", [])
     ok = p.returncode == 0 and doc.get("status") == "passed"
     out({"stage": "serve-mtp", "pass": ok, "exit": p.returncode, "status": doc.get("status"),
