@@ -10,7 +10,9 @@
 // forward pass is awaited through its event, never assumed finished; that wait
 // holds the executor's capture mutex, because it may run on a worker thread
 // while the scheduler thread captures a decode graph on the executor stream
-// (executor.hpp).
+// (executor.hpp). Host copies to and from the staging halves use a small
+// persistent thread pool (host_copy_pool.hpp), overlapped with the DMA of the
+// neighbouring half.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -21,6 +23,7 @@
 #include <vector>
 
 #include "src/models/ling_3_flash/kernels/rocm/executor.hpp"
+#include "src/models/ling_3_flash/kernels/rocm/host_copy_pool.hpp"
 
 namespace gufo::models::ling_3_flash::rocm {
 namespace {
@@ -61,37 +64,92 @@ private:
   std::atomic<std::uint32_t>& count_;
 };
 
+/// The staging buffer as two halves, so that the DMA of one chunk overlaps the
+/// host copy of its neighbour. `events` order reuse of a half.
+struct Staging {
+  hipStream_t stream;
+  HostCopyPool& pool;
+  std::uint8_t* halves[2];
+  hipEvent_t events[2];
+  static constexpr std::size_t kChunkBytes = kTransferStagingBytes / 2;
+};
+
+Staging MakeStaging(hipStream_t stream, HostCopyPool& pool, void* buffer,
+                    const hipEvent_t (&events)[2]) {
+  auto* base = static_cast<std::uint8_t*>(buffer);
+  return Staging{stream,
+                 pool,
+                 {base, base + Staging::kChunkBytes},
+                 {events[0], events[1]}};
+}
+
+/// Waits for queued copies after a failure: they still use the staging halves.
+void Drain(const Staging& st) {
+  (void)hipStreamSynchronize(st.stream);
+}
+
 /// Device -> host through the pinned staging buffer.
-bool CopyOut(hipStream_t stream, void* staging, std::uint8_t* host,
-             const void* device, std::size_t bytes, std::string* error) {
-  for (std::size_t at = 0; at < bytes;) {
-    const std::size_t n = std::min(kTransferStagingBytes, bytes - at);
-    if (!Check(hipMemcpyAsync(staging,
-                              static_cast<const std::uint8_t*>(device) + at, n,
-                              hipMemcpyDeviceToHost, stream),
-               "snapshot copy out", error) ||
-        !Check(hipStreamSynchronize(stream), "snapshot copy out sync", error)) {
+bool CopyOut(const Staging& st, std::uint8_t* host, const void* device,
+             std::size_t bytes, std::string* error) {
+  const auto* src = static_cast<const std::uint8_t*>(device);
+  const auto chunk = [&](std::size_t k) {
+    return std::min(Staging::kChunkBytes, bytes - k * Staging::kChunkBytes);
+  };
+  const auto issue = [&](std::size_t k) {
+    const std::size_t half = k & 1;
+    return Check(hipMemcpyAsync(st.halves[half], src + k * Staging::kChunkBytes,
+                                chunk(k), hipMemcpyDeviceToHost, st.stream),
+                 "snapshot copy out", error) &&
+           Check(hipEventRecord(st.events[half], st.stream),
+                 "snapshot copy out event", error);
+  };
+  const std::size_t chunks =
+      (bytes + Staging::kChunkBytes - 1) / Staging::kChunkBytes;
+  if (chunks == 0) {
+    return true;
+  }
+  if (!issue(0)) {
+    Drain(st);
+    return false;
+  }
+  for (std::size_t k = 0; k < chunks; ++k) {
+    // The other half was drained by the host copy of chunk k - 1.
+    if ((k + 1 < chunks && !issue(k + 1)) ||
+        !Check(hipEventSynchronize(st.events[k & 1]), "snapshot copy out sync",
+               error)) {
+      Drain(st);
       return false;
     }
-    std::memcpy(host + at, staging, n);
-    at += n;
+    st.pool.Copy(host + k * Staging::kChunkBytes, st.halves[k & 1], chunk(k));
   }
   return true;
 }
 
 /// Host -> device through the pinned staging buffer.
-bool CopyIn(hipStream_t stream, void* staging, void* device,
-            const std::uint8_t* host, std::size_t bytes, std::string* error) {
-  for (std::size_t at = 0; at < bytes;) {
-    const std::size_t n = std::min(kTransferStagingBytes, bytes - at);
-    std::memcpy(staging, host + at, n);
-    if (!Check(hipMemcpyAsync(static_cast<std::uint8_t*>(device) + at, staging,
-                              n, hipMemcpyHostToDevice, stream),
-               "snapshot copy in", error) ||
-        !Check(hipStreamSynchronize(stream), "snapshot copy in sync", error)) {
+bool CopyIn(const Staging& st, void* device, const std::uint8_t* host,
+            std::size_t bytes, std::string* error) {
+  auto* dst = static_cast<std::uint8_t*>(device);
+  for (std::size_t at = 0, k = 0; at < bytes; at += Staging::kChunkBytes, ++k) {
+    const std::size_t half = k & 1;
+    const std::size_t n = std::min(Staging::kChunkBytes, bytes - at);
+    // The DMA that last read this half (chunk k - 2) must be done.
+    if (k >= 2 && !Check(hipEventSynchronize(st.events[half]),
+                         "snapshot copy in sync", error)) {
+      Drain(st);
       return false;
     }
-    at += n;
+    st.pool.Copy(st.halves[half], host + at, n);
+    if (!Check(hipMemcpyAsync(dst + at, st.halves[half], n,
+                              hipMemcpyHostToDevice, st.stream),
+               "snapshot copy in", error) ||
+        !Check(hipEventRecord(st.events[half], st.stream),
+               "snapshot copy in event", error)) {
+      Drain(st);
+      return false;
+    }
+  }
+  if (!Check(hipStreamSynchronize(st.stream), "snapshot copy in sync", error)) {
+    return false;
   }
   return true;
 }
@@ -185,16 +243,18 @@ bool Executor::CaptureSnapshotState(const Session& session, std::uint32_t rows,
   }
   const TransferScope in_flight(session.transfers_);
   const TransferLock lock(transfer_mutex_, transfers_waiting_);
+  const Staging staging = MakeStaging(transfer_stream_, *copy_pool_,
+                                      transfer_staging_, transfer_events_);
   if (!AwaitForward(capture_mutex_, session.forward_done_, error_msg) ||
-      !CopyOut(transfer_stream_, transfer_staging_, out.kda_state, st.kda_state,
+      !CopyOut(staging, out.kda_state, st.kda_state,
                kKdaLayers * kKdaStateFloats * sizeof(float), error_msg) ||
-      !CopyOut(transfer_stream_, transfer_staging_, out.kda_conv, st.kda_conv,
+      !CopyOut(staging, out.kda_conv, st.kda_conv,
                kKdaLayers * kKdaConvStateFloats * sizeof(float), error_msg)) {
     return false;
   }
   if (out.mtp_h != nullptr && st.mtp_cache != nullptr &&
-      !CopyOut(transfer_stream_, transfer_staging_, out.mtp_h, st.mtp_h,
-               kHidden * sizeof(float), error_msg)) {
+      !CopyOut(staging, out.mtp_h, st.mtp_h, kHidden * sizeof(float),
+               error_msg)) {
     return false;
   }
   *hold = std::move(local);
@@ -314,10 +374,12 @@ bool Executor::RestoreSnapshot(Session& session, std::uint32_t rows,
   session.AwaitRowHolds(0);
   const TransferScope in_flight(session.transfers_);
   const TransferLock lock(transfer_mutex_, transfers_waiting_);
+  const Staging staging = MakeStaging(transfer_stream_, *copy_pool_,
+                                      transfer_staging_, transfer_events_);
   if (!AwaitForward(capture_mutex_, session.forward_done_, error_msg) ||
-      !CopyIn(transfer_stream_, transfer_staging_, st.kda_state, in.kda_state,
+      !CopyIn(staging, st.kda_state, in.kda_state,
               kKdaLayers * kKdaStateFloats * sizeof(float), error_msg) ||
-      !CopyIn(transfer_stream_, transfer_staging_, st.kda_conv, in.kda_conv,
+      !CopyIn(staging, st.kda_conv, in.kda_conv,
               kKdaLayers * kKdaConvStateFloats * sizeof(float), error_msg)) {
     return false;
   }
@@ -339,7 +401,7 @@ bool Executor::RestoreSnapshot(Session& session, std::uint32_t rows,
     while (row < limit) {
       const std::uint32_t n =
           std::min<std::uint32_t>(kCompareRows, limit - row);
-      if (!CopyOut(transfer_stream_, transfer_staging_, device_rows.data(),
+      if (!CopyOut(staging, device_rows.data(),
                    layer + std::size_t{row} * kRowBytes,
                    std::size_t{n} * kRowBytes, error_msg)) {
         return false;
@@ -356,8 +418,7 @@ bool Executor::RestoreSnapshot(Session& session, std::uint32_t rows,
       row += n;
     }
     same[m] = std::min(row, limit);
-    if (!CopyIn(transfer_stream_, transfer_staging_,
-                layer + std::size_t{same[m]} * kRowBytes,
+    if (!CopyIn(staging, layer + std::size_t{same[m]} * kRowBytes,
                 in.mla + m * width + std::size_t{same[m]} * kRowBytes,
                 width - std::size_t{same[m]} * kRowBytes, error_msg)) {
       return false;
@@ -367,10 +428,9 @@ bool Executor::RestoreSnapshot(Session& session, std::uint32_t rows,
     session.mtp_valid_ = false;
     if (in.mtp_h != nullptr) {
       const std::size_t mtp_width = std::size_t{rows - (rows != 0)} * kRowBytes;
-      if (!CopyIn(transfer_stream_, transfer_staging_, st.mtp_h, in.mtp_h,
-                  kHidden * sizeof(float), error_msg) ||
-          !CopyIn(transfer_stream_, transfer_staging_, st.mtp_cache, in.mtp,
-                  mtp_width, error_msg)) {
+      if (!CopyIn(staging, st.mtp_h, in.mtp_h, kHidden * sizeof(float),
+                  error_msg) ||
+          !CopyIn(staging, st.mtp_cache, in.mtp, mtp_width, error_msg)) {
         return false;
       }
       session.mtp_valid_ = true;

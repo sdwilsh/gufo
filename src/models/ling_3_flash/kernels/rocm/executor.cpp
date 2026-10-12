@@ -195,6 +195,11 @@ Executor::~Executor() {
   if (stream_ != nullptr) {
     (void)hipStreamDestroy(stream_);
   }
+  for (hipEvent_t e : transfer_events_) {
+    if (e != nullptr) {
+      (void)hipEventDestroy(e);
+    }
+  }
   if (transfer_stream_ != nullptr) {
     (void)hipStreamDestroy(transfer_stream_);
   }
@@ -227,9 +232,16 @@ bool Executor::Init(std::string* error) {
       !Check(hipStreamCreateWithFlags(&transfer_stream_, hipStreamNonBlocking),
              "transfer stream", error) ||
       !Check(hipHostMalloc(&transfer_staging_, kTransferStagingBytes),
-             "pinned snapshot staging", error)) {
+             "pinned snapshot staging", error) ||
+      !Check(
+          hipEventCreateWithFlags(&transfer_events_[0], hipEventDisableTiming),
+          "transfer event", error) ||
+      !Check(
+          hipEventCreateWithFlags(&transfer_events_[1], hipEventDisableTiming),
+          "transfer event", error)) {
     return false;
   }
+  copy_pool_ = std::make_unique<HostCopyPool>(kHostCopyThreads);
   const std::size_t B = options_.max_batch;
   Buffers& b = *b_;
   std::size_t total = 0;
