@@ -325,7 +325,8 @@ void Executor::Kda(const DeviceLayer& l, const Session& session,
 }
 
 void Executor::Mla(const DeviceLayer& l, const Session& session,
-                   std::uint32_t il, std::uint32_t first_pos, std::uint32_t n) {
+                   std::uint32_t il, std::uint32_t first_pos, std::uint32_t n,
+                   GpuTensorSink* sink) {
   Buffers& b = *b_;
   const SessionState& st = session.state_;
   auto* cache = static_cast<__half*>(st.mla_cache) +
@@ -333,8 +334,12 @@ void Executor::Mla(const DeviceLayer& l, const Session& session,
   Q8(l.attn_q, b.x, b.q, n);
   Q8(l.kv_a, b.x, b.kva, n);
   Q8(l.attn_gate, b.x, b.gate, n);
+  const int ly = static_cast<int>(il);
+  DumpFloat(sink, "mla_q", ly, b.q, n, kMlaQRows);
+  DumpFloat(sink, "mla_kva", ly, b.kva, n, kMlaCacheWidth);
   mla::LatentNormRope(b.kva, l.kv_a_norm.f32(), b.positions, b.kv, n, stream_);
   mla::CacheAppend(cache, b.kv, first_pos, n, stream_);
+  DumpFloat(sink, "mla_kv", ly, b.kv, n, kMlaCacheWidth);
   mla::QAbsorb(b.q, l.k_b.data, b.positions, b.qabs, n, stream_);
   if (n <= kMaxDecodeTokens) {
     // Small-batch family: every token runs the decode kernel on its own
@@ -349,7 +354,10 @@ void Executor::Mla(const DeviceLayer& l, const Session& session,
     mla::PrefillAttention(b.qabs, cache, first_pos, n, b.lat, b.scratch,
                           stream_);
   }
+  DumpFloat(sink, "mla_qabs", ly, b.qabs, n, kHeads * kMlaCacheWidth);
+  DumpFloat(sink, "mla_lat", ly, b.lat, n, kHeads * kMlaLatent);
   mla::VbUpProjGate(b.lat, l.v_b.data, b.gate, b.kout, n, stream_);
+  DumpFloat(sink, "mla_vb", ly, b.kout, n, kKdaInner);
   Q8(l.attn_output, b.kout, b.mixer, n);
 }
 
@@ -365,7 +373,12 @@ void Executor::Ffn(const DeviceLayer& l, std::uint32_t il, std::uint32_t n,
     Q8(l.ffn_up, b.x, b.gb, n);
     dense::SwiGluClamped(b.ga, b.gb, b.act, std::size_t{n} * kDenseFf,
                          shexp_limit, stream_);
+    DumpFloat(sink, "ffn_in", static_cast<int>(il), b.x, n, kHidden);
+    DumpFloat(sink, "ffn_gate", static_cast<int>(il), b.ga, n, kDenseFf);
+    DumpFloat(sink, "ffn_up", static_cast<int>(il), b.gb, n, kDenseFf);
+    DumpFloat(sink, "ffn_act", static_cast<int>(il), b.act, n, kDenseFf);
     Q8(l.ffn_down, b.act, b.mixer, n);
+    DumpFloat(sink, "ffn_out", static_cast<int>(il), b.mixer, n, kHidden);
     dense::AddResidual(b.h, b.mixer, std::size_t{n} * kHidden, stream_);
     return;
   }
@@ -393,6 +406,43 @@ void Executor::Ffn(const DeviceLayer& l, std::uint32_t il, std::uint32_t n,
   dense::SwiGluClamped(b.ga, b.gb, b.act, std::size_t{n} * kSharedFf,
                        shexp_limit, stream_);
   Q8(l.down_shexp, b.act, b.mixer, n);
+  if (sink != nullptr && (sink->Wants("ffn_routed", static_cast<int>(il)) ||
+                          sink->Wants("ffn_out", static_cast<int>(il)))) {
+    // Debug split of the FFN contribution (routed experts, shared expert,
+    // total) so it can be compared without the residual stream's cancellation.
+    const int layer = static_cast<int>(il);
+    std::vector<float> eo(std::size_t{n} * kExpertsUsed * kHidden);
+    std::vector<float> w(std::size_t{n} * kExpertsUsed);
+    std::vector<float> shared(std::size_t{n} * kHidden);
+    (void)hipMemcpyAsync(eo.data(), b.exp_out, eo.size() * 4,
+                         hipMemcpyDeviceToHost, stream_);
+    (void)hipMemcpyAsync(w.data(), b.rweights, w.size() * 4,
+                         hipMemcpyDeviceToHost, stream_);
+    (void)hipMemcpyAsync(shared.data(), b.mixer, shared.size() * 4,
+                         hipMemcpyDeviceToHost, stream_);
+    (void)hipStreamSynchronize(stream_);
+    std::vector<float> routed(std::size_t{n} * kHidden, 0.0F);
+    std::vector<float> total(std::size_t{n} * kHidden);
+    for (std::uint32_t t = 0; t < n; ++t) {
+      for (std::uint32_t k = 0; k < kExpertsUsed; ++k) {
+        const float wk = w[std::size_t{t} * kExpertsUsed + k];
+        const float* src =
+            eo.data() + (std::size_t{t} * kExpertsUsed + k) * kHidden;
+        for (std::uint32_t i = 0; i < kHidden; ++i) {
+          routed[std::size_t{t} * kHidden + i] += wk * src[i];
+        }
+      }
+    }
+    for (std::size_t i = 0; i < total.size(); ++i) {
+      total[i] = routed[i] + shared[i];
+    }
+    if (sink->Wants("ffn_routed", layer))
+      sink->Float("ffn_routed", layer, kHidden, routed);
+    if (sink->Wants("ffn_shared", layer))
+      sink->Float("ffn_shared", layer, kHidden, shared);
+    if (sink->Wants("ffn_out", layer))
+      sink->Float("ffn_out", layer, kHidden, total);
+  }
   moe::Combine(b.h, b.exp_out, b.rweights, b.mixer, n, stream_);
 }
 
@@ -407,7 +457,7 @@ bool Executor::Block(const Session& session, std::uint32_t il,
   if (l.kind == LayerKind::kKda) {
     Kda(l, session, il, n, sink);
   } else {
-    Mla(l, session, il, first_pos, n);
+    Mla(l, session, il, first_pos, n, sink);
   }
   DumpFloat(sink, "mixer_out", layer, b.mixer, n, kHidden);
   dense::AddResidual(b.h, b.mixer, std::size_t{n} * kHidden, stream_);

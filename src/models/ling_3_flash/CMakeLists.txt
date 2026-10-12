@@ -26,3 +26,11 @@ if (ENGINE_ENABLE_HIP)
     $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffast-math;-fno-finite-math-only;-Wno-unused-command-line-argument>)
   target_link_libraries(gufo_ling_3_flash PUBLIC hip::host roc::hipblas)
 endif()
+
+# Scalar float32 oracle; built only by explicit validation targets, never by
+# production or routine checks. It keeps -O2 in every configuration.
+add_library(gufo_ling_3_flash_reference STATIC EXCLUDE_FROM_ALL
+  cpu_ops.cpp reference.cpp)
+target_link_libraries(gufo_ling_3_flash_reference PUBLIC gufo_ling_3_flash)
+set_source_files_properties(cpu_ops.cpp reference.cpp
+  PROPERTIES COMPILE_OPTIONS "-O2")

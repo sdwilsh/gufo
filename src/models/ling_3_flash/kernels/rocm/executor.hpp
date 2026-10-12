@@ -162,7 +162,7 @@ private:
   void Kda(const DeviceLayer& l, const Session& session, std::uint32_t il,
            std::uint32_t n, GpuTensorSink* sink);
   void Mla(const DeviceLayer& l, const Session& session, std::uint32_t il,
-           std::uint32_t first_pos, std::uint32_t n);
+           std::uint32_t first_pos, std::uint32_t n, GpuTensorSink* sink);
   void Ffn(const DeviceLayer& l, std::uint32_t il, std::uint32_t n,
            GpuTensorSink* sink);
   void Q8(const DeviceTensor& w, const float* x, float* y, std::uint32_t n);

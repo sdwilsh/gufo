@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
 
 #include "tests/models/ling_3_flash/model_tool.hpp"
 
@@ -74,6 +75,8 @@ struct Diff {
   double logits{0.0};
   double max_abs_logit{0.0};
   bool top1_same{false};
+  double kl{0.0};          ///< KL(reference || candidate) of the softmax
+  double ref_margin{0.0};  ///< reference top-1 minus top-2 logit
   double state{0.0}, conv{0.0}, cache{0.0};  ///< worst layer rel-L2
   int worst_state_layer{-1}, worst_cache_layer{-1};
   bool bitwise{false};
@@ -93,6 +96,26 @@ Diff Compare(const Capture& a, const Capture& b) {
         std::max_element(b.logits.begin(), b.logits.end()) - b.logits.begin();
   }
   d.finite = AllFinite(a.logits) && AllFinite(b.logits);
+  if (d.finite && !a.logits.empty() && a.logits.size() == b.logits.size()) {
+    const auto log_sum_exp = [](const std::vector<float>& v) {
+      const double m = *std::max_element(v.begin(), v.end());
+      double sum = 0.0;
+      for (const float x : v) {
+        sum += std::exp(x - m);
+      }
+      return m + std::log(sum);
+    };
+    const double lse_a = log_sum_exp(a.logits);
+    const double lse_b = log_sum_exp(b.logits);
+    for (std::size_t i = 0; i < a.logits.size(); ++i) {
+      const double lp_b = b.logits[i] - lse_b;
+      d.kl += std::exp(lp_b) * (lp_b - (a.logits[i] - lse_a));
+    }
+    auto top2 = b.logits;
+    std::partial_sort(top2.begin(), top2.begin() + 2, top2.end(),
+                      std::greater<float>());
+    d.ref_margin = static_cast<double>(top2[0]) - top2[1];
+  }
   bool bits = a.logits == b.logits;
   for (std::size_t i = 0; i < a.state.size(); ++i) {
     const double rs = RelL2(a.state[i], b.state[i]);
