@@ -1,0 +1,175 @@
+{
+  "artifactType": "model-bench-table",
+  "fingerprint": {
+    "canonical": {
+      "cppStandard": "C++20",
+      "cpuArchitecture": "x86_64",
+      "cpuLogicalCores": 32,
+      "cpuModel": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "cpuPhysicalCores": 16,
+      "cxxCompiler": "GCC 15.3.0",
+      "gpuArchitecture": "gfx1151",
+      "gpuComputeUnits": 20,
+      "gpuDriver": "amdgpu",
+      "gpuName": "AMD Radeon 8060S Graphics",
+      "gpuPciId": "1002:1586",
+      "kernelRelease": "7.2.9-200.fc44.x86_64",
+      "memoryTotalBytes": 134297600000,
+      "memoryType": "LPDDR5X (Unified)",
+      "rocmVersion": "7.2.3",
+      "schemaVersion": "1.0.0"
+    },
+    "fingerprintId": "ba531d541ed3467f940eab20469eea687ce1335b170e72dca44bac3eba2aa4b5",
+    "schemaVersion": "1.0.0"
+  },
+  "measuredOn": "2026-10-12",
+  "mode": null,
+  "model": {
+    "id": "Ling-3.0-flash",
+    "variant": "q5km"
+  },
+  "notes": [
+    "llama.cpp: llama-server version: 0.5.0-dev (build 11146, commit 7fe450e19)",
+    "pp2048/tg128; depth is a cached conversation prefix of synthetic text (8-token reply); measured turn task is recorded per row; tolerance max(32, 0.500%) on cache_n and prompt_n; actual counts per sample in rows",
+    "synthetic text: 1.174 tokens/word, template overhead 21 tokens",
+    "depth 196,608 measured in a separate run on 2026-10-12"
+  ],
+  "referenceName": "llama.cpp",
+  "rows": {
+    "0": {
+      "command": "llama-server -m Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf -c 199296 -np 1 --port 35355 --host 127.0.0.1 --alias bench -ngl 999 -fa on -ctk q8_0 -ctv q8_0 --cache-reuse 0 --jinja --reasoning off --cache-ram 0",
+      "counts": [
+        {
+          "cache_n": 8,
+          "completion_sha256": "58377b66454f5b7d46c387ae9a3c552cd0501c4f2eed5e1e9924e1587e81b276",
+          "draft_n": 0,
+          "draft_n_accepted": 0,
+          "predicted_n": 128,
+          "prompt_n": 2021
+        }
+      ],
+      "pp": 402.82,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 32.04,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "131072": {
+      "command": "llama-server -m Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf -c 199296 -np 1 --port 35355 --host 127.0.0.1 --alias bench -ngl 999 -fa on -ctk q8_0 -ctv q8_0 --cache-reuse 0 --jinja --reasoning off --cache-ram 0",
+      "counts": [
+        {
+          "cache_n": 131208,
+          "completion_sha256": "e7e055dccfe6fdff0a561cbc5e973b5231a69952695e973d6e4ca4eb18702959",
+          "draft_n": 0,
+          "draft_n_accepted": 0,
+          "predicted_n": 128,
+          "prompt_n": 2050
+        }
+      ],
+      "pp": 36.97,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 12.86,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "32768": {
+      "command": "llama-server -m Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf -c 199296 -np 1 --port 35355 --host 127.0.0.1 --alias bench -ngl 999 -fa on -ctk q8_0 -ctv q8_0 --cache-reuse 0 --jinja --reasoning off --cache-ram 0",
+      "counts": [
+        {
+          "cache_n": 32756,
+          "completion_sha256": "b5bdce4e61fd83698681abe4dcbb47319ff38accea00d8a8630f2ed5f245c99f",
+          "draft_n": 0,
+          "draft_n_accepted": 0,
+          "predicted_n": 128,
+          "prompt_n": 2048
+        }
+      ],
+      "pp": 142.92,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 23.63,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "65536": {
+      "command": "llama-server -m Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf -c 199296 -np 1 --port 35355 --host 127.0.0.1 --alias bench -ngl 999 -fa on -ctk q8_0 -ctv q8_0 --cache-reuse 0 --jinja --reasoning off --cache-ram 0",
+      "counts": [
+        {
+          "cache_n": 65541,
+          "completion_sha256": "548a0181ae29b436193b44d482a8312c7bcab51911e0ebfec32eb9e72b9b58c1",
+          "draft_n": 0,
+          "draft_n_accepted": 0,
+          "predicted_n": 128,
+          "prompt_n": 2052
+        }
+      ],
+      "pp": 69.28,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 18.58,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "196608": {
+      "command": "llama-server -m Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf -c 199296 -np 1 --port 43283 --host 127.0.0.1 --alias bench -ngl 999 -fa on -ctk q8_0 -ctv q8_0 --cache-reuse 0 --jinja --reasoning off --cache-ram 0",
+      "counts": [
+        {
+          "cache_n": 196568,
+          "completion_sha256": "422695da85218c241c79d1560c5600d7db94ea5c3f0f33d975d448d82130a17d",
+          "draft_n": 0,
+          "draft_n_accepted": 0,
+          "predicted_n": 128,
+          "prompt_n": 2052
+        }
+      ],
+      "pp": 24.88,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 9.66,
+      "tg_sd": null,
+      "workload": "prose"
+    }
+  },
+  "schemaVersion": 1,
+  "server": {
+    "command": [
+      "llama-server",
+      "-m",
+      "Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf",
+      "-c",
+      "199296",
+      "-np",
+      "1",
+      "--port",
+      "35355",
+      "--host",
+      "127.0.0.1",
+      "--alias",
+      "bench",
+      "-ngl",
+      "999",
+      "-fa",
+      "on",
+      "-ctk",
+      "q8_0",
+      "-ctv",
+      "q8_0",
+      "--cache-reuse",
+      "0",
+      "--jinja",
+      "--reasoning",
+      "off",
+      "--cache-ram",
+      "0"
+    ]
+  },
+  "source": {
+    "buildMode": "nix-release",
+    "dirty": false,
+    "revision": "9e596291be6e765e1805b80c5bc91b81a3720ca5"
+  },
+  "table": "single-ar",
+  "target": "reference"
+}

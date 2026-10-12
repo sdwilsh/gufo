@@ -4,14 +4,20 @@
   "model": {
     "id": "Ling-3.0-flash",
     "docs": "ling-3.0-flash",
-    "label": "Ling-3.0-flash Q4_K_S"
+    "label": "Ling-3.0-flash"
   },
   "files": {
-    "gguf": "first shard of Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf"
+    "gguf": "first shard of the quant (Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf or Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf; MTP block 42 inside)"
   },
   "variants": {
-    "default": {
-      "label": "Q4_K_S",
+    "q4ks": {
+      "label": "AD-Q4_K_S",
+      "requires": [
+        "gguf"
+      ]
+    },
+    "q5km": {
+      "label": "AD-Q5_K_M",
       "requires": [
         "gguf"
       ]
@@ -21,19 +27,28 @@
     "temperature": 0,
     "seed": 1
   },
+  "speculative": {
+    "mode": "mtp",
+    "label": "MTP",
+    "gufo_args": [
+      "--speculative",
+      "mtp"
+    ]
+  },
   "tables": {
     "single-ar": {
       "title": "Single user, autoregressive",
-      "per_variant": false,
+      "per_variant": true,
       "prompt_tokens": 2048,
       "output_tokens": 128,
       "depths": [
         0,
-        4096,
-        16384,
-        65536
+        32768,
+        65536,
+        131072,
+        196608
       ],
-      "context": 67776,
+      "context": 199296,
       "depth_tolerance": 0.005,
       "prefix": {
         "generator": "synthetic-paragraphs",
@@ -43,25 +58,117 @@
       "metric": "tok/s",
       "better": "higher"
     },
-    "loading": {
-      "title": "Loading time",
-      "per_variant": false,
-      "context": 262144,
-      "sessions": 1,
+    "single-mtp": {
+      "title": "Single user, MTP",
+      "per_variant": true,
+      "speculative": true,
+      "prompt_tokens": 2048,
+      "output_tokens": 128,
+      "depths": [
+        0,
+        32768,
+        65536,
+        131072
+      ],
+      "context": 133760,
+      "depth_tolerance": 0.005,
+      "prefix": {
+        "generator": "synthetic-paragraphs",
+        "seed": 1
+      },
       "repetitions": 1,
-      "metric": "seconds",
-      "better": "lower",
-      "rows": "variants"
+      "metric": "tok/s",
+      "better": "higher",
+      "workloads": {
+        "single-mtp": {
+          "label": "mixed",
+          "workload": "prose"
+        },
+        "single-mtp-repetition": {
+          "label": "repetitive",
+          "workload": "repetition"
+        }
+      }
+    },
+    "multi-ar": {
+      "title": "Multiple users, autoregressive",
+      "per_variant": true,
+      "modes": [
+        "ar"
+      ],
+      "corpus_layout": "homogeneous",
+      "concurrency": [
+        1,
+        2,
+        4,
+        6,
+        8
+      ],
+      "context": 4096,
+      "output_tokens": 128,
+      "cache_prompt": true,
+      "warmup": 1,
+      "repetitions": 1,
+      "metric": "tok/s",
+      "better": "higher",
+      "prompt_tokens": 2048,
+      "workload": "prose",
+      "prefill_first": true,
+      "replay_tokens": 9,
+      "rate": "aggregate"
+    },
+    "multi-mtp": {
+      "title": "Multiple users, MTP",
+      "per_variant": true,
+      "modes": [
+        "mtp"
+      ],
+      "concurrency": [
+        1,
+        2,
+        4,
+        6,
+        8
+      ],
+      "context": 4096,
+      "output_tokens": 128,
+      "cache_prompt": true,
+      "warmup": 1,
+      "repetitions": 1,
+      "metric": "tok/s",
+      "better": "higher",
+      "prompt_tokens": 2048,
+      "prefill_first": true,
+      "replay_tokens": 9,
+      "rate": "aggregate",
+      "workloads": {
+        "multi-mixed": {
+          "label": "mixed",
+          "corpus_layout": "homogeneous",
+          "workload": "prose"
+        },
+        "multi-repetition": {
+          "label": "repetitive",
+          "corpus_layout": "homogeneous",
+          "workload": "repetition"
+        }
+      }
     },
     "memory": {
       "title": "Memory occupation",
-      "per_variant": false,
-      "context": 66000,
+      "per_variant": true,
+      "context": 133121,
       "workloads": [
         {
           "id": "pp2048 + tg128",
           "depth": 0,
           "prompt_tokens": 2048,
+          "output_tokens": 128
+        },
+        {
+          "id": "16K prefix, pp4096 + tg128",
+          "depth": 16384,
+          "prompt_tokens": 4096,
           "output_tokens": 128
         }
       ],
@@ -75,10 +182,14 @@
     "llm": [
       "--think",
       "off",
-      "--speculative",
-      "off",
       "--max-pending-per-client",
-      "8"
+      "8",
+      "--cache-ram-bytes",
+      "2147483648"
+    ],
+    "ar_args": [
+      "--speculative",
+      "off"
     ],
     "readiness": "/ready"
   },
@@ -90,6 +201,10 @@
       "999",
       "-fa",
       "on",
+      "-ctk",
+      "q8_0",
+      "-ctv",
+      "q8_0",
       "--cache-reuse",
       "0",
       "--jinja",
