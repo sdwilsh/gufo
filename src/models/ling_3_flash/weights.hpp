@@ -88,9 +88,9 @@ struct LayerWeights {
   // MoE (blocks 2..).
   TensorRef router;         ///< F32 [2560 -> 512]
   TensorRef exp_probs_b;    ///< F32 [512] selection bias
-  TensorRef ffn_gate_exps;  ///< [2560 -> 768] x 512, IQ4_XS or Q5_K
+  TensorRef ffn_gate_exps;  ///< [2560 -> 768] x 512, IQ4_XS, Q4_K, Q5_K or Q6_K
   TensorRef ffn_up_exps;
-  TensorRef ffn_down_exps;   ///< [768 -> 2560] x 512, Q4_K or Q6_K
+  TensorRef ffn_down_exps;   ///< [768 -> 2560] x 512, Q4_K, Q5_K or Q6_K
   TensorRef ffn_gate_shexp;  ///< Q8_0 [2560 -> 768]
   TensorRef ffn_up_shexp;
   TensorRef ffn_down_shexp;  ///< Q8_0 [768 -> 2560]
@@ -110,7 +110,7 @@ struct MtpWeights {
 
 struct ModelWeights {
   Config config;
-  TensorRef token_embd;              ///< Q4_K [2560 -> 157184]
+  TensorRef token_embd;              ///< Q4_K or Q8_0 [2560 -> 157184]
   TensorRef output_norm;             ///< F32 [2560]
   TensorRef output;                  ///< F16 [2560 -> 157184]
   std::vector<LayerWeights> layers;  ///< Trunk blocks 0..41.

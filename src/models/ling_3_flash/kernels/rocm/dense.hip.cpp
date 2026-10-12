@@ -597,6 +597,31 @@ __global__ __launch_bounds__(32 * WT * WR) void GemmKernel(
 }
 
 // ---------------------------------------------------------------------------
+// Q8_0 embedding gather.
+// ---------------------------------------------------------------------------
+__global__ __launch_bounds__(256) void EmbedQ8_0Kernel(
+    const std::uint8_t* __restrict__ table,
+    const std::int32_t* __restrict__ tokens, float* __restrict__ out,
+    std::uint32_t hidden) {
+  const std::uint32_t t = blockIdx.x;
+  const std::int32_t id = tokens[t];
+  float* dst = out + std::size_t{t} * hidden;
+  if (id < 0) {
+    for (std::uint32_t i = threadIdx.x; i < hidden; i += 256)
+      dst[i] = 0.0F;
+    return;
+  }
+  const std::uint8_t* row =
+      table + std::size_t{static_cast<std::uint32_t>(id)} * (hidden / 32) * 34;
+  for (std::uint32_t i = threadIdx.x; i < hidden; i += 256) {
+    const std::uint8_t* blk = row + std::size_t{i / 32} * 34;
+    const float d = HalfBitsToFloat(blk[0] | (blk[1] << 8));
+    dst[i] =
+        d * static_cast<float>(static_cast<std::int8_t>(blk[2 + (i & 31)]));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Q4_K embedding gather.
 // ---------------------------------------------------------------------------
 __global__ __launch_bounds__(256) void EmbedQ4KKernel(
@@ -1164,6 +1189,30 @@ void EmbedQ4K(const void* table, const std::int32_t* tokens, float* out,
     return;
   EmbedQ4KKernel<<<n_tokens, 256, 0, stream>>>(
       static_cast<const std::uint8_t*>(table), tokens, out, hidden);
+}
+
+void EmbedQ8_0(const void* table, const std::int32_t* tokens, float* out,
+               std::uint32_t n_tokens, std::uint32_t hidden,
+               hipStream_t stream) {
+  if (n_tokens == 0)
+    return;
+  EmbedQ8_0Kernel<<<n_tokens, 256, 0, stream>>>(
+      static_cast<const std::uint8_t*>(table), tokens, out, hidden);
+}
+
+void Embed(WeightType type, const void* table, const std::int32_t* tokens,
+           float* out, std::uint32_t n_tokens, std::uint32_t hidden,
+           hipStream_t stream) {
+  switch (type) {
+    case WeightType::kQ4_K:
+      EmbedQ4K(table, tokens, out, n_tokens, hidden, stream);
+      break;
+    case WeightType::kQ8_0:
+      EmbedQ8_0(table, tokens, out, n_tokens, hidden, stream);
+      break;
+    default:
+      throw std::invalid_argument("ling embedding: unsupported table format");
+  }
 }
 
 void RmsNormRows(const float* x, const float* gamma, float* out,

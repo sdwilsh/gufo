@@ -150,6 +150,14 @@ void SwiGluClampedQuant(const float* gate, const float* up, float* out,
 /// out[t][:] = dequant(table[tokens[t]]); table is Q4_K rows of `hidden`.
 void EmbedQ4K(const void* table, const std::int32_t* tokens, float* out,
               std::uint32_t n_tokens, std::uint32_t hidden, hipStream_t stream);
+/// Same for Q8_0 rows (34-byte blocks of 32).
+void EmbedQ8_0(const void* table, const std::int32_t* tokens, float* out,
+               std::uint32_t n_tokens, std::uint32_t hidden,
+               hipStream_t stream);
+/// Embedding gather for the table's own format (Q4_K or Q8_0).
+void Embed(WeightType type, const void* table, const std::int32_t* tokens,
+           float* out, std::uint32_t n_tokens, std::uint32_t hidden,
+           hipStream_t stream);
 
 /// out[t][g*d..] = x[t][g*d..] * rsqrt(mean(x[t][g*d..]^2) + eps) * gamma[..]
 /// for `groups` independent norms of d = dim / groups elements each; gamma is
@@ -393,7 +401,7 @@ std::size_t DecodeScratchBytes();
 
 /// Decode / small verify batch, `n_tokens` in 1..8: act[t][k][f] =
 /// swiglu_clamped(gate_e . x[t], up_e . x[t]) for the 8 experts e = ids[t][k]
-/// (gate/up `[512][768][2560]`, type IQ4_XS or Q5_K (Q4_K/Q6_K also work),
+/// (gate/up `[512][768][2560]`, type IQ4_XS, Q4_K, Q5_K or Q6_K,
 /// clamp L = swiglu_clamp_exp[layer], 0 = off); x `[t][2560]`, ids `[t][8]`,
 /// act `[t][8][768]`. Each distinct selected expert is read once per call
 /// even when several tokens pick it. `scratch` is DecodeScratchBytes().
@@ -402,8 +410,9 @@ void ExpertGateUpDecode(const void* gate, const void* up, WeightType type,
                         std::uint32_t n_tokens, float limit, float* act,
                         void* scratch, hipStream_t stream);
 /// Decode, `n_tokens` in 1..8: out[t][k][:] = down_e . act[t][k] for e =
-/// ids[t][k] (down `[512][2560][768]`, type Q4_K or Q6_K); act `[t][8][768]`,
-/// out `[t][8][2560]`, unweighted. Same single-read-per-expert guarantee.
+/// ids[t][k] (down `[512][2560][768]`, type Q4_K, Q5_K or Q6_K); act
+/// `[t][8][768]`, out `[t][8][2560]`, unweighted. Same single-read-per-expert
+/// guarantee.
 void ExpertDownDecode(const void* down, WeightType type, const float* act,
                       const std::int32_t* ids, std::uint32_t n_tokens,
                       float* out, void* scratch, hipStream_t stream);
