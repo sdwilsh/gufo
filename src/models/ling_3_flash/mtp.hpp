@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 #include "src/models/ling_3_flash/layout.hpp"
 
@@ -292,6 +293,170 @@ private:
   std::uint64_t cycles_{0};
   std::array<float, kMaxDrafts + 1> ms_{};
   std::array<std::uint32_t, kMaxDrafts + 1> samples_{};
+};
+
+/// Prior wall time (ms) of a batched decode forward over `rows` rows of
+/// distinct sessions at `context`: gfx1151 batched AR steps measured on the
+/// full model (m1-bench, rc2 base; aggregate 35.9 / 56.7 / 81.7 / 105.6 t/s
+/// at 1 / 2 / 4 / 8 sessions at depth 0, 32.0 / 48.3 / 66.7 / 83.0 at
+/// 65,536), linear between the measured widths and in depth. Rows of one
+/// session's verify share more experts than rows of distinct sessions, so
+/// this is the high side for verify rows.
+[[nodiscard]] inline float MtpBatchStepMsPrior(float rows,
+                                               std::uint32_t context) noexcept {
+  constexpr std::array<float, 4> kRows = {1.0F, 2.0F, 4.0F, 8.0F};
+  constexpr std::array<float, 4> kDepth0 = {27.86F, 35.27F, 48.96F, 75.76F};
+  constexpr std::array<float, 4> kDepth64k = {31.25F, 41.41F, 59.97F, 96.39F};
+  const float depth =
+      static_cast<float>(context < 65536 ? context : 65536) / 65536.0F;
+  const auto at = [&](std::size_t i) {
+    return kDepth0[i] + depth * (kDepth64k[i] - kDepth0[i]);
+  };
+  rows = std::max(rows, 1.0F);
+  std::size_t i = 0;
+  while (i + 2 < kRows.size() && rows > kRows[i + 1]) {
+    ++i;
+  }
+  const float t = (rows - kRows[i]) / (kRows[i + 1] - kRows[i]);
+  return at(i) + t * (at(i + 1) - at(i));
+}
+
+/// Prior wall time (ms) of one batched draft step over `lanes` chains (block
+/// 42 and the Q8_0 draft head once; one expert union per lane): about 4 ms
+/// for one lane on gfx1151.
+[[nodiscard]] constexpr float MtpDraftStepMsPrior(std::size_t lanes) noexcept {
+  return 3.4F + 0.8F * static_cast<float>(lanes);
+}
+
+/// Draft length of the greedy lanes of a batched decode cycle
+/// (Session::DecodeBatch): one width for all of them, chosen from their own
+/// acceptance estimates and the cost of whole cycles per (occupancy, context
+/// bin), the way Flash-Next's MtpBatchController does. Width 0 is the batched
+/// AR step, so a cohort drafts only when that beats batched AR on measured (or
+/// prior) costs; it never falls back to serial decoding. Greedy tokens do not
+/// depend on the width, so cohort-measured costs are allowed here; sampled
+/// lanes keep their own-history MtpLengthController choice so seeded replay
+/// never depends on the peers.
+class MtpCohortController {
+public:
+  struct Row {
+    const MtpLengthController* acceptance;
+    std::uint32_t budget;  ///< Most drafts this lane may take.
+  };
+
+  /// `occupancy` lanes in the cycle, `rows` of them greedy; the other lanes
+  /// take `other_rows` verify rows in all. A cycle's rows go to verify
+  /// forwards of at most `row_limit` rows: a width whose rows do not fit
+  /// beside the others costs a further forward, which a wider greedy width
+  /// may still repay.
+  [[nodiscard]] std::uint32_t Choose(std::span<const Row> rows,
+                                     std::size_t occupancy,
+                                     std::uint32_t other_rows,
+                                     std::uint32_t row_limit,
+                                     std::uint32_t context) const noexcept {
+    if (rows.empty() || occupancy == 0 || occupancy > 8) {
+      return 0;
+    }
+    std::uint32_t cap = kMaxDrafts;
+    for (const Row& row : rows) {
+      cap = std::min(cap, row.budget);
+    }
+    if (cap == 0) {
+      return 0;
+    }
+    const Cell& cell = CellFor(occupancy, context);
+    // Periodic plain cycles measure the alternative to drafting.
+    const bool stable = last_occupancy_ == occupancy &&
+                        last_bin_ == ContextBin(context) && stable_cycles_ >= 2;
+    if (stable && (cell.samples[0] == 0 || cell.cycles % 32 < 2)) {
+      return 0;
+    }
+    const auto greedy = static_cast<float>(rows.size());
+    const auto verify_ms = [&](std::uint32_t total) {
+      // Full forwards of row_limit rows and the remainder (the packing is
+      // first fit; this is its cost when no row is wasted).
+      const std::uint32_t limit = std::max(row_limit, 1U);
+      float ms = static_cast<float>(total / limit) *
+                 MtpBatchStepMsPrior(static_cast<float>(limit), context);
+      if (total % limit != 0) {
+        ms += MtpBatchStepMsPrior(static_cast<float>(total % limit), context);
+      }
+      return ms;
+    };
+    const auto prior = [&](std::uint32_t width) {
+      return verify_ms(other_rows +
+                       static_cast<std::uint32_t>(greedy) * (width + 1)) +
+             static_cast<float>(width) * MtpDraftStepMsPrior(rows.size());
+    };
+    const float scale = cell.samples[0] >= 2 ? cell.ms[0] / prior(0) : 1.0F;
+    const auto cost = [&](std::uint32_t width) {
+      return cell.samples[width] >= 2 ? cell.ms[width] : scale * prior(width);
+    };
+    const auto others = static_cast<float>(occupancy - rows.size());
+    float best_score = (others + greedy) / cost(0);
+    std::uint32_t best = 0;
+    for (std::uint32_t width = 1; width <= cap; ++width) {
+      float expected = others;
+      for (const Row& row : rows) {
+        expected += row.acceptance->ExpectedTokens(width);
+      }
+      const float score = expected / cost(width);
+      if (score > best_score * 1.01F) {
+        best_score = score;
+        best = width;
+      }
+    }
+    // Bounded exploration learns the cost one width wider.
+    if (cell.cycles % 16 == 2) {
+      return std::min(cap, std::max(1U, best + 1));
+    }
+    return best;
+  }
+
+  /// Wall time of a cycle whose greedy lanes drafted `drafts` each.
+  void Observe(std::size_t occupancy, std::uint32_t context,
+               std::uint32_t drafts, float ms) noexcept {
+    if (occupancy == 0 || occupancy > 8 || drafts > kMaxDrafts ||
+        !std::isfinite(ms) || ms <= 0.0F) {
+      return;
+    }
+    const unsigned bin = ContextBin(context);
+    const bool same = last_occupancy_ == occupancy && last_bin_ == bin;
+    stable_cycles_ = same ? std::min(stable_cycles_ + 1, 1000000U) : 1;
+    last_occupancy_ = occupancy;
+    last_bin_ = bin;
+    Cell& cell = CellFor(occupancy, context);
+    ++cell.cycles;
+    auto& n = cell.samples[drafts];
+    auto& e = cell.ms[drafts];
+    e = n < 2 ? ms : e + 0.25F * (ms - e);
+    n = std::min<std::uint32_t>(n + 1, 1000000);
+  }
+
+private:
+  struct Cell {
+    std::array<float, kMaxDrafts + 1> ms{};
+    std::array<std::uint32_t, kMaxDrafts + 1> samples{};
+    std::uint64_t cycles{0};
+  };
+  static unsigned ContextBin(std::uint32_t context) noexcept {
+    unsigned bin = 0;
+    for (std::uint32_t bound = 4096; context >= bound && bin < 7; bound *= 2) {
+      ++bin;
+    }
+    return bin;
+  }
+  Cell& CellFor(std::size_t occupancy, std::uint32_t context) noexcept {
+    return cells_[occupancy - 1][ContextBin(context)];
+  }
+  const Cell& CellFor(std::size_t occupancy,
+                      std::uint32_t context) const noexcept {
+    return cells_[occupancy - 1][ContextBin(context)];
+  }
+  std::array<std::array<Cell, 8>, 8> cells_{};
+  std::size_t last_occupancy_{0};
+  unsigned last_bin_{0};
+  unsigned stable_cycles_{0};
 };
 
 }  // namespace gufo::models::ling_3_flash

@@ -21,7 +21,7 @@ B=build/gpu-test/tests/models/ling_3_flash
 parent_tests=${PARENT_GPU_TEST:-../gufo-ling-final5/build/gpu-test/tests/models/ling_3_flash}
 parent_gufo=${PARENT_GUFO:-../gufo-ling-final5/build/release/gufo}
 rm -rf "$ctx"; mkdir -p "$ctx/tests" "$ctx/base" "$ctx/corpus" "$ctx/lib"
-for t in batch_test batch_segments_test decode_digest session_test snapshot_test interleave_test restore_tail_test mtp_test; do
+for t in batch_test batch_segments_test batch_mtp_test decode_digest session_test snapshot_test interleave_test restore_tail_test mtp_test; do
   cp "$B/ling_3_flash_$t" "$ctx/tests/"
 done
 cp "$parent_tests/ling_3_flash_decode_digest" "$ctx/base/ling_3_flash_decode_digest-parent"
