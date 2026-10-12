@@ -16,8 +16,9 @@ COPY oracle/ /opt/gufo/oracle/
 COPY oracle-novel/ /opt/gufo/oracle-novel/
 COPY functional/ /opt/gufo/tests/functional/
 COPY flake.lock /opt/gufo/flake.lock
-COPY gufo gfx1151_peak ling-int-suite ling-int-bench ling-serve-suite ling-cache-suite /usr/local/bin/
-RUN chmod -R a+rX /opt/gufo && chmod a+rx /usr/local/bin/* /opt/gufo/tests/ling_3_flash_* \
+COPY gufo gfx1151_peak ling-int-suite ling-int-bench ling-serve-suite ling-cache-suite ling-token26 \
+     ling-mla-prefill-bench-parent ling-mla-prefill-bench-candidate /usr/local/bin/
+RUN chmod -R a+rX /opt/gufo && chmod a+rx /usr/local/bin/* /opt/gufo/tests/ling_3_flash_* /opt/gufo/base/* \
   && mkdir -p /work && chmod 1777 /work
 # restricted PSS: non-root, read-only rootfs; the only writable path is /work (emptyDir)
 USER 1000:1000

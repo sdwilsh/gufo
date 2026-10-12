@@ -8,6 +8,11 @@
 # The report-only base session_test comes from the pre-merge image (BASE_IMAGE,
 # default localhost/gufo-ling-int2r4) and the device-loss preload helper from
 # build/gpu-test/libdevice_loss_faults.so (target device_loss_faults).
+# ling-int-bench's small_ab / kernels_ab stages compare against a parent build:
+# PARENT_GUFO (default build/base-release/gufo) and the MLA prefill
+# microbenchmark built from the parent's and this tree's kernel source
+# (MLA_BENCH_PARENT / MLA_BENCH_CANDIDATE, default build/bench/mla_base and
+# build/bench/mla_new; tools/models/ling_3_flash/mla_prefill_bench.hip).
 set -eu
 tag=${1:-localhost/gufo-ling-int2r7}
 oracle=${2:-/tmp/b2-oracle}
@@ -36,6 +41,9 @@ cp -L "$novel/greedy.jsonl" "$novel/kl_base.bin" "$ctx/oracle-novel/"
 python3 "$here/../mtp/make_corpus.py" . "$ctx/corpus" "$novel/input_text.txt"
 cp "$here/run-suite" "$ctx/run-suite"
 cp build/release/gufo "$ctx/gufo"; cp "$peak" "$ctx/gfx1151_peak"
+cp "${PARENT_GUFO:-build/base-release/gufo}" "$ctx/base/gufo-parent"
+cp "${MLA_BENCH_PARENT:-build/bench/mla_base}" "$ctx/ling-mla-prefill-bench-parent"
+cp "${MLA_BENCH_CANDIDATE:-build/bench/mla_new}" "$ctx/ling-mla-prefill-bench-candidate"
 cp "$here/ling-int-suite" "$here/ling-int-bench" "$here/ling-serve-suite" "$here/ling-token26" "$here/../cache/ling-cache-suite" "$ctx/"
 cp -r tests/functional "$ctx/functional"; rm -rf "$ctx/functional/__pycache__"
 cp flake.lock "$ctx/flake.lock"
