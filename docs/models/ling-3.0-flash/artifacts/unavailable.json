@@ -1,0 +1,4 @@
+{
+  "multi-mixed": {"*": "llama.cpp draft-mtp completion differs from its own AR on Ling-3.0-flash"},
+  "multi-repetition": {"*": "llama.cpp draft-mtp completion differs from its own AR on Ling-3.0-flash"}
+}

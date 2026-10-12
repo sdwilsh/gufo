@@ -1,0 +1,127 @@
+{
+  "arbiter": "Gufo ReferenceModel over the same GGUF, F32 activations and F32 latent cache (src/models/ling_3_flash/reference.cpp)",
+  "bases": {
+    "chat128.kl": "4132b92c7c6d22255d498f15c7865ee90a50c6e8cec171f5907ae5afb8251f26",
+    "window512.kl": "24d157ed78308379d8b142687752c2e76f2f56175f0f9a910ad2cf892bb4e4e1"
+  },
+  "steps": {
+    "gufo-decode-chat128": {
+      "status": "pass",
+      "kl_mean": 1.96113e-05,
+      "kl_mean_stderr": 7.79936e-06,
+      "kl_p99": 0.00050974,
+      "kl_max": 0.00053649,
+      "top1_agreement": 1,
+      "positions": 126
+    },
+    "gufo-decode-window512": {
+      "status": "pass",
+      "kl_mean": 0.00151443,
+      "kl_mean_stderr": 0.00025225,
+      "kl_p99": 0.019577,
+      "kl_max": 0.04397,
+      "top1_agreement": 0.99216,
+      "positions": 255
+    },
+    "gufo-prefill-chat128": {
+      "status": "pass",
+      "kl_mean": 0.000117174,
+      "kl_mean_stderr": 5.53952e-05,
+      "kl_p99": 0.0027095,
+      "kl_max": 0.0060751,
+      "top1_agreement": 1,
+      "positions": 126
+    },
+    "gufo-prefill-window512": {
+      "status": "pass",
+      "kl_mean": 0.0010689,
+      "kl_mean_stderr": 0.000157846,
+      "kl_p99": 0.013146,
+      "kl_max": 0.022831,
+      "top1_agreement": 1,
+      "positions": 255
+    },
+    "llama-f16-decode-chat128": {
+      "status": null,
+      "kl_mean": 0.003667,
+      "kl_mean_stderr": null,
+      "kl_p99": 0.04372,
+      "kl_max": 0.057459,
+      "top1_agreement": null,
+      "positions": 126
+    },
+    "llama-f16-decode-window512": {
+      "status": null,
+      "kl_mean": 0.002728,
+      "kl_mean_stderr": null,
+      "kl_p99": 0.025427,
+      "kl_max": 0.057955,
+      "top1_agreement": null,
+      "positions": 255
+    },
+    "llama-f16-prefill-chat128": {
+      "status": null,
+      "kl_mean": 0.004133,
+      "kl_mean_stderr": null,
+      "kl_p99": 0.050468,
+      "kl_max": 0.073315,
+      "top1_agreement": null,
+      "positions": 126
+    },
+    "llama-f16-prefill-window512": {
+      "status": null,
+      "kl_mean": 0.005005,
+      "kl_mean_stderr": null,
+      "kl_p99": 0.02916,
+      "kl_max": 0.046609,
+      "top1_agreement": null,
+      "positions": 255
+    },
+    "llama-q8_0-decode-chat128": {
+      "status": null,
+      "kl_mean": 0.003291,
+      "kl_mean_stderr": null,
+      "kl_p99": 0.032395,
+      "kl_max": 0.052319,
+      "top1_agreement": null,
+      "positions": 126
+    },
+    "llama-q8_0-decode-window512": {
+      "status": null,
+      "kl_mean": 0.002875,
+      "kl_mean_stderr": null,
+      "kl_p99": 0.023251,
+      "kl_max": 0.042745,
+      "top1_agreement": null,
+      "positions": 255
+    },
+    "llama-q8_0-prefill-chat128": {
+      "status": null,
+      "kl_mean": 0.004522,
+      "kl_mean_stderr": null,
+      "kl_p99": 0.04292,
+      "kl_max": 0.06215,
+      "top1_agreement": null,
+      "positions": 126
+    },
+    "llama-q8_0-prefill-window512": {
+      "status": null,
+      "kl_mean": 0.005618,
+      "kl_mean_stderr": null,
+      "kl_p99": 0.037236,
+      "kl_max": 0.049943,
+      "top1_agreement": null,
+      "positions": 255
+    },
+    "mtp_test": {
+      "status": "pass",
+      "checks": 60,
+      "passed": 60
+    },
+    "session_test": {
+      "status": "pass",
+      "checks": 11,
+      "passed": 11
+    }
+  }
+}

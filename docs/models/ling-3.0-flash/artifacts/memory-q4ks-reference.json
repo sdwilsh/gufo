@@ -1,0 +1,88 @@
+{
+  "artifactType": "model-bench-table",
+  "fingerprint": {
+    "canonical": {
+      "cppStandard": "C++20",
+      "cpuArchitecture": "x86_64",
+      "cpuLogicalCores": 32,
+      "cpuModel": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "cpuPhysicalCores": 16,
+      "cxxCompiler": "GCC 15.3.0",
+      "gpuArchitecture": "gfx1151",
+      "gpuComputeUnits": 20,
+      "gpuDriver": "amdgpu",
+      "gpuName": "AMD Radeon 8060S Graphics",
+      "gpuPciId": "1002:1586",
+      "kernelRelease": "7.2.9-200.fc44.x86_64",
+      "memoryTotalBytes": 134297600000,
+      "memoryType": "LPDDR5X (Unified)",
+      "rocmVersion": "7.2.3",
+      "schemaVersion": "1.0.0"
+    },
+    "fingerprintId": "ba531d541ed3467f940eab20469eea687ce1335b170e72dca44bac3eba2aa4b5",
+    "schemaVersion": "1.0.0"
+  },
+  "measuredOn": "2026-10-12",
+  "mode": null,
+  "model": {
+    "id": "Ling-3.0-flash",
+    "variant": "q4ks"
+  },
+  "notes": [
+    "llama.cpp: llama-server version: 0.5.0-dev (build 11146, commit 7fe450e19)",
+    "peak device-global hipMemGetInfo used bytes (total - free), sampled every 250 ms during the request; idle_gib is the same counter before the server started",
+    "server mode: ar",
+    "gib is the sysfs GTT peak over the whole table run (the HIP counter does not see Vulkan allocations); llama.cpp preallocates its K/V cache, so one value covers both workloads"
+  ],
+  "referenceName": "llama.cpp",
+  "rows": {
+    "16K prefix, pp4096 + tg128": {
+      "command": "llama-server -m Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf -c 133121 -np 1 --port 45085 --host 127.0.0.1 --alias bench -ngl 999 -fa on -ctk q8_0 -ctv q8_0 --cache-reuse 0 --jinja --reasoning off --cache-ram 0",
+      "gib": 69.948
+    },
+    "pp2048 + tg128": {
+      "command": "llama-server -m Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf -c 133121 -np 1 --port 45085 --host 127.0.0.1 --alias bench -ngl 999 -fa on -ctk q8_0 -ctv q8_0 --cache-reuse 0 --jinja --reasoning off --cache-ram 0",
+      "gib": 69.948
+    }
+  },
+  "schemaVersion": 1,
+  "server": {
+    "command": [
+      "llama-server",
+      "-m",
+      "Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf",
+      "-c",
+      "133121",
+      "-np",
+      "1",
+      "--port",
+      "45085",
+      "--host",
+      "127.0.0.1",
+      "--alias",
+      "bench",
+      "-ngl",
+      "999",
+      "-fa",
+      "on",
+      "-ctk",
+      "q8_0",
+      "-ctv",
+      "q8_0",
+      "--cache-reuse",
+      "0",
+      "--jinja",
+      "--reasoning",
+      "off",
+      "--cache-ram",
+      "0"
+    ]
+  },
+  "source": {
+    "buildMode": "nix-release",
+    "dirty": false,
+    "revision": "9e596291be6e765e1805b80c5bc91b81a3720ca5"
+  },
+  "table": "memory",
+  "target": "reference"
+}
