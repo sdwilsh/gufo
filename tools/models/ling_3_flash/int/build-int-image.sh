@@ -74,5 +74,7 @@ for v in build/bench/moe_var-*; do
 done
 cp "$here/ling-int-suite" "$here/ling-int-bench" "$here/ling-serve-suite" "$here/ling-token26" "$here/../cache/ling-cache-suite" "$ctx/"
 cp -r tests/functional "$ctx/functional"; rm -rf "$ctx/functional/__pycache__"
+# tests/functional/{tool_reasoning,pi_agent}.py import gufo.* from <root>/tools.
+cp -r tools/gufo "$ctx/tools-gufo"; rm -rf "$ctx/tools-gufo/__pycache__" "$ctx"/tools-gufo/*/__pycache__
 cp flake.lock "$ctx/flake.lock"
 podman build -t "$tag" --build-arg IMAGE="$tag" -f "$here/Containerfile.int" "$ctx"

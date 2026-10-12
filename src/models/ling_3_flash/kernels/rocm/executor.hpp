@@ -142,6 +142,9 @@ private:
   /// Recorded at the end of every forward pass on this session; snapshot
   /// copies wait on it instead of trusting that the pass has been synchronized.
   hipEvent_t forward_done_{nullptr};
+  /// Snapshot saves/restores of this session in progress (on a worker
+  /// thread). A batched forward refuses a session with a transfer in flight.
+  mutable std::atomic<std::uint32_t> transfers_{0};
   bool mtp_valid_{false};
 };
 
@@ -197,6 +200,28 @@ struct DraftRequest {
   std::vector<OpTiming>* op_profile{nullptr};
 };
 
+/// One session's part of a batched decode step (Executor::ForwardBatch): its
+/// tokens are appended at the session's position, as Forward would.
+struct BatchSegment {
+  Session* session{nullptr};
+  /// 1..8 tokens (the small-batch family); all segments of a step together
+  /// hold at most 8 rows.
+  std::span<const std::int32_t> tokens;
+  /// Host destination of the logits of rows [logits_from, n), `vocab` floats
+  /// each. Empty skips the output head for this segment.
+  std::span<float> logits;
+  /// First token row whose logits are wanted (UINT32_MAX = last row only).
+  std::uint32_t logits_from{UINT32_MAX};
+  enum class Status : std::uint8_t {
+    kPending,
+    kDone,      ///< Ran; the session advanced by its tokens.
+    kRejected,  ///< Refused before any launch; the session is untouched.
+    kFailed,    ///< The step failed after launch; the session state is lost.
+  };
+  Status status{Status::kPending};  ///< Out.
+  std::string error;                ///< Out: why it was rejected or failed.
+};
+
 /// Single-stream layer loop of the Ling-3.0-flash trunk (PLAN section 1) over
 /// a resident DeviceModel. Owns the activation scratch; sessions own state.
 class Executor {
@@ -234,6 +259,43 @@ public:
   /// of `session` through the whole trunk and advances its position.
   [[nodiscard]] bool Forward(Session& session, const ForwardRequest& request,
                              std::string* error_msg = nullptr);
+
+  /// One eager forward pass over the segments of several sessions (one
+  /// segment per session, at most 8 rows in all). The rows share the weight
+  /// passes; each segment's KDA conv window and recurrence, MLA cache append
+  /// and attention (over its own context), MTP cache fill and logits use only
+  /// its own session. Every segment's logits, recurrent state, conv windows,
+  /// cache rows and MTP rows are bit-identical to Forward of the same tokens
+  /// on that session alone (the decode-family kernels compute every row
+  /// independently of the others; engine.hpp, batch invariance).
+  /// Each segment is validated before anything is launched (distinct
+  /// session, 1..8 tokens, row budget, context capacity, token range, no
+  /// snapshot transfer in flight); a refused segment is kRejected and the
+  /// others still run. Returns false when the pass failed after launch: every
+  /// launched segment is then kFailed and its session state undefined (the
+  /// caller must drop it without device calls; the device may be lost).
+  /// Records every member's forward event, so snapshot copies wait for it.
+  [[nodiscard]] bool ForwardBatch(std::span<BatchSegment> segments,
+                                  std::string* error_msg = nullptr);
+  /// Most rows (and so sessions of one token) one ForwardBatch takes: the
+  /// decode family's 8, within max_batch and one output-head group.
+  [[nodiscard]] std::uint32_t batch_row_limit() const noexcept {
+    return std::min(
+        {std::uint32_t{8}, options_.max_batch, options_.logit_group});
+  }
+  /// Where a FailBatchesForTest failure is reported.
+  enum class BatchFailurePoint : std::uint8_t {
+    kAfterSync,   ///< as a device error surfacing at the final wait
+    kBeforeSync,  ///< right after the trunk launches, before the final wait
+  };
+  /// Test hook: the next `count` ForwardBatch passes fail after their
+  /// launches at `point` (host-side bookkeeping only: no device fault).
+  void FailBatchesForTest(
+      std::uint32_t count,
+      BatchFailurePoint point = BatchFailurePoint::kAfterSync) noexcept {
+    batch_failures_for_test_ = count;
+    batch_failure_point_ = point;
+  }
 
   /// Teacher forcing: runs block `il` alone on `in` (host `[n][2560]`
   /// hidden rows) at positions first_pos.. of `session` and writes the block
@@ -362,27 +424,41 @@ private:
   Executor(const DeviceModel& model, const Options& options);
   bool Init(std::string* error_msg);
 
-  /// One block. `fuse` (decode family only) selects the fused launches; with
-  /// `x_ready` the attention norm of this block (x and its quantised planes)
-  /// was already produced by the previous block's last launch, and `next` (the
-  /// next resident block, if any) gets its attention norm fused into this
-  /// block's last launch.
-  bool Block(const Session& session, std::uint32_t il, std::uint32_t first_pos,
-             std::uint32_t n, GpuTensorSink* sink, bool fuse, bool x_ready,
+  /// Rows [row0, row0 + n) of a forward pass: `n` tokens of `session` at
+  /// positions first_pos... Forward runs one lane (row0 0); ForwardBatch one
+  /// per segment, in ascending row order. Row-wise and weight-shared launches
+  /// cover all rows; the per-session ones (KDA conv window and recurrence, MLA
+  /// cache append and attention) run once per lane on its own state.
+  struct Lane {
+    const Session* session{nullptr};
+    std::uint32_t first_pos{0};
+    std::uint32_t n{0};
+    std::uint32_t row0{0};
+  };
+  /// One block over the lanes' `n` rows in all. `fuse` (decode family only)
+  /// selects the fused launches; with `x_ready` the attention norm of this
+  /// block (x and its quantised planes) was already produced by the previous
+  /// block's last launch, and `next` (the next resident block, if any) gets
+  /// its attention norm fused into this block's last launch.
+  bool Block(std::span<const Lane> lanes, std::uint32_t il, std::uint32_t n,
+             GpuTensorSink* sink, bool fuse, bool x_ready,
              const DeviceLayer* next, std::string* error_msg);
-  bool BlockOf(const DeviceLayer& l, const Session& session, std::uint32_t il,
-               std::uint32_t first_pos, std::uint32_t n, GpuTensorSink* sink,
+  bool BlockOf(const DeviceLayer& l, std::span<const Lane> lanes,
+               std::uint32_t il, std::uint32_t n, GpuTensorSink* sink,
                bool fuse, bool x_ready, const DeviceLayer* next,
                std::string* error_msg);
-  /// After a forward of n tokens from first_pos: advances the MTP cache and
-  /// the trunk-hidden carry (no-op without MTP).
+  /// After a forward of n tokens from first_pos, rows row0.. of the pass:
+  /// advances the MTP cache and the trunk-hidden carry (no-op without MTP).
+  /// Overwrites activation rows [0, n) of `h`, so lanes of one pass are filled
+  /// in ascending row order (a lane's rows lie at or past row0 >= the rows
+  /// the earlier lanes overwrote).
   bool MtpAfterForward(Session& session, std::uint32_t n,
-                       std::uint32_t first_pos, std::string* error_msg);
-  void Kda(const DeviceLayer& l, const Session& session, std::uint32_t il,
+                       std::uint32_t first_pos, std::uint32_t row0,
+                       std::string* error_msg);
+  void Kda(const DeviceLayer& l, std::span<const Lane> lanes, std::uint32_t il,
            std::uint32_t n, bool fuse, GpuTensorSink* sink);
-  void Mla(const DeviceLayer& l, const Session& session, std::uint32_t il,
-           std::uint32_t first_pos, std::uint32_t n, bool fuse,
-           GpuTensorSink* sink);
+  void Mla(const DeviceLayer& l, std::span<const Lane> lanes, std::uint32_t il,
+           std::uint32_t n, bool fuse, GpuTensorSink* sink);
   void Ffn(const DeviceLayer& l, std::uint32_t il, std::uint32_t n, bool fuse,
            const DeviceLayer* next, GpuTensorSink* sink);
   void Q8(const DeviceTensor& w, const float* x, float* y, std::uint32_t n);
@@ -405,12 +481,16 @@ private:
                std::uint32_t width);
   bool UploadInputs(std::span<const std::int32_t> tokens, std::uint32_t n,
                     std::uint32_t first_pos, std::string* error_msg);
+  /// Uploads per-row tokens and positions (same length) and waits.
+  bool UploadRows(std::span<const std::int32_t> tokens,
+                  std::span<const std::int32_t> positions,
+                  std::string* error_msg);
   bool Head(std::uint32_t n, std::uint32_t from, std::span<float> logits,
             std::span<std::int32_t> argmax, std::string* error_msg);
   /// Embedding, all blocks and (head_from < n) the output norm, logits GEMV
   /// and argmax of rows [head_from, n) (at most logit_group of them), as
   /// launches only: no host synchronisation, so it can be graph-captured.
-  bool Trunk(const Session& session, std::uint32_t n, std::uint32_t first_pos,
+  bool Trunk(std::span<const Lane> lanes, std::uint32_t n,
              std::uint32_t head_from, bool events, GpuTensorSink* sink,
              std::string* error_msg);
   void HeadLaunch(std::uint32_t n, std::uint32_t from);
@@ -466,6 +546,8 @@ private:
   std::uint64_t graph_replays_{0};
   std::uint64_t capture_invalidations_{0};
   std::uint32_t capture_breaks_for_test_{0};
+  std::uint32_t batch_failures_for_test_{0};
+  BatchFailurePoint batch_failure_point_{BatchFailurePoint::kAfterSync};
   /// Pinned staging for the per-step host inputs of graph replays (tokens,
   /// positions).
   std::int32_t* staging_{nullptr};

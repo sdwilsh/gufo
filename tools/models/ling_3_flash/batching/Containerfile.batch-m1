@@ -1,0 +1,32 @@
+# Ling-3.0-Flash batching M1 validation image. It holds the gfx1151 model tests
+# of this build (batch_test, decode_digest, and the session, snapshot, and MTP
+# contracts), the parent (base build) decode_digest and release gufo, this
+# build's release gufo, the functional harness, a real-text corpus, and the
+# ling-batch-m1 driver. It uses the same ROCm user space as
+# tools/models/ling_3_flash/int/Containerfile.int. The build context is
+# build/ling-batch-m1-ctx (see build-batch-m1-image.sh).
+FROM registry.fedoraproject.org/fedora:44
+RUN dnf -y install --setopt=install_weak_deps=False \
+      python3 python3-openai python3-httpx python3-jsonschema python3-pydantic libicu libcurl libpng libjpeg-turbo libwebp libgomp \
+      openssl-libs libatomic elfutils-libs numactl-libs libdrm \
+      rocm-hip rocm-runtime hipblas hipblaslt rocblas rocsolver \
+  && dnf clean all && rm -rf /var/cache/* /usr/share/doc /usr/share/man \
+  && find /usr/lib64/rocblas/library /usr/lib64/hipblaslt/library -type f -name '*gfx[0-9]*' ! -name '*gfx1151*' -delete
+COPY tests/ /opt/gufo/tests/
+COPY base/ /opt/gufo/base/
+COPY lib/ /opt/gufo/lib/
+COPY corpus/ /opt/gufo/corpus/
+COPY functional/ /opt/gufo/tests/functional/
+COPY tools-gufo/ /opt/gufo/tools/gufo/
+COPY flake.lock /opt/gufo/flake.lock
+COPY gufo ling-batch-m1 /usr/local/bin/
+RUN chmod -R a+rX /opt/gufo && chmod a+rx /usr/local/bin/* /opt/gufo/tests/ling_3_flash_* /opt/gufo/base/* \
+  && mkdir -p /work && chmod 1777 /work
+# Restricted PSS: non-root, read-only rootfs. The only writable path is /work (emptyDir).
+USER 1000:1000
+WORKDIR /work
+ENV HOME=/work XDG_CACHE_HOME=/work/cache TMPDIR=/work/tmp PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 PATH=/usr/local/bin:/usr/bin:/bin
+ARG IMAGE=localhost/gufo-ling-batch-m1
+ENV GUFO_IMAGE=${IMAGE}
+CMD ["ling-batch-m1", "--stages", "tests,serve"]

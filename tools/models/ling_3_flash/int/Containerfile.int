@@ -22,6 +22,7 @@ COPY bin/ /usr/local/bin/
 COPY corpus/ /opt/gufo/corpus/
 COPY compare_routing.py /opt/gufo/compare_routing.py
 COPY functional/ /opt/gufo/tests/functional/
+COPY tools-gufo/ /opt/gufo/tools/gufo/
 COPY flake.lock /opt/gufo/flake.lock
 COPY gufo gfx1151_peak ling-int-suite ling-int-bench ling-serve-suite ling-cache-suite ling-token26 \
      ling-mla-prefill-bench-parent ling-mla-prefill-bench-candidate /usr/local/bin/

@@ -9,6 +9,7 @@
 // while the scheduler thread captures a decode graph on the executor stream
 // (executor.hpp).
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -38,6 +39,21 @@ bool AwaitForward(std::mutex& capture_mutex, hipEvent_t forward_done,
   return Check(hipEventSynchronize(forward_done),
                "wait for the session's last forward", error);
 }
+
+/// Marks a snapshot transfer of one session as in flight for its duration
+/// (Executor::ForwardBatch refuses sessions with one).
+class TransferScope {
+public:
+  explicit TransferScope(std::atomic<std::uint32_t>& count) : count_(count) {
+    count_.fetch_add(1, std::memory_order_acq_rel);
+  }
+  ~TransferScope() { count_.fetch_sub(1, std::memory_order_acq_rel); }
+  TransferScope(const TransferScope&) = delete;
+  TransferScope& operator=(const TransferScope&) = delete;
+
+private:
+  std::atomic<std::uint32_t>& count_;
+};
 
 /// Device -> host through the pinned staging buffer.
 bool CopyOut(hipStream_t stream, void* staging, std::uint8_t* host,
@@ -86,6 +102,7 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t rows,
     return false;
   }
   const auto& st = session.state_;
+  const TransferScope in_flight(session.transfers_);
   const std::lock_guard<std::mutex> lock(transfer_mutex_);
   if (!AwaitForward(capture_mutex_, session.forward_done_, error_msg) ||
       !CopyOut(transfer_stream_, transfer_staging_, out.kda_state, st.kda_state,
@@ -132,6 +149,7 @@ bool Executor::RestoreSnapshot(Session& session, std::uint32_t rows,
     return false;
   }
   auto& st = session.state_;
+  const TransferScope in_flight(session.transfers_);
   const std::lock_guard<std::mutex> lock(transfer_mutex_);
   if (!AwaitForward(capture_mutex_, session.forward_done_, error_msg) ||
       !CopyIn(transfer_stream_, transfer_staging_, st.kda_state, in.kda_state,
