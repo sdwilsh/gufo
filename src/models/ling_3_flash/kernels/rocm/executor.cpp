@@ -454,6 +454,19 @@ bool Executor::UploadInputs(std::span<const std::int32_t> tokens,
          Check(hipStreamSynchronize(stream_), "upload sync", error);
 }
 
+bool Executor::UploadRows(std::span<const std::int32_t> tokens,
+                          std::span<const std::int32_t> positions,
+                          std::string* error) {
+  return Check(hipMemcpyAsync(b_->tokens, tokens.data(), tokens.size_bytes(),
+                              hipMemcpyHostToDevice, stream_),
+               "upload tokens", error) &&
+         Check(hipMemcpyAsync(b_->positions, positions.data(),
+                              positions.size_bytes(), hipMemcpyHostToDevice,
+                              stream_),
+               "upload positions", error) &&
+         Check(hipStreamSynchronize(stream_), "upload sync", error);
+}
+
 void Executor::DumpFloat(GpuTensorSink* sink, const char* name, int layer,
                          const float* device, std::uint32_t rows,
                          std::uint32_t width) {
@@ -560,64 +573,79 @@ void Executor::Q8Quantized(
   dense::GemvQ8_0Quantized(g, count, quant, n, k, stream_);
 }
 
-void Executor::Kda(const DeviceLayer& l, const Session& session,
+void Executor::Kda(const DeviceLayer& l, std::span<const Lane> lanes,
                    std::uint32_t il, std::uint32_t n, bool fuse,
                    GpuTensorSink* sink) {
   Buffers& b = *b_;
   const std::uint32_t k = KdaIndex(il);
-  float* state = session.state_.kda_state + std::size_t{k} * kKdaStateFloats;
-  float* conv_state =
-      session.state_.kda_conv + std::size_t{k} * kKdaConvStateFloats;
   if (fuse) {
     Q8Quantized({{&l.kda_proj, b.proj}}, b.xq, n, kHidden);
   } else {
     Q8(l.kda_proj, b.x, b.proj, n);
   }
   Mark("kda.proj_gemv", TensorBytes(l.kda_proj));
-  if (fuse) {
-    kda::PrepDecode(b.proj, l.conv_q.f32(), l.conv_k.f32(), l.conv_v.f32(),
-                    conv_state, l.ssm_a.f32(), l.ssm_dt.f32(), b.conv, b.g,
-                    b.beta, n,
-                    rollback_active_ && n > 1
-                        ? b.conv_ckpt + std::size_t{k} * kKdaConvStateFloats
-                        : nullptr,
-                    kKdaLayers * kKdaConvStateFloats, stream_);
-  } else {
-    if (n == 1) {
-      kda::Conv3Decode(b.proj, l.conv_q.f32(), l.conv_k.f32(), l.conv_v.f32(),
-                       conv_state, b.conv, stream_);
+  // Conv window and recurrence: per lane, on that session's own state and
+  // rows, with the launches a forward of the lane's tokens alone would use.
+  for (const Lane& lane : lanes) {
+    const std::uint32_t m = lane.n;
+    float* conv_state =
+        lane.session->state_.kda_conv + std::size_t{k} * kKdaConvStateFloats;
+    const float* proj = b.proj + std::size_t{lane.row0} * kKdaProjRows;
+    float* conv = b.conv + std::size_t{lane.row0} * kQkvStride;
+    float* g = b.g + std::size_t{lane.row0} * kKdaInner;
+    float* beta = b.beta + std::size_t{lane.row0} * kHeads;
+    if (fuse) {
+      kda::PrepDecode(proj, l.conv_q.f32(), l.conv_k.f32(), l.conv_v.f32(),
+                      conv_state, l.ssm_a.f32(), l.ssm_dt.f32(), conv, g, beta,
+                      m,
+                      rollback_active_ && m > 1
+                          ? b.conv_ckpt + std::size_t{k} * kKdaConvStateFloats
+                          : nullptr,
+                      kKdaLayers * kKdaConvStateFloats, stream_);
+      continue;
+    }
+    if (m == 1) {
+      kda::Conv3Decode(proj, l.conv_q.f32(), l.conv_k.f32(), l.conv_v.f32(),
+                       conv_state, conv, stream_);
     } else {
       if (rollback_active_) {
-        kda::Conv3Checkpoint(b.proj, conv_state,
+        kda::Conv3Checkpoint(proj, conv_state,
                              b.conv_ckpt + std::size_t{k} * kKdaConvStateFloats,
-                             kKdaLayers * kKdaConvStateFloats, n, stream_);
+                             kKdaLayers * kKdaConvStateFloats, m, stream_);
       }
-      kda::Conv3Prefill(b.proj, l.conv_q.f32(), l.conv_k.f32(), l.conv_v.f32(),
-                        conv_state, b.conv, n, stream_);
+      kda::Conv3Prefill(proj, l.conv_q.f32(), l.conv_k.f32(), l.conv_v.f32(),
+                        conv_state, conv, m, stream_);
     }
-    kda::GateBetaPrep(b.proj, l.ssm_a.f32(), l.ssm_dt.f32(), b.g, b.beta, n,
-                      stream_);
-    kda::L2NormHeads(b.conv, kQkvStride, n, stream_);
-    kda::L2NormHeads(b.conv + kKdaInner, kQkvStride, n, stream_);
+    kda::GateBetaPrep(proj, l.ssm_a.f32(), l.ssm_dt.f32(), g, beta, m, stream_);
+    kda::L2NormHeads(conv, kQkvStride, m, stream_);
+    kda::L2NormHeads(conv + kKdaInner, kQkvStride, m, stream_);
   }
   Mark("kda.conv_gate_l2", 0);
-  float* q = b.conv;
-  float* kk = b.conv + kKdaInner;
-  float* v = b.conv + 2 * kKdaInner;
-  if (n == 1) {
-    kda::RecurrentDecode(state, q, kk, v, b.g, b.beta, b.o, stream_);
-  } else if (n <= kMaxDecodeTokens) {
-    kda::RecurrentSequence(state, q, kQkvStride, kk, kQkvStride, v, kQkvStride,
-                           b.g, b.beta, b.o, n, stream_,
-                           rollback_active_
-                               ? b.kda_ckpt + std::size_t{k} * kKdaStateFloats
-                               : nullptr,
-                           kKdaLayers * kKdaStateFloats);
-  } else {
-    kda::PrefillSequence(state, q, kQkvStride, kk, kQkvStride, v, kQkvStride,
-                         b.g, b.beta, b.o, n, stream_);
+  for (const Lane& lane : lanes) {
+    const std::uint32_t m = lane.n;
+    float* state =
+        lane.session->state_.kda_state + std::size_t{k} * kKdaStateFloats;
+    float* q = b.conv + std::size_t{lane.row0} * kQkvStride;
+    float* kk = q + kKdaInner;
+    float* v = q + 2 * kKdaInner;
+    const float* g = b.g + std::size_t{lane.row0} * kKdaInner;
+    const float* beta = b.beta + std::size_t{lane.row0} * kHeads;
+    float* o = b.o + std::size_t{lane.row0} * kKdaInner;
+    if (m == 1) {
+      kda::RecurrentDecode(state, q, kk, v, g, beta, o, stream_);
+    } else if (m <= kMaxDecodeTokens) {
+      kda::RecurrentSequence(state, q, kQkvStride, kk, kQkvStride, v,
+                             kQkvStride, g, beta, o, m, stream_,
+                             rollback_active_
+                                 ? b.kda_ckpt + std::size_t{k} * kKdaStateFloats
+                                 : nullptr,
+                             kKdaLayers * kKdaStateFloats);
+    } else {
+      kda::PrefillSequence(state, q, kQkvStride, kk, kQkvStride, v, kQkvStride,
+                           g, beta, o, m, stream_);
+    }
   }
-  Mark("kda.recurrent", 2 * kKdaStateFloats * sizeof(float));
+  Mark("kda.recurrent", lanes.size() * 2 * kKdaStateFloats * sizeof(float));
   DumpFloat(sink, "kda_o", static_cast<int>(il), b.o, n, kKdaInner);
   if (fuse) {
     kda::OutputNormGateQuant(b.o, b.proj, l.ssm_norm.f32(), b.kout, n, b.kq,
@@ -632,16 +660,17 @@ void Executor::Kda(const DeviceLayer& l, const Session& session,
   Mark("kda.out_gemv", TensorBytes(l.attn_output));
 }
 
-void Executor::Mla(const DeviceLayer& l, const Session& session,
-                   std::uint32_t il, std::uint32_t first_pos, std::uint32_t n,
-                   bool fuse, GpuTensorSink* sink) {
+void Executor::Mla(const DeviceLayer& l, std::span<const Lane> lanes,
+                   std::uint32_t il, std::uint32_t n, bool fuse,
+                   GpuTensorSink* sink) {
   Buffers& b = *b_;
-  const SessionState& st = session.state_;
   const bool mtp_block = il == kMtpBlock;
-  auto* cache = mtp_block
-                    ? static_cast<__half*>(st.mtp_cache)
-                    : static_cast<__half*>(st.mla_cache) +
-                          std::size_t{MlaIndex(il)} * st.cache.LayerStride();
+  const auto cache_of = [&](const Lane& lane) {
+    const SessionState& st = lane.session->state_;
+    return mtp_block ? static_cast<__half*>(st.mtp_cache)
+                     : static_cast<__half*>(st.mla_cache) +
+                           std::size_t{MlaIndex(il)} * st.cache.LayerStride();
+  };
   if (fuse) {
     Q8Quantized({{&l.attn_q, b.q}, {&l.kv_a, b.kva}, {&l.attn_gate, b.gate}},
                 b.xq, n, kHidden);
@@ -656,25 +685,38 @@ void Executor::Mla(const DeviceLayer& l, const Session& session,
   DumpFloat(sink, "mla_q", ly, b.q, n, kMlaQRows);
   DumpFloat(sink, "mla_kva", ly, b.kva, n, kMlaCacheWidth);
   mla::LatentNormRope(b.kva, l.kv_a_norm.f32(), b.positions, b.kv, n, stream_);
-  mla::CacheAppend(cache, b.kv, b.positions, n, stream_);
+  std::size_t attended_rows = 0;
+  for (const Lane& lane : lanes) {
+    mla::CacheAppend(cache_of(lane),
+                     b.kv + std::size_t{lane.row0} * kMlaCacheWidth,
+                     b.positions + lane.row0, lane.n, stream_);
+    // Rows from first_pos on are rewritten: their persistent expansion is
+    // stale. The MTP block never runs the prefill family and has no store.
+    if (!mtp_block) {
+      std::uint32_t& expanded_to =
+          lane.session->state_.mla_expanded_to[MlaIndex(il)];
+      expanded_to = std::min(expanded_to, lane.first_pos);
+    }
+    attended_rows += lane.first_pos + lane.n;
+  }
   Mark("mla.latent_rope_append", 0);
-  // Rows from first_pos on are rewritten: their persistent expansion is stale.
-  // The MTP block never runs the prefill family and has no expanded store.
-  std::uint32_t unused_watermark = 0;
-  std::uint32_t& expanded_to =
-      mtp_block ? unused_watermark : st.mla_expanded_to[MlaIndex(il)];
-  expanded_to = std::min(expanded_to, first_pos);
   DumpFloat(sink, "mla_kv", ly, b.kv, n, kMlaCacheWidth);
   if (n <= kMaxDecodeTokens) {
     // Small-batch family: every token runs the absorbed decode kernel on its
-    // own context, so a chunk of n gives the same bits as n single-token steps
-    // whatever the context length (split-K plans depend only on the context).
+    // own session's context, so a chunk of n gives the same bits as n
+    // single-token steps whatever the context length (split-K plans depend
+    // only on the context), and so does a batch of several sessions' rows.
     mla::QAbsorb(b.q, l.k_b.data, b.positions, b.qabs, n, stream_);
-    for (std::uint32_t t = 0; t < n; ++t)
-      mla::DecodeAttention(b.qabs + (std::size_t{t} * kHeads * kMlaCacheWidth),
-                           cache, b.positions + t,
-                           b.lat + (std::size_t{t} * kHeads * kMlaLatent),
-                           b.scratch, stream_);
+    Mark("mla.qabsorb", TensorBytes(l.k_b));
+    for (const Lane& lane : lanes) {
+      const __half* cache = cache_of(lane);
+      for (std::uint32_t t = lane.row0; t < lane.row0 + lane.n; ++t)
+        mla::DecodeAttention(
+            b.qabs + (std::size_t{t} * kHeads * kMlaCacheWidth), cache,
+            b.positions + t, b.lat + (std::size_t{t} * kHeads * kMlaLatent),
+            b.scratch, stream_);
+    }
+    Mark("mla.attention", attended_rows * kMlaCacheWidth * sizeof(__half));
     DumpFloat(sink, "mla_qabs", ly, b.qabs, n, kHeads * kMlaCacheWidth);
     DumpFloat(sink, "mla_lat", ly, b.lat, n, kHeads * kMlaLatent);
     mla::VbUpProjGate(b.lat, l.v_b.data, b.gate, b.kout, n, stream_);
@@ -683,6 +725,15 @@ void Executor::Mla(const DeviceLayer& l, const Session& session,
     // Prefill family: non-absorbed. Latent rows expand per head (bounded
     // 2048-key blocks) and the gated attention output is written directly.
     // Always used for n > 8, so the bits do not depend on the chunk layout.
+    // One lane: only Forward runs this family.
+    assert(lanes.size() == 1);
+    const Lane& lane = lanes.front();
+    const SessionState& st = lane.session->state_;
+    const std::uint32_t first_pos = lane.first_pos;
+    const __half* cache = cache_of(lane);
+    std::uint32_t unused_watermark = 0;
+    std::uint32_t& expanded_to =
+        mtp_block ? unused_watermark : st.mla_expanded_to[MlaIndex(il)];
     mla::QPrepare(b.q, b.positions, b.qabs, n, stream_);
     Mark("mla.q_prep", 0);
     __half* expanded = nullptr;
@@ -891,18 +942,17 @@ void Executor::Ffn(const DeviceLayer& l, std::uint32_t il, std::uint32_t n,
   Mark("moe.combine_norm", 0);
 }
 
-bool Executor::Block(const Session& session, std::uint32_t il,
-                     std::uint32_t first_pos, std::uint32_t n,
-                     GpuTensorSink* sink, bool fuse, bool x_ready,
-                     const DeviceLayer* next, std::string* error) {
-  return BlockOf(model_.layers()[il - model_.first_layer()], session, il,
-                 first_pos, n, sink, fuse, x_ready, next, error);
+bool Executor::Block(std::span<const Lane> lanes, std::uint32_t il,
+                     std::uint32_t n, GpuTensorSink* sink, bool fuse,
+                     bool x_ready, const DeviceLayer* next,
+                     std::string* error) {
+  return BlockOf(model_.layers()[il - model_.first_layer()], lanes, il, n, sink,
+                 fuse, x_ready, next, error);
 }
 
-bool Executor::BlockOf(const DeviceLayer& l, const Session& session,
-                       std::uint32_t il, std::uint32_t first_pos,
-                       std::uint32_t n, GpuTensorSink* sink, bool fuse,
-                       bool x_ready, const DeviceLayer* next,
+bool Executor::BlockOf(const DeviceLayer& l, std::span<const Lane> lanes,
+                       std::uint32_t il, std::uint32_t n, GpuTensorSink* sink,
+                       bool fuse, bool x_ready, const DeviceLayer* next,
                        std::string* error) {
   Buffers& b = *b_;
   const int layer = static_cast<int>(il);
@@ -917,9 +967,9 @@ bool Executor::BlockOf(const DeviceLayer& l, const Session& session,
     Mark("norm.attn", 0);
   }
   if (l.kind == LayerKind::kKda) {
-    Kda(l, session, il, n, fuse, sink);
+    Kda(l, lanes, il, n, fuse, sink);
   } else {
-    Mla(l, session, il, first_pos, n, fuse, sink);
+    Mla(l, lanes, il, n, fuse, sink);
   }
   DumpFloat(sink, "mixer_out", layer, b.mixer, n, kHidden);
   if (fuse) {
@@ -991,9 +1041,9 @@ bool Executor::Head(std::uint32_t n, std::uint32_t from,
   return true;
 }
 
-bool Executor::Trunk(const Session& session, std::uint32_t n,
-                     std::uint32_t first_pos, std::uint32_t head_from,
-                     bool events, GpuTensorSink* sink, std::string* error) {
+bool Executor::Trunk(std::span<const Lane> lanes, std::uint32_t n,
+                     std::uint32_t head_from, bool events, GpuTensorSink* sink,
+                     std::string* error) {
   Buffers& b = *b_;
   const std::uint32_t layers = layer_count();
   if (events) {
@@ -1008,7 +1058,7 @@ bool Executor::Trunk(const Session& session, std::uint32_t n,
   for (std::uint32_t il = 0; il < layers; ++il) {
     const DeviceLayer* next =
         il + 1 < layers ? &model_.layers()[il + 1] : nullptr;
-    if (!Block(session, il, first_pos, n, sink, fuse, ready, next, error)) {
+    if (!Block(lanes, il, n, sink, fuse, ready, next, error)) {
       (void)hipStreamSynchronize(stream_);
       (void)hipStreamSynchronize(branch_stream_);
       return false;
@@ -1097,7 +1147,8 @@ bool Executor::ForwardGraph(Session& session, const ForwardRequest& r,
       }).join();
     }
     capturing_ = true;
-    const bool ok = Trunk(session, n, first_pos, from, false, nullptr, error);
+    const Lane lane{&session, first_pos, n, 0};
+    const bool ok = Trunk({&lane, 1}, n, from, false, nullptr, error);
     capturing_ = false;
     const hipError_t end = hipStreamEndCapture(stream_, &captured);
     capture_invalidated_ = end == hipErrorStreamCaptureInvalidated;
@@ -1172,7 +1223,7 @@ bool Executor::ForwardGraph(Session& session, const ForwardRequest& r,
   }
   launch_.issue_ms = StepMs();
   ++graph_replays_;
-  return MtpAfterForward(session, n, first_pos, error) &&
+  return MtpAfterForward(session, n, first_pos, 0, error) &&
          FinishForward(session, r, n, from, layers, true, error);
 }
 
@@ -1271,8 +1322,9 @@ bool Executor::Forward(Session& session, const ForwardRequest& r,
     BeginProfile();
   }
   rollback_active_ = r.rollback;
+  const Lane lane{&session, first_pos, n, 0};
   const bool trunk_ok =
-      Trunk(session, n, first_pos, /*head_from=*/n, true, r.sink, error);
+      Trunk({&lane, 1}, n, /*head_from=*/n, true, r.sink, error);
   rollback_active_ = false;
   launch_.issue_ms = StepMs();
   if (!trunk_ok) {
@@ -1282,7 +1334,7 @@ bool Executor::Forward(Session& session, const ForwardRequest& r,
   if (from < n && !Head(n, from, r.logits, r.argmax, error)) {
     return false;
   }
-  if (!MtpAfterForward(session, n, first_pos, error)) {
+  if (!MtpAfterForward(session, n, first_pos, 0, error)) {
     return false;
   }
   if (!FinishForward(session, r, n, from, layers, false, error)) {
@@ -1295,8 +1347,196 @@ bool Executor::Forward(Session& session, const ForwardRequest& r,
   return true;
 }
 
+bool Executor::ForwardBatch(std::span<BatchSegment> segments,
+                            std::string* error) {
+  using Status = BatchSegment::Status;
+  step_start_ = std::chrono::steady_clock::now();
+  launch_ = {};
+  const std::uint32_t row_limit = batch_row_limit();
+  std::vector<Lane> lanes;
+  std::vector<BatchSegment*> members;  // accepted, in row order
+  std::vector<std::int32_t> tokens;
+  std::vector<std::int32_t> positions;
+  std::vector<std::uint32_t> froms;  // first logits row per member
+  lanes.reserve(segments.size());
+  members.reserve(segments.size());
+  std::uint32_t rows = 0;
+  std::uint32_t head_from = UINT32_MAX;
+  // Validation only reads host state: a refused segment's session is never
+  // touched, and nothing is launched before every segment was checked.
+  for (std::size_t i = 0; i < segments.size(); ++i) {
+    BatchSegment& s = segments[i];
+    s.status = Status::kRejected;
+    s.error.clear();
+    const auto n = static_cast<std::uint32_t>(s.tokens.size());
+    if (first_layer() != 0) {
+      s.error = "forward needs the trunk from block 0 (layer_first is set)";
+      continue;
+    }
+    if (s.session == nullptr) {
+      s.error = "batch segment has no session";
+      continue;
+    }
+    if (std::any_of(
+            segments.begin(), segments.begin() + i,
+            [&](const BatchSegment& o) { return o.session == s.session; })) {
+      s.error = "session appears twice in one batched forward";
+      continue;
+    }
+    // The pool finishes a member's snapshot before batching it; a transfer
+    // in flight would copy state this pass rewrites. Refused, not asserted:
+    // the caller runs such a lane alone, as it did before batching.
+    if (s.session->transfers_.load(std::memory_order_acquire) != 0) {
+      s.error = "session has a snapshot transfer in flight";
+      continue;
+    }
+    if (n == 0 || n > kMaxDecodeTokens) {
+      s.error = "batch segment of " + std::to_string(n) +
+                " tokens outside 1.." + std::to_string(kMaxDecodeTokens);
+      continue;
+    }
+    if (rows + n > row_limit) {
+      s.error =
+          "batched forward exceeds " + std::to_string(row_limit) + " rows";
+      continue;
+    }
+    const std::uint32_t first_pos = s.session->position();
+    if (first_pos + n > s.session->capacity()) {
+      s.error = "context overflow: " + std::to_string(first_pos) + " + " +
+                std::to_string(n) + " > " +
+                std::to_string(s.session->capacity());
+      continue;
+    }
+    if (const auto bad = std::find_if(
+            s.tokens.begin(), s.tokens.end(),
+            [](std::int32_t t) {
+              return t < 0 || static_cast<std::uint32_t>(t) >= kVocab;
+            });
+        bad != s.tokens.end()) {
+      s.error = "token id " + std::to_string(*bad) + " outside the vocabulary";
+      continue;
+    }
+    const std::uint32_t from =
+        s.logits_from == UINT32_MAX ? n - 1 : s.logits_from;
+    if (!s.logits.empty() &&
+        (from >= n || s.logits.size() < std::size_t{n - from} * kVocabRows)) {
+      s.error = "logits buffer too small for rows " + std::to_string(from) +
+                ".." + std::to_string(n);
+      continue;
+    }
+    s.status = Status::kPending;
+    lanes.push_back({s.session, first_pos, n, rows});
+    members.push_back(&s);
+    froms.push_back(from);
+    for (std::uint32_t t = 0; t < n; ++t) {
+      tokens.push_back(s.tokens[t]);
+      positions.push_back(static_cast<std::int32_t>(first_pos + t));
+    }
+    if (!s.logits.empty()) {
+      head_from = std::min(head_from, rows + from);
+    }
+    rows += n;
+  }
+  if (lanes.empty()) {
+    return true;
+  }
+  head_from = std::min(head_from, rows);  // rows: no segment wants logits
+  std::string message;
+  bool launched = false;  // the trunk is queued: members' state is in flight
+  const auto fail = [&]() {
+    for (BatchSegment* s : members) {
+      s->status = Status::kFailed;
+      s->error = message;
+      // Later snapshot copies into a member wait for whatever was queued.
+      if (launched) {
+        (void)hipEventRecord(s->session->forward_done_, stream_);
+      }
+    }
+    if (launched) {
+      // As Trunk() on failure: nothing queued (including the eager
+      // shared-expert branch) may still run when the caller reuses scratch.
+      (void)hipStreamSynchronize(stream_);
+      (void)hipStreamSynchronize(branch_stream_);
+    }
+    if (error != nullptr) {
+      *error = message;
+    }
+    return false;
+  };
+  const std::uint32_t layers = layer_count();
+  if (!UploadRows(tokens, positions, &message) ||
+      !Trunk(lanes, rows, head_from, true, nullptr, &message)) {
+    return fail();
+  }
+  launched = true;
+  if (batch_failures_for_test_ > 0 &&
+      batch_failure_point_ == BatchFailurePoint::kBeforeSync) {
+    --batch_failures_for_test_;
+    message = "batched forward: injected failure before the wait (test hook)";
+    return fail();
+  }
+  launch_.issue_ms = StepMs();
+  Buffers& b = *b_;
+  for (std::size_t i = 0; i < members.size(); ++i) {
+    BatchSegment& s = *members[i];
+    if (s.logits.empty()) {
+      continue;
+    }
+    const Lane& lane = lanes[i];
+    const std::uint32_t first_row = lane.row0 + froms[i] - head_from;
+    if (!Check(hipMemcpyAsync(s.logits.data(),
+                              b.logits + std::size_t{first_row} * kVocabRows,
+                              std::size_t{lane.n - froms[i]} * kVocabRows * 4,
+                              hipMemcpyDeviceToHost, stream_),
+               "copy logits", &message)) {
+      return fail();
+    }
+  }
+  // Ascending rows (MtpAfterForward overwrites the rows below row0).
+  for (std::size_t i = 0; i < lanes.size(); ++i) {
+    if (!MtpAfterForward(*members[i]->session, lanes[i].n, lanes[i].first_pos,
+                         lanes[i].row0, &message)) {
+      return fail();
+    }
+  }
+  (void)hipEventRecord(events_[layers + 1], stream_);
+  // Every member's snapshot copies wait for this pass.
+  for (BatchSegment* s : members) {
+    (void)hipEventRecord(s->session->forward_done_, stream_);
+  }
+  if (!Check(hipStreamSynchronize(stream_), "batched forward", &message) ||
+      !Check(hipGetLastError(), "batched forward", &message)) {
+    return fail();
+  }
+  if (batch_failures_for_test_ > 0) {
+    --batch_failures_for_test_;
+    message = "batched forward: injected failure after the wait (test hook)";
+    return fail();
+  }
+  timing_.layer_ms.assign(layers, 0.0F);
+  for (std::uint32_t il = 0; il < layers; ++il) {
+    (void)hipEventElapsedTime(&timing_.layer_ms[il], events_[il],
+                              events_[il + 1]);
+  }
+  float total = 0.0F;
+  float head = 0.0F;
+  (void)hipEventElapsedTime(&head, events_[layers], events_[layers + 1]);
+  (void)hipEventElapsedTime(&total, events_[0], events_[layers + 1]);
+  timing_.total_ms = total;
+  timing_.head_ms = head;
+  launch_.wall_ms = StepMs();
+  launch_.device_ms = total;
+  launch_.graph = false;
+  for (std::size_t i = 0; i < members.size(); ++i) {
+    members[i]->session->set_position(lanes[i].first_pos + lanes[i].n);
+    members[i]->status = Status::kDone;
+  }
+  return true;
+}
+
 bool Executor::MtpAfterForward(Session& session, std::uint32_t n,
-                               std::uint32_t first_pos, std::string* error) {
+                               std::uint32_t first_pos, std::uint32_t row0,
+                               std::string* error) {
   SessionState& st = session.state_;
   if (st.mtp_cache == nullptr) {
     return true;
@@ -1307,20 +1547,22 @@ bool Executor::MtpAfterForward(Session& session, std::uint32_t n,
   const DeviceMtp& m = *model_.mtp();
   Buffers& b = *b_;
   // hn[0] = h of position first_pos - 1 (the carry), hn[1 + t] = the
-  // output-normed trunk row t. Row r of the fill pairs hn[skip + r] with the
-  // token of trunk row skip + r: MTP cache row q = (h_q, token_{q + 1}).
+  // output-normed trunk row row0 + t. Row r of the fill pairs hn[skip + r]
+  // with the token of trunk row row0 + skip + r: MTP cache row q = (h_q,
+  // token_{q + 1}).
   if (first_pos > 0) {
     (void)hipMemcpyAsync(b.hn, st.mtp_h, kHidden * sizeof(float),
                          hipMemcpyDeviceToDevice, stream_);
   }
-  dense::RmsNormRows(b.h, model_.output_norm().f32(), b.hn + kHidden, n,
-                     kHidden, 1, kRmsEps, stream_);
+  dense::RmsNormRows(b.h + std::size_t{row0} * kHidden,
+                     model_.output_norm().f32(), b.hn + kHidden, n, kHidden, 1,
+                     kRmsEps, stream_);
   Mark("mtp.hidden_norm", 0);
   const std::uint32_t skip = first_pos == 0 ? 1U : 0U;
   const std::uint32_t rows = n - skip;
   if (rows > 0) {
-    dense::EmbedQ4K(model_.token_embd().data, b.tokens + skip, b.ga, rows,
-                    kHidden, stream_);
+    dense::EmbedQ4K(model_.token_embd().data, b.tokens + row0 + skip, b.ga,
+                    rows, kHidden, stream_);
     mtp::ConcatNormRows(b.ga, b.hn + std::size_t{skip} * kHidden, m.enorm.f32(),
                         m.hnorm.f32(), b.gb, rows, kRmsEps, stream_);
     Q8(m.eh_proj, b.gb, b.h, rows);
@@ -1396,8 +1638,9 @@ bool Executor::MtpDraft(Session& session, const DraftRequest& r,
   Q8(m.eh_proj, b.gb, b.h, 1);
   Mark("draft.embed_eh_proj", TensorBytes(m.eh_proj));
   const bool fuse = dense::GemvQ8_0Fits(1, kHidden);
-  if (!BlockOf(m.block, session, kMtpBlock, r.position, 1, nullptr, fuse, false,
-               nullptr, error)) {
+  const Lane lane{&session, r.position, 1, 0};
+  if (!BlockOf(m.block, {&lane, 1}, kMtpBlock, 1, nullptr, fuse, false, nullptr,
+               error)) {
     profiling_ = false;
     (void)hipStreamSynchronize(stream_);
     return false;
@@ -1535,7 +1778,8 @@ bool Executor::RunBlock(Session& session, std::uint32_t il,
              "upload block input", error)) {
     return false;
   }
-  if (!Block(session, il, first_pos, n, sink, false, false, nullptr, error)) {
+  const Lane lane{&session, first_pos, n, 0};
+  if (!Block({&lane, 1}, il, n, sink, false, false, nullptr, error)) {
     (void)hipStreamSynchronize(stream_);
     return false;
   }
