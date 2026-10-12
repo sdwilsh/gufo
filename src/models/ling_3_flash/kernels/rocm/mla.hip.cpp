@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 #include "src/models/ling_3_flash/kernels/rocm/kernels.hpp"
 #include "src/models/ling_3_flash/layout.hpp"
@@ -225,6 +226,25 @@ constexpr std::uint32_t kTokensPerBlock = 16;
 constexpr std::uint32_t kMaxSplits = 96;
 constexpr std::uint32_t kSplitKeys = 256;  // target keys per split
 
+// Batch invariance. The matrix core adds the two products of each key pair
+// (2j, 2j+1) with a shared exponent alignment, and a masked key's product
+// 0 * V still takes its exponent from V. A row whose last valid key is the
+// even member of a pair therefore saw the V row of its masked partner, so its
+// result depended on what the cache or the tile fill held there (real rows in
+// one chunk layout, zeros in another). Such rows (odd valid count below 16 in
+// the tile) get the P.V product again with every pair holding one real key
+// and one hard zero (P and V), which does not depend on the partner. Rows with
+// an even count, or a full tile, are unaffected by masked content and keep
+// the single product; the choice depends only on the row's own position.
+__device__ __forceinline__ bool OddTail(std::uint32_t kb, std::uint32_t key_end,
+                                        std::uint32_t qpos, bool live) {
+  const std::uint32_t last = min(qpos + 1U, key_end);  // exclusive
+  if (!live || last <= kb)
+    return false;
+  const std::uint32_t valid = last - kb;
+  return valid < kKeys && (valid & 1U) != 0U;
+}
+
 template<bool kDecode>
 __launch_bounds__(256) __global__
     void AttentionKernel(const float* __restrict__ q,
@@ -306,7 +326,10 @@ __launch_bounds__(256) __global__
   float run_max = -INFINITY;
   float run_sum = 0.0F;
 
-  for (std::uint32_t kb = key_begin; kb < key_end; kb += kKeys) {
+  // One 16-key tile step. `kTail` tiles may hold rows with an odd valid-key
+  // count (see OddTail); the sweep below keeps them out of the hot loop.
+  const auto tile = [&](std::uint32_t kb, auto tail) {
+    constexpr bool kTail = decltype(tail)::value;
     // 1. stage the K tile (contiguous in the cache), zero past the range.
     for (std::uint32_t idx = tid; idx < kKeys * (kWidth / 8); idx += 256) {
       const std::uint32_t key = idx / (kWidth / 8);
@@ -410,18 +433,78 @@ __launch_bounds__(256) __global__
         }
       }
     }
+    if constexpr (!kTail) {
 #pragma unroll
-    for (std::uint32_t t = 0; t < 4; ++t) {
-      const v16h vf =
-          LoadFrag(&vt_lds[(((wave * 4) + t) * 16 + sub) * kVtStride]);
+      for (std::uint32_t t = 0; t < 4; ++t) {
+        const v16h vf =
+            LoadFrag(&vt_lds[(((wave * 4) + t) * 16 + sub) * kVtStride]);
 #pragma unroll
-      for (std::uint32_t rb = 0; rb < 2; ++rb) {
-        const v16h pf = LoadFrag(&p_lds[((rb * 16) + sub) * kVtStride]);
-        o_acc[rb][t] = Wmma(pf, vf, o_acc[rb][t]);
+        for (std::uint32_t rb = 0; rb < 2; ++rb) {
+          const v16h pf = LoadFrag(&p_lds[((rb * 16) + sub) * kVtStride]);
+          o_acc[rb][t] = Wmma(pf, vf, o_acc[rb][t]);
+        }
+      }
+    } else {
+      // Rows with an odd valid count take the pair-isolated product. Some live
+      // row has qpos in [kb, kb + 14] with qpos - kb even (block-uniform).
+      bool ragged;
+      if constexpr (kDecode) {
+        ragged = OddTail(kb, key_end, context - 1, true);
+      } else {
+        const std::uint32_t lo = first_pos + q0;
+        const std::uint32_t hi = lo + min(kTokensPerBlock, n_tokens - q0) - 1;
+        std::uint32_t x = max(lo, kb);
+        x += (x - kb) & 1U;
+        ragged = x <= min(hi, kb + kKeys - 2);
+      }
+#pragma unroll
+      for (std::uint32_t t = 0; t < 4; ++t) {
+        const v16h vf =
+            LoadFrag(&vt_lds[(((wave * 4) + t) * 16 + sub) * kVtStride]);
+#pragma unroll
+        for (std::uint32_t rb = 0; rb < 2; ++rb) {
+          const v16h pf = LoadFrag(&p_lds[((rb * 16) + sub) * kVtStride]);
+          v8f iso = {};
+          if (ragged) {
+            iso = o_acc[rb][t];
+#pragma unroll
+            for (std::uint32_t parity = 0; parity < 2; ++parity) {
+              v16h pp = pf;
+              v16h vv = vf;
+#pragma unroll
+              for (std::uint32_t i = 0; i < 16; ++i) {
+                if ((i & 1U) != parity) {
+                  pp[i] = 0;
+                  vv[i] = 0;
+                }
+              }
+              iso = Wmma(pp, vv, iso);
+            }
+          }
+          o_acc[rb][t] = Wmma(pf, vf, o_acc[rb][t]);
+          if (ragged) {
+#pragma unroll
+            for (std::uint32_t i = 0; i < 8; ++i) {
+              const std::uint32_t row = (2 * i) + half_id;
+              if (OddTail(kb, key_end, row_qpos(row), row_live(row)))
+                o_acc[rb][t][i] = iso[i];
+            }
+          }
+        }
       }
     }
     // The next iteration's K staging only touches k_lds, which nobody reads
     // after the barrier above; its first barrier orders p_lds/vt_lds reuse.
+  };
+  {
+    // Tiles every row sees in full (or not at all) come first; the last tiles,
+    // where the causal / cache-end boundary falls, run the tail variant.
+    const std::uint32_t full_end = kDecode ? key_end : first_pos + q0;
+    std::uint32_t kb = key_begin;
+    for (; kb < key_end && kb + kKeys <= full_end; kb += kKeys)
+      tile(kb, std::false_type{});
+    for (; kb < key_end; kb += kKeys)
+      tile(kb, std::true_type{});
   }
 
   if (seg == 0) {
