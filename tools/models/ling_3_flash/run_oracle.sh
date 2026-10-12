@@ -11,7 +11,8 @@
 #
 # Environment: MODEL (shard 1), ORACLE_OUT, THREADS (default 12, max advised),
 # PYTHON (python3 with numpy, only for the optional KL-base self check),
-# CHUNKS (default 16), PORT (default 8099), STEPS (default "kl greedy manifest"; "self" adds the
+# ORACLE_TEXT / ORACLE_PROMPTS (default oracle_text.txt / oracle_prompts.json; the novel-text
+# oracle uses oracle_novel_text.txt / oracle_novel_prompts.json), CHUNKS (default 16), PORT (default 8099), STEPS (default "kl greedy manifest"; "self" adds the
 # llama.cpp-vs-itself KL check, "manifest" writes MANIFEST.json and copies).
 set -euo pipefail
 
@@ -24,7 +25,8 @@ PORT=${PORT:-8099}
 PYTHON=${PYTHON:-python3}
 STEPS=${STEPS:-"kl greedy manifest"}
 CHUNKS=${CHUNKS:-16}
-TEXT=$here/oracle_text.txt
+TEXT=${ORACLE_TEXT:-$here/oracle_text.txt}
+PROMPTS=${ORACLE_PROMPTS:-$here/oracle_prompts.json}
 mkdir -p "$OUT"
 
 version=$(llama-cli --version 2>&1 | grep -i "version" | head -1)
@@ -58,7 +60,7 @@ if [[ " $STEPS " == *" greedy "* ]]; then
   srv=(llama-server "${common[@]}" -c 4096 -np 1 --no-warmup --no-webui
        --host 127.0.0.1 --port "$PORT" -cram 0)
   echo "greedy server: ${srv[*]}" >> "$cmds"
-  echo "greedy client: $here/oracle_greedy.py --url http://127.0.0.1:$PORT --prompts $here/oracle_prompts.json --n-predict 64 --out $OUT/greedy.jsonl" >> "$cmds"
+  echo "greedy client: $here/oracle_greedy.py --url http://127.0.0.1:$PORT --prompts $PROMPTS --n-predict 64 --out $OUT/greedy.jsonl" >> "$cmds"
   s=$(date +%s)
   nice -n 10 "${srv[@]}" > "$OUT/greedy_server.log" 2>&1 &
   srv_pid=$!
@@ -68,7 +70,7 @@ if [[ " $STEPS " == *" greedy "* ]]; then
     sleep 5
   done
   "$PYTHON" "$here/oracle_greedy.py" --url "http://127.0.0.1:$PORT" \
-    --prompts "$here/oracle_prompts.json" --n-predict 64 --out "$OUT/greedy.jsonl"
+    --prompts "$PROMPTS" --n-predict 64 --out "$OUT/greedy.jsonl"
   kill $srv_pid; wait $srv_pid 2>/dev/null || true
   trap - EXIT
   echo "greedy wall: $(( $(date +%s) - s )) s" | tee -a "$cmds"

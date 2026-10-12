@@ -5328,6 +5328,90 @@ void TestBailingMessagesTools() {
   }
 }
 
+// Messages tool_choice with a Bailing model: a named tool is steered by name
+// and parsed by the Bailing parser, and "none" leaves call markup as text.
+void TestBailingMessagesToolChoice() {
+  const std::string call = "<tool_call>ping</tool_call>";
+  const std::string text = "Hm.</think>\n" + call;
+  const std::string tools = R"("tools":[
+    {"name":"edit","input_schema":{"type":"object","properties":{
+      "path":{"type":"string"}}}},
+    {"name":"ping","input_schema":{"type":"object"}}])";
+  for (const bool stream : {false, true}) {
+    for (const bool none : {false, true}) {
+      const auto body = gufo::json::parse(
+          std::string(R"({"max_tokens":64,"tool_choice":)") +
+          (none ? R"({"type":"none"})" : R"({"type":"tool","name":"ping"})") +
+          "," + tools + "}");
+      gufo::server::ChatRequest chat;
+      chat.messages.emplace_back(gufo::tokenization::ChatRole::kUser, "go");
+      Expect(!gufo::server::ParseAnthropicToolControls(body, &chat),
+             "Messages tool_choice is accepted");
+      FakeBackend backend;
+      backend.syntax =
+          gufo::server::TextGenerationBackend::ToolCallSyntax::kBailing;
+      backend.pieces = Chars(text);
+      auto response = gufo::server::CreateAnthropicMessage(
+          Request("{}"), backend, chat, 64, {}, stream);
+      Expect(response.status == 200, "Bailing Messages request succeeds");
+      std::string wire = response.body;
+      if (stream) {
+        wire.clear();
+        response.streaming_body([&](std::string_view part) {
+          wire += part;
+          return true;
+        });
+      }
+      Expect(!backend.last_request.constrained_tools,
+             "Bailing tool choice never uses the constrained-JSON path");
+      Expect(none ? backend.last_request.tool_choice ==
+                        gufo::server::ChatRequest::ToolChoice::kNone
+                  : backend.last_request.forced_tool_name == "ping",
+             "tool_choice reaches the backend");
+      std::string name, answer, stop_reason;
+      const auto read_block = [&](const gufo::json::Value& block) {
+        const auto type = block.member_str("type");
+        if (type == "tool_use")
+          name = block.member_str("name");
+        else if (type == "text")
+          answer += block.member_str("text");
+      };
+      if (stream) {
+        for (auto data = wire.find("data: "); data != std::string::npos;
+             data = wire.find("data: ", data + 6)) {
+          const auto end = wire.find("\n\n", data);
+          const auto event = gufo::json::parse(
+              std::string_view(wire).substr(data + 6, end - data - 6));
+          if (const auto* block = event.find("content_block"))
+            read_block(*block);
+          const auto* delta = event.find("delta");
+          if (delta == nullptr)
+            continue;
+          if (delta->member_str("type") == "text_delta")
+            answer += delta->member_str("text");
+          if (event.member_str("type") == "message_delta")
+            stop_reason = delta->member_str("stop_reason");
+        }
+      } else {
+        const auto message = gufo::json::parse(wire);
+        stop_reason = message.member_str("stop_reason");
+        for (const auto& block : message.find("content")->items())
+          read_block(block);
+      }
+      if (none) {
+        Expect(name.empty() && Trimmed(answer) == call &&
+                   stop_reason == "end_turn",
+               "tool_choice none leaves Bailing call text alone");
+      } else {
+        Expect(name == "ping" && answer.empty() && stop_reason == "tool_use",
+               "a named tool_choice yields that tool_use block");
+        Expect(wire.find("<tool_call>") == std::string::npos,
+               "Bailing call markup never reaches the client");
+      }
+    }
+  }
+}
+
 // A second call that never finishes: the first is kept and the unfinished
 // markup is withheld at a length stop, a client stop string or a cancel. Only
 // the model's own stop completes a call cut after its name or an argument.
@@ -6909,6 +6993,7 @@ void TestIncrementalToolArguments() {
 int main() {
   TestBailingToolCalls();
   TestBailingMessagesTools();
+  TestBailingMessagesToolChoice();
   TestBailingGrammarOutputParses();
   TestBailingModes();
   TestBailingCutSecondCall();

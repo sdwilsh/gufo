@@ -326,6 +326,22 @@ def main():
                 except (OSError, ValueError, KeyError):
                     pass
                 phase["suites"][name] = entry
+            # run.py expands the "cache" suite into continuation cases (text-cancel,
+            # *-cancel, their *-disk restores, disk-spacing[-disk]); none is named
+            # "cache", so the summary dropped it. Report it as one aggregate row.
+            if "cache" in args.suites.split(","):
+                named = set(args.suites.split(","))
+                cases = {n: e for n, e in phase["suites"].items() if n not in named}
+                bad = sorted(n for n, e in cases.items() if e["status"] != "passed")
+                phase["suites"]["cache"] = {
+                    "status": "passed" if cases and not bad else "failed",
+                    "cases": {n: e["status"] for n, e in cases.items()},
+                    "seconds": round(sum(e.get("seconds") or 0 for e in cases.values()), 1)}
+                if not cases:
+                    phase["suites"]["cache"]["error"] = "no cache cases ran"
+                if bad:
+                    phase["suites"]["cache"]["error"] = "failed cases: " + ",".join(bad)
+                    phase["status"] = "failed"
             if report.get("error"):
                 phase["error"] = report["error"][:500]
             if "disk_spacing" in report:

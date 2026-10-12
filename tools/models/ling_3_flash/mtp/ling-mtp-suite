@@ -84,11 +84,21 @@ def field(line, name):
     return m.group(1) if m else None
 
 
-def wait_health(port, proc, timeout):
+def log_tail(path, n=60):
+    try:
+        with open(path, errors="replace") as f:
+            return "".join(f.readlines()[-n:])
+    except OSError as e:
+        return "(no log: %s)" % e
+
+
+def wait_health(port, proc, timeout, log_path=None):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         if proc.poll() is not None:
-            raise RuntimeError("server exited %s" % proc.returncode)
+            tail = log_tail(log_path) if log_path else ""
+            raise RuntimeError("server exited %s\n--- server output tail (%s) ---\n%s"
+                               % (proc.returncode, log_path, tail))
         try:
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
             c.request("GET", "/health")
@@ -97,7 +107,8 @@ def wait_health(port, proc, timeout):
         except OSError:
             pass
         time.sleep(2)
-    raise RuntimeError("server did not become healthy")
+    raise RuntimeError("server did not become healthy\n--- server output tail (%s) ---\n%s"
+                       % (log_path, log_tail(log_path) if log_path else ""))
 
 
 def post(port, body, timeout=3600):
@@ -120,7 +131,7 @@ def serve_pass(args, mode, port):
     with open(log_path, "wb") as lf:
         proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
         try:
-            wait_health(port, proc, 1800)
+            wait_health(port, proc, 1800, log_path)
             for corpus in ("prose", "code"):
                 text = open(os.path.join(CORPUS, corpus + ".txt"), encoding="utf-8").read()
                 for depth in args.depths:
@@ -142,6 +153,10 @@ def serve_pass(args, mode, port):
                         "draft_proposed": int(field(line, "draft_proposed") or 0),
                         "draft_rounds": int(field(line, "draft_rounds") or 0),
                         "text": (resp.get("choices") or [{}])[0].get("text", "")})
+        except BaseException as e:
+            log("serve pass %s failed: %s: %s" % (mode, type(e).__name__, e))
+            log("server output tail:\n" + log_tail(log_path))
+            raise
         finally:
             if proc.poll() is None:
                 proc.send_signal(signal.SIGINT)
@@ -229,7 +244,8 @@ def part_serve_mtp(args):
         out({"stage": "serve-mtp", "pass": False, "error": "no document", "tail": p.stdout[-2000:]})
         return False
     stages = {st.get("name"): {k: st.get(k) for k in ("status", "failed_cases", "failures", "error",
-                                                        "exit_reason", "suites", "seconds")
+                                                        "exit_reason", "suites", "seconds",
+                                                        "report_error")
                                if st.get(k) not in (None, {}, [])} for st in doc.get("stages", [])}
     for st in doc.get("stages", []):
         if st.get("status") == "passed":
@@ -271,6 +287,9 @@ def main():
     args = ap.parse_args()
     args.depths = [int(x) for x in args.depths.split(",")]
     os.makedirs(args.work, exist_ok=True)
+    # A fresh emptyDir /work has no tmp dir; gufo refuses to start without TMPDIR (HIP/comgr).
+    for v, d in (("TMPDIR", "/work/tmp"), ("XDG_CACHE_HOME", "/work/cache")):
+        os.makedirs(os.environ.setdefault(v, d), exist_ok=True)
     parts = ["tests", "measure"] if args.part == "all" else args.part.split(",")
     status = {}
     for part in parts:

@@ -6,7 +6,9 @@ import sys
 from tool_native import assert_native, cached
 
 
-def check_tool_choice_cache(client, model, checks, chat_result):
+def check_tool_choice_cache(client, model, checks, chat_result, checkpoint_tail=0):
+    """`checkpoint_tail`: prompt tokens an exact replay may prefill again
+    (CHECKPOINT_TAIL_TOKENS)."""
     function = {
         "name": "read", "description": "Read a file.",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}},
@@ -64,10 +66,12 @@ def check_tool_choice_cache(client, model, checks, chat_result):
             assert done["text"].strip() == "DONE", done
 
         # An identical prompt under another tool choice must have identical
-        # token counts and reuse its completed prompt without any prefill.
+        # token counts and reuse its completed prompt without any prefill,
+        # except the model's mandatory checkpoint tail.
         retry = record(label + "_retry", {**continued, "tool_choice": "auto"})
         assert retry["usage"]["prompt_tokens"] == done["usage"]["prompt_tokens"], retry
-        assert cached(retry["usage"]) == retry["usage"]["prompt_tokens"], retry
+        assert cached(retry["usage"]) >= retry["usage"]["prompt_tokens"] - checkpoint_tail, (
+            checkpoint_tail, retry)
 
     # Required calls remain mandatory even when the user asks for plain text.
     # The grammar must supply that guarantee without a system instruction.
