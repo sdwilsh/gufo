@@ -61,6 +61,11 @@ public:
   ContinuationSnapshot& operator=(ContinuationSnapshot&&) = delete;
 
   [[nodiscard]] virtual std::size_t PayloadBytes() const noexcept = 0;
+  /// False once the snapshot can no longer be restored (a background copy
+  /// that completes the payload failed). Lookups skip such entries and fall
+  /// back to a shorter checkpoint or a cold prefill. A snapshot whose payload
+  /// is still being copied is usable: restoring it waits for the copy.
+  [[nodiscard]] virtual bool Usable() const noexcept { return true; }
   /// Prefer an available state that still holds this snapshot's borrowed rows.
   /// This is an allocation hint; every state must remain able to restore it.
   [[nodiscard]] virtual bool PrefersState(
@@ -80,6 +85,8 @@ enum class SnapshotEventReason : std::uint8_t {
   kExactReplacement,
   kCaptureFailure,
   kReservationMismatch,
+  /// A retained snapshot became unusable (its background copy failed).
+  kUnusable,
 };
 
 /// Continuation boundaries take precedence over optional history/retry copies.

@@ -6,6 +6,7 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -45,9 +46,12 @@ struct FakeSnapshot final : gufo::server::ContinuationSnapshot {
     return owner == &state;
   }
 
+  [[nodiscard]] bool Usable() const noexcept override { return usable; }
+
   std::size_t value;
   std::size_t payload_bytes;
   const gufo::server::ContinuationState* owner;
+  mutable std::atomic<bool> usable{true};
 };
 
 void TestBorrowedSnapshotPrefersAvailableOwner() {
@@ -149,6 +153,53 @@ void TestBorrowedSnapshotRetryReplacesOwnersReply() {
              dynamic_cast<FakeState&>(retry.state()).value == 7,
          "a retry restores into the owner whose reply it replaces");
   retry.Invalidate();
+}
+
+void TestUnusableSnapshotIsSkippedAndFailedRestoreFallsBack() {
+  using Tokens = std::vector<gufo::server::ContinuationToken>;
+  int removed_unusable = 0;
+  std::size_t last_retained = 1;
+  std::vector<std::size_t> invalidations(2);
+  std::size_t next_id = 0;
+  gufo::server::ContinuationCache cache(
+      2, [&] { return std::make_unique<FakeState>(next_id++, &invalidations); },
+      {.restore =
+           [](gufo::server::ContinuationState& state,
+              const gufo::server::ContinuationSnapshot& snapshot) {
+             const auto& fake = dynamic_cast<const FakeSnapshot&>(snapshot);
+             if (fake.value == 99) {
+               // A background copy that fails while the restore waits for it.
+               fake.usable = false;
+               throw std::runtime_error("snapshot copy failed");
+             }
+             dynamic_cast<FakeState&>(state).value = fake.value;
+           },
+       .capacity_bytes = [] { return 1024; },
+       .on_event =
+           [&](const gufo::server::SnapshotEvent& event) {
+             if (event.reason == gufo::server::SnapshotEventReason::kUnusable) {
+               ++removed_unusable;
+               last_retained = event.retained_snapshot_bytes;
+             }
+           }});
+  auto root = cache.Acquire(Tokens{1, 2, 3});
+  Expect(root.TryReserveSnapshot(sizeof(std::size_t), 3), "reserve");
+  root.Commit({1, 2, 3}, std::make_unique<FakeSnapshot>(99));
+  // Usable when chosen, failing during the restore: a miss, not an error.
+  auto first = cache.Acquire(Tokens{1, 2, 3, 4});
+  Expect(!first.cache_hit(), "failed restore falls back to a cold lease");
+  first.Invalidate();
+  // Already unusable: skipped by the lookup.
+  auto second = cache.Acquire(Tokens{1, 2, 3, 5});
+  Expect(!second.cache_hit(), "an unusable snapshot is not offered");
+  second.Invalidate();
+  // Its bytes went back to the budget with the entry, not at some eviction.
+  Expect(removed_unusable == 1 && last_retained == 0,
+         "an unusable snapshot's bytes are released");
+  auto third = cache.Acquire(Tokens{9, 9});
+  Expect(third.TryReserveSnapshot(1024, 2),
+         "the whole budget is available again");
+  third.Invalidate();
 }
 
 void TestColdMissThenExactExtensionHit() {
@@ -1364,6 +1415,7 @@ void TestNewBranchPreservesSharedSourceUnderBytePressure() {
 }
 
 int main() {
+  TestUnusableSnapshotIsSkippedAndFailedRestoreFallsBack();
   TestAppendedImagesReuseOnlyCompatiblePrefixes();
   TestImageIdentityIsolation();
   TestColdMissThenExactExtensionHit();
