@@ -167,7 +167,10 @@ Ling-3.0-flash serves with its MTP block by default when the GGUF carries it
 `--speculative off`, up to eight decoding requests (at most `--sessions`) share
 one forward pass per token; each request's tokens, logits and state stay
 bit-identical to decoding it alone, and one request keeps the single-session
-path. MTP requests still decode one at a time.
+path. MTP requests still decode one at a time. Ling's tokenizer keeps the
+tokens of up to 64 MiB of recent message text in process memory (least
+recently used first out, no expiry), so a repeated or continued conversation
+tokenizes only what changed.
 Request decoding leaves EOS and later speculative tokens out of the reusable
 checkpoint. Fixed-length benchmarks may continue through EOS.
 See the [DS4 benchmark and quality contract](models/deepseek-v4-flash/BENCHMARKS.md).
