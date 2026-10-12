@@ -147,7 +147,14 @@ inline std::string GenerationLogDetails(
           : result.cache_hit    ? "memory"
                                 : "miss")
       << " cached_tokens=" << result.cached_prompt_tokens
-      << " cache_restore_ms=" << result.cache_restore_ms
+      << " request_seq=" << result.request_seq
+      << " previous_prompt_tokens=" << result.previous_prompt_tokens
+      << " previous_common_prefix_tokens="
+      << result.previous_common_prefix_tokens << " recent_overlaps=";
+  for (std::size_t i = 0; i < result.recent_prefix_overlaps.size(); ++i)
+    out << (i == 0 ? "" : ",") << result.recent_prefix_overlaps[i].first << ':'
+        << result.recent_prefix_overlaps[i].second;
+  out << " cache_restore_ms=" << result.cache_restore_ms
       << " queue_depth=" << result.queue_depth_at_submit
       << " resident_at_admission=" << result.resident_requests_at_admission
       << " queue_ms=" << result.queue_ms

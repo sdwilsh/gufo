@@ -5065,6 +5065,181 @@ void ExpectBailing(
   }
 }
 
+void TestBailingToolCalls() {
+  constexpr auto kStop = "stop";
+  constexpr auto kCalls = "tool_calls";
+  const std::string clean =
+      "<tool_call>edit\n<arg_key>path</arg_key>\n<arg_value>a/b.py</"
+      "arg_value>\n"
+      "<arg_key>line</arg_key>\n<arg_value>12</arg_value>\n"
+      "<arg_key>dry_run</arg_key>\n<arg_value>false</arg_value>\n"
+      "<arg_key>new</arg_key>\n<arg_value>x = 1\n</arg_value>\n</tool_call>";
+  const std::string clean_args =
+      R"({"path":"a/b.py","line":12,"dry_run":false,"new":"x = 1\n"})";
+
+  // Reasoning closed by </think>, prose, a call.
+  ExpectBailing("Let me edit.</think>\n\nEditing now.\n" + clean, "true",
+                "Let me edit.", "Editing now.", {{"edit", clean_args}}, kCalls);
+  // A call that arrives before </think> closes reasoning implicitly.
+  ExpectBailing("Need a call.\n" + clean, "true", "Need a call.", "",
+                {{"edit", clean_args}}, kCalls);
+  // Thinking off: everything is content.
+  ExpectBailing("Sure.\n" + clean, "false", "", "Sure.", {{"edit", clean_args}},
+                kCalls);
+  // Parallel calls with prose between and after them.
+  ExpectBailing(
+      "Two steps.\n<tool_call>ping</tool_call>\nthen\n" + clean + "\nDone.",
+      "false", "", "Two steps.\n\nthen\n\nDone.",
+      {{"ping", "{}"}, {"edit", clean_args}}, kCalls);
+  // Plain answers and look-alike prose.
+  ExpectBailing("a <tool_x> b </think> c", "false", "",
+                "a <tool_x> b </think> c", {}, kStop);
+  ExpectBailing("why</think>The answer.", "true", "why", "The answer.", {},
+                kStop);
+  // After </think> only line breaks are framing, as the Bailing template's
+  // `split('</think>')[-1].lstrip('\n')` reads it (Qwen also drops spaces).
+  ExpectBailing("why</think>\n\n  The answer.", "true", "why", "  The answer.",
+                {}, kStop);
+  // The structured paths read the same boundary: line breaks after </think>
+  // are framing and spaces are not, with tool-only steering and with a
+  // response_format alike.
+  for (const bool stream : {false, true}) {
+    for (const auto& pieces :
+         {std::vector<std::string>{"why</think>\n\n  The answer."},
+          Chars("why</think>\n\n  The answer.")}) {
+      const auto tool_only = RunBailing(pieces, stream, "true");
+      Expect(tool_only.content == "  The answer." &&
+                 tool_only.reasoning.find("why") != std::string::npos,
+             "tool-steered Bailing content keeps spaces after </think>");
+      const auto formatted =
+          RunBailing(pieces, stream, "true",
+                     R"(,"response_format":{"type":"json_object"})");
+      Expect(formatted.content == "  The answer." &&
+                 formatted.reasoning.find("why") != std::string::npos,
+             "response_format Bailing content keeps spaces after </think>");
+    }
+  }
+  // Beside a response_format the grammar admits a call or the JSON answer:
+  // a leading opener is a Bailing call, JSON is content, and a call cut by
+  // the token limit is neither.
+  {
+    const std::string format = R"(,"response_format":{"type":"json_object"})";
+    const std::string call =
+        "<tool_call>record\n<arg_key>value</arg_key>\n<arg_value>a b"
+        "</arg_value>\n</tool_call>";
+    for (const bool stream : {false, true}) {
+      for (const auto& pieces : {std::vector<std::string>{call}, Chars(call)}) {
+        const auto called = RunBailing(pieces, stream, "false", format);
+        Expect(
+            called.calls.size() == 1 && called.calls[0].first == "record" &&
+                gufo::json::parse(called.calls[0].second).member_str("value") ==
+                    "a b" &&
+                called.content.empty() && called.finish == "tool_calls",
+            "a Bailing call beside a response_format is a call");
+      }
+      const auto answered =
+          RunBailing({R"({"a": 1})"}, stream, "false", format);
+      Expect(answered.calls.empty() && answered.content == R"({"a": 1})" &&
+                 answered.finish == "stop",
+             "the JSON answer beside tools is content");
+      const auto cut = RunBailing(
+          Chars("<tool_call>record\n<arg_key>value</arg_key>\n<arg_value>a"),
+          stream, "false", format,
+          gufo::server::TextGenerationBackend::FinishReason::kLength);
+      Expect(cut.calls.empty() && cut.content.empty() && cut.finish == "length",
+             "a cut Bailing call beside a response_format stays hidden");
+    }
+  }
+  // A stop string inside a value cuts the call even when the value quotes a
+  // closer: it is unfinished, never a call with lost arguments.
+  ExpectBailing(
+      "<tool_call>record\n<arg_key>value</arg_key>\n<arg_value>"
+      "<tool_call><function=record><parameter=content>AAAA</parameter>"
+      "</function></tool_call> ",
+      "false", "", "", {}, "stop",
+      gufo::server::TextGenerationBackend::FinishReason::kStopSequence);
+  // Undeclared tool under auto: emitted as generated so the client's
+  // unknown-tool path can answer it.
+  ExpectBailing(
+      "<tool_call>rm_rf\n<arg_key>p</arg_key>\n"
+      "<arg_value>/</arg_value>\n</tool_call>",
+      "false", "", "", {{"rm_rf", R"({"p":"/"})"}}, kCalls);
+  // A bare name at a clean stop is `name {}`.
+  ExpectBailing("<tool_call>ping", "false", "", "", {{"ping", "{}"}}, kCalls);
+  // A call inside reasoning, then a stray </think>: swallowed.
+  ExpectBailing("Need a tool.<tool_call>ping</tool_call></think>after", "true",
+                "Need a tool.", "after", {{"ping", "{}"}}, kCalls);
+  // Non-ASCII values split inside UTF-8 sequences by one-byte chunks.
+  {
+    auto expected = gufo::json::Value::object();
+    expected["path"] = "\xC3\xA9\xE4\xB8\xAD\xF0\x9F\x98\x80/x.py";
+    ExpectBailing(
+        "Go.\n<tool_call>edit\n<arg_key>path</arg_key>\n<arg_value>"
+        "\xC3\xA9\xE4\xB8\xAD\xF0\x9F\x98\x80/x.py</arg_value>\n</tool_call>",
+        "false", "", "Go.", {{"edit", expected.dump()}}, kCalls);
+  }
+  // Malformed arguments (no closing tags) after a clean stop surface as text.
+  const std::string cut = "<tool_call>edit\n<arg_key>path</arg_key>\n<arg_val";
+  ExpectBailing(cut, "false", "", cut, {}, kStop);
+  // Framing the model repeats after an accepted call is not content (#400),
+  // while a closed quoted opener in prose or reasoning is not a call.
+  ExpectBailing("Go.\n" + clean + "\n</tool_call>", "false", "", "Go.",
+                {{"edit", clean_args}}, kCalls);
+  ExpectBailing("Go.\n<tool_call>ping</tool_call>\n</tool_call>\nDone.",
+                "false", "", "Go.\nDone.", {{"ping", "{}"}}, kCalls);
+  ExpectBailing("Write `<tool_call>` to call.", "false", "",
+                "Write `<tool_call>` to call.", {}, kStop);
+  ExpectBailing("Use `<tool_call>` here.</think>Done.", "true",
+                "Use `<tool_call>` here.", "Done.", {}, kStop);
+  // As for Qwen and DeepSeek (TestNativeToolImplicitReasoningEnd), a fenced
+  // example call is reasoning, and only the unquoted call after it is invoked.
+  ExpectBailing(
+      "Example:\n```xml\n" + clean + "\n```\nEdit it.\n\n</think>" + clean,
+      "true", "Example:\n```xml\n" + clean + "\n```\nEdit it.", "",
+      {{"edit", clean_args}}, kCalls);
+  // An opener inside an unfinished inline quote (ended by a blank line) stays
+  // reasoning too, as the grammar's reasoning lexeme reads it.
+  ExpectBailing("Use `<tool_call>edit later.\n\nNow:\n" + clean, "true",
+                "Use `<tool_call>edit later.\n\nNow:", "",
+                {{"edit", clean_args}}, kCalls);
+  // Prose after an accepted call that names the opener is not a second call:
+  // quoted, or bare at a clean stop with auto tool choice.
+  ExpectBailing("<tool_call>ping</tool_call>\nUse `<tool_call>` next time.",
+                "false", "", "Use `<tool_call>` next time.", {{"ping", "{}"}},
+                kCalls);
+  ExpectBailing("<tool_call>ping</tool_call>\nI used <tool_call> above.",
+                "false", "", "I used <tool_call> above.", {{"ping", "{}"}},
+                kCalls);
+  // Closing tags echoed after a call are framing, not content.
+  ExpectBailing("<tool_call>ping</tool_call>\n</arg_value>\n</tool_call>",
+                "false", "", "", {{"ping", "{}"}}, kCalls);
+  ExpectBailing(clean + "\n</arg_value>\n</tool_call>\nDone.", "false", "",
+                "Done.", {{"edit", clean_args}}, kCalls);
+  // A closer spelled inside an argument value is argument text, with reasoning
+  // on or off, whether or not the value holds reasoning markup (strict-tools
+  // check in tests/functional/openai_sdk.py).
+  const std::string literal = "<think>literal</think></tool_call>";
+  const std::string record =
+      "<tool_call>record<arg_key>value</arg_key><arg_value>" + literal +
+      "</arg_value></tool_call>";
+  const std::string record_args =
+      R"({"value":"<think>literal</think></tool_call>"})";
+  ExpectBailing(record, "false", "", "", {{"record", record_args}}, kCalls);
+  ExpectBailing(record, "true", "", "", {{"record", record_args}}, kCalls);
+  ExpectBailing("Recording.\n" + record, "false", "", "Recording.",
+                {{"record", record_args}}, kCalls);
+  ExpectBailing("Need a call.\n" + record, "true", "Need a call.", "",
+                {{"record", record_args}}, kCalls);
+  ExpectBailing("Done.</think>\n" + record + "\nok", "true", "Done.", "ok",
+                {{"record", record_args}}, kCalls);
+  ExpectBailing(record + "\n" + clean, "false", "", "",
+                {{"record", record_args}, {"edit", clean_args}}, kCalls);
+  // The same value with a pretty-printed template spelling.
+  ExpectBailing("<tool_call>record\n<arg_key>value</arg_key>\n<arg_value>" +
+                    literal + "</arg_value>\n</tool_call>",
+                "false", "", "", {{"record", record_args}}, kCalls);
+}
+
 // Messages tools (#469) run through the Chat tool path. A Bailing model's
 // calls are parsed by its own call parser even when tool_choice "any" asks
 // for the constrained-JSON path, buffered and as Anthropic SSE events.
@@ -6732,6 +6907,7 @@ void TestIncrementalToolArguments() {
 }
 
 int main() {
+  TestBailingToolCalls();
   TestBailingMessagesTools();
   TestBailingGrammarOutputParses();
   TestBailingModes();

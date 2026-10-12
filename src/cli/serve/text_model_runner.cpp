@@ -304,6 +304,21 @@ void EmitSnapshotEvent(const SnapshotEvent& event) noexcept {
   }
 }
 
+/// Debug record of one retained prompt checkpoint, so an agent-loop report can
+/// name the kind of the checkpoint a later request restored. Kinds: frontier
+/// (the reused state frozen before prefill), stable (this prompt's stable
+/// boundary), prompt_end (the complete prompt), live (the end of generation),
+/// grid (2048-token spacing), learned (shared-prefix boundary).
+void LogCheckpoint(std::string_view kind, std::size_t tokens) noexcept {
+  if (!Logger::Enabled(LogLevel::kDebug))
+    return;
+  try {
+    Logger::Debug("cache", "event=checkpoint kind=" + std::string(kind) +
+                               " tokens=" + std::to_string(tokens));
+  } catch (...) {
+  }
+}
+
 std::string_view DiskEventActionName(
     ContinuationDiskEventAction action) noexcept {
   switch (action) {
@@ -317,6 +332,8 @@ std::string_view DiskEventActionName(
       return "removed";
     case ContinuationDiskEventAction::kSkipped:
       return "skipped";
+    case ContinuationDiskEventAction::kDrained:
+      return "drained";
   }
   return "unknown";
 }
@@ -356,6 +373,8 @@ std::string_view DiskEventReasonName(
       return "restore_failure";
     case ContinuationDiskEventReason::kBusy:
       return "busy";
+    case ContinuationDiskEventReason::kTimeout:
+      return "timeout";
   }
   return "unknown";
 }
@@ -688,6 +707,8 @@ struct TextRunnerPool::Request::Impl {
     // On a warm continuation the reused frontier is already a safe fallback.
     // Freeze it before prefill, then retain this turn's own stable boundary
     // before mutable assistant framing.
+    const auto capabilities = runner->Descriptor().capabilities;
+    const std::size_t tail = capabilities.min_checkpoint_tail_tokens;
     auto count = cache_prefix_tokens == 0 ? prompt.size() : cache_prefix_tokens;
     // A newly consumed image needs its own stable checkpoint. Otherwise the
     // next assistant turn can invalidate the complete prompt's framing and
@@ -709,10 +730,19 @@ struct TextRunnerPool::Request::Impl {
       // reasoning does, diverges after that boundary, so retaining only the
       // frontier pins every later turn to the same early position and the
       // re-prefilled tail grows for the rest of the conversation.
-      if (prefill_offset < count)
+      // A model whose numerics depend on chunk size needs every span between
+      // two cut points to be a full chunk, so a stable boundary that close to
+      // the reused frontier (or the prompt end) is skipped; the frozen
+      // frontier already serves as the fallback.
+      if (prefill_offset < count &&
+          (tail == 0 || count == prompt.size() ||
+           (count - prefill_offset >= tail && prompt.size() - count >= tail)))
         stable_prefix_position = count;
       count = prefill_offset;
     }
+    if (tail > 0 && count > prefill_offset && count < prompt.size() &&
+        (count - prefill_offset < tail || prompt.size() - count < tail))
+      count = prompt.size();
     if (lease.restored_from_disk() && prefill_offset == prompt.size())
       count = prompt.size();
     // Cancellation can leave a component live frontier past the stable
@@ -731,7 +761,6 @@ struct TextRunnerPool::Request::Impl {
           state,
           std::span<const TextRunnerToken>(prompt).first(prefill_offset));
     }
-    const auto capabilities = runner->Descriptor().capabilities;
     // Component adapters supply their own pass boundaries below. Building the
     // generic plan first only repeats prefix lookups before discarding it.
     if (!lease.component() && capabilities.incremental_prefill &&
@@ -761,6 +790,31 @@ struct TextRunnerPool::Request::Impl {
     }
     if (lease.component())
       checkpoints = lease.PlannedCaptures(cache_prefix_tokens);
+    if (tail > 0) {
+      // Keep every pair of consecutive cut points at least `tail` tokens
+      // apart: the reused frontier, this prompt's snapshot and stable
+      // positions, learned boundaries, grid checkpoints and the prompt end.
+      // The fixed points win; learned boundaries then grid points fill in.
+      std::vector<std::size_t> kept{prefill_offset, prompt.size()};
+      if (snapshot_tokens.size() > prefill_offset)
+        kept.push_back(snapshot_tokens.size());
+      if (stable_prefix_position != 0)
+        kept.push_back(stable_prefix_position);
+      const auto spaced = [&](std::vector<std::size_t>& points) {
+        std::vector<std::size_t> accepted;
+        for (const auto point : points) {
+          if (std::ranges::all_of(kept, [&](std::size_t other) {
+                return (point > other ? point - other : other - point) >= tail;
+              })) {
+            kept.push_back(point);
+            accepted.push_back(point);
+          }
+        }
+        points = std::move(accepted);
+      };
+      spaced(boundaries);
+      spaced(checkpoints);
+    }
   }
 
   ~Impl() {
@@ -800,6 +854,7 @@ struct TextRunnerPool::Request::Impl {
         snapshot_metrics.snapshot_bytes +=
             lease.PublishSnapshot(snapshot_tokens, std::move(prompt_snapshot),
                                   fallback_position != 0);
+        LogCheckpoint("frontier", snapshot_tokens.size());
       } catch (...) {
         lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure, snapshot_bytes,
                            snapshot_tokens.size());
@@ -835,7 +890,8 @@ struct TextRunnerPool::Request::Impl {
       return;
     }
     if (!capabilities.prefix_reuse || !capabilities.snapshot ||
-        !capabilities.fork) {
+        !capabilities.fork ||
+        snapshot_tokens.size() < capabilities.min_snapshot_tokens) {
       return;
     }
     if (lease.cache_hit() && !lease.restored_from_disk() &&
@@ -1046,6 +1102,7 @@ struct TextRunnerPool::Request::Impl {
         snapshot_metrics.snapshot_bytes += lease.PublishSnapshot(
             {prefix.begin(), prefix.end()}, snapshot, true);
         reserved = false;
+        LogCheckpoint(shared ? "learned" : "grid", position);
       }
       // A RAM checkpoint and a learned disk boundary can coincide. Share the
       // immutable copy instead of reading the same device state twice.
@@ -1232,7 +1289,11 @@ std::size_t TextRunnerPool::Request::ShareCheckpoint(
     return 0;
   // The complete prompt is retained only after decoding starts; share the
   // last prefill position instead so peers can start sooner.
-  const auto target = std::min(common_tokens, impl_->prompt.size() - 1);
+  const auto tail =
+      std::max<std::size_t>(1, capabilities.min_checkpoint_tail_tokens);
+  if (impl_->prompt.size() <= tail)
+    return 0;
+  const auto target = std::min(common_tokens, impl_->prompt.size() - tail);
   const auto offset = impl_->prefill_offset;
   if (target <= offset)
     return 0;
@@ -1249,11 +1310,63 @@ std::size_t TextRunnerPool::Request::ShareCheckpoint(
   for (const auto position : impl_->checkpoints)
     consider(position);
   auto& checkpoints = impl_->checkpoints;
-  const auto position =
-      planned != 0 && target - planned <= kSharedCheckpointSlack ? planned
-                                                                 : target;
-  if (position == target && !std::ranges::binary_search(checkpoints, target))
-    checkpoints.insert(std::ranges::upper_bound(checkpoints, target), target);
+  auto position = planned != 0 && target - planned <= kSharedCheckpointSlack
+                      ? planned
+                      : target;
+  bool insert = position == target;
+  if (tail > 1 && position == target) {
+    // A new checkpoint must stay `tail` tokens from every other cut point:
+    // reuse a planned point below it, or move it down before one above it.
+    std::vector<std::size_t> points{offset, impl_->prompt.size()};
+    for (const auto point : checkpoints)
+      points.push_back(point);
+    for (const auto point : impl_->boundaries)
+      points.push_back(point);
+    if (impl_->snapshot_tokens.size() > offset)
+      points.push_back(impl_->snapshot_tokens.size());
+    if (impl_->stable_prefix_position != 0)
+      points.push_back(impl_->stable_prefix_position);
+    for (std::size_t round = 0; round <= points.size(); ++round) {
+      bool moved = false;
+      for (const auto other : points) {
+        if (other <= position && position - other < tail) {
+          if (other <= offset)
+            return 0;
+          position = other;  // an existing cut point: nothing new to insert
+          insert = false;
+          moved = true;
+          break;
+        }
+        if (other > position && other - position < tail) {
+          if (other < tail || other - tail <= offset)
+            return 0;
+          position = other - tail;
+          insert = true;
+          moved = true;
+          break;
+        }
+      }
+      if (!moved)
+        break;
+    }
+    if (position <= offset)
+      return 0;
+    // A learned disk boundary at this very position is one cut point for both
+    // tiers: the prefill stop captures once and feeds the RAM cache and the
+    // disk store. The spacing search above treats it as an existing cut point
+    // and plans nothing, which left RAM without the checkpoint, so only the
+    // fourth conversation under a shared prompt could restore it.
+    if (!insert &&
+        std::ranges::find(impl_->boundaries, position) !=
+            impl_->boundaries.end() &&
+        position != impl_->stable_prefix_position &&
+        (impl_->snapshot_tokens.size() <= offset ||
+         position != impl_->snapshot_tokens.size()))
+      insert = true;
+  }
+  if (insert && !std::ranges::binary_search(checkpoints, position))
+    checkpoints.insert(std::ranges::upper_bound(checkpoints, position),
+                       position);
   // Prompt snapshots are retained as continuation boundaries already.
   if (std::ranges::binary_search(checkpoints, position))
     impl_->shared_checkpoints.push_back(position);
@@ -1298,6 +1411,13 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
   // Stop exactly on the next shared-prefix boundary so it can be persisted.
   // Direct callers join any capture before mutating its borrowed state.
   impl_->CapturePromptSnapshot();
+  // A grant below two full chunks cannot be rebalanced around a cut point (a
+  // chunk of 1..8 tokens would change numerics), so models that report a tail
+  // requirement always get at least two tails per call, whatever
+  // --prefill-chunk says.
+  max_input_tokens = std::max(
+      max_input_tokens,
+      2 * impl_->runner->Descriptor().capabilities.min_checkpoint_tail_tokens);
   const auto snapshot_position = impl_->snapshot_tokens.size();
   while (!impl_->boundaries.empty() &&
          impl_->boundaries.front() <= impl_->prefill_offset) {
@@ -1564,6 +1684,10 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
   checkpoint.resize(position);
   if (capabilities.snapshot && capabilities.fork) {
     CommitMetrics metrics = impl_->snapshot_metrics;
+    const bool has_prompt_snapshot = impl_->prompt_snapshot != nullptr;
+    const std::size_t prompt_snapshot_tokens = impl_->snapshot_tokens.size();
+    const std::size_t prompt_size = impl_->prompt.size();
+    const std::size_t live_tokens = checkpoint.size();
     metrics.snapshot_bytes += impl_->lease.Commit(
         std::move(impl_->snapshot_tokens), std::move(impl_->prompt_snapshot),
         std::move(checkpoint));
@@ -1572,6 +1696,11 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
       metrics.disk_queued_bytes = metrics.component_cache->disk_queued_bytes;
       metrics.disk_enqueue_ms = metrics.component_cache->disk_enqueue_ms;
     }
+    if (has_prompt_snapshot)
+      LogCheckpoint(
+          prompt_snapshot_tokens == prompt_size ? "prompt_end" : "stable",
+          prompt_snapshot_tokens);
+    LogCheckpoint("live", live_tokens);
     impl_.reset();
     return metrics;
   }
@@ -2004,8 +2133,11 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     } catch (...) {
       boundaries.clear();
     }
-    std::erase_if(boundaries, [&lease](std::size_t boundary) {
-      return boundary <= lease.cached_tokens();
+    const auto tail =
+        impl_->validated.descriptor.capabilities.min_checkpoint_tail_tokens;
+    const auto size = prompt.size();
+    std::erase_if(boundaries, [&lease, tail, size](std::size_t boundary) {
+      return boundary <= lease.cached_tokens() || size - boundary < tail;
     });
   }
   Request request(std::make_unique<Request::Impl>(

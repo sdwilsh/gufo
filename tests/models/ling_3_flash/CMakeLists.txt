@@ -51,9 +51,11 @@ endif()
 # exist only when a model is named: -DGUFO_LING_MODEL=/path/first-shard.gguf.
 if (ENGINE_ENABLE_HIP)
   set(LING_MODEL_BINARIES)
-  foreach(name IN ITEMS session_test snapshot_test interleave_test restore_tail_test
-                        logit_dump layer_check b2 decode_digest handoff_study
-                        batch_segments_test reload_test)
+  foreach(name IN ITEMS session_test snapshot_test interleave_test
+                       restore_tail_test logit_dump
+                       layer_check b2 decode_digest handoff_study mtp_test
+                       mtp_distribution batch_test batch_segments_test
+                       batch_mtp_test reload_test)
     set(target ling_3_flash_${name})
     add_executable(${target} EXCLUDE_FROM_ALL ${name}.cpp)
     target_link_libraries(${target} PRIVATE gufo_ling_3_flash hip::host)

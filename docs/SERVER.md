@@ -111,7 +111,7 @@ DeepSeek maps `minimal`/`low` to `low`, `medium`/`high`/`xhigh` to `high`,
 and `max` to `max`.
 The [functional suite](../tests/functional/README.md) with
 `--suite sampling-defaults --sampling-preset qwen38` (or
-`deepseek4`) compares omitted and explicit settings, including C2 replay.
+`deepseek4` or `ling3`) compares omitted and explicit settings, including C2 replay.
 
 Sources: [Qwen27B](https://huggingface.co/Qwen/Qwen3.8-27B#best-practices),
 [Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next#best-practices),
@@ -160,6 +160,14 @@ samplers, cache state and draft policies. C1 uses point-mass proposals and
 retains seeded AR token identity; filtered sampled C>1 can use compact
 probabilistic proposals with exact p/q acceptance and residual correction.
 That route preserves the target distribution with its own seeded trace.
+
+Ling-3.0-flash serves with its MTP block by default when the GGUF carries it
+(greedy output matches AR; sampled requests use p/q acceptance); pass
+`--speculative off` for AR and 2.1 GiB less device memory. With
+`--speculative off`, up to eight decoding requests (at most `--sessions`) share
+one forward pass per token; each request's tokens, logits and state stay
+bit-identical to decoding it alone, and one request keeps the single-session
+path. MTP requests still decode one at a time.
 Request decoding leaves EOS and later speculative tokens out of the reusable
 checkpoint. Fixed-length benchmarks may continue through EOS.
 See the [DS4 benchmark and quality contract](models/deepseek-v4-flash/BENCHMARKS.md).
@@ -171,6 +179,42 @@ configured ceiling. Sampled MTP proposals use p/q acceptance and residual
 correction; greedy verification follows target argmax. Draft and verification
 work can batch across ready requests. See the
 [Flash-Next benchmark and quality contract](models/qwen3.8-flash-next/BENCHMARKS.md).
+
+Ling-3.0-flash (`bailingmoe3`) snapshots are complete host copies: KDA state and
+conv windows (75.5 MiB), the F16 MLA latent rows (8068 bytes per token, tokens
+included) and the last logits. They restore bit for bit into any session, so the
+RAM cache, learned shared prefixes, forks and `--cache-disk` work as for the
+Qwen hybrids; a 60k-token snapshot is about 0.55 GiB, so size
+`--cache-ram-bytes` for the contexts you serve. The snapshot never stores
+derived data (the expanded K/V cache, whose device budget is
+`--expanded-kv-bytes`, 12 GiB by default, 0 disables; a restore invalidates it
+and it is rebuilt lazily from the latent rows with identical bits). A
+restored request equals the cold run iff each later token is computed in the
+numeric family it has cold (prefill chunks above 8 tokens, decode and 1-8 token
+chunks in the small-batch family; see the reproducibility contract in
+`src/models/ling_3_flash/engine.hpp`). Planned checkpoints stay at least 9
+tokens before the prompt end and the prefill never leaves a 1-8 token tail
+before one when it can rebalance. The disk-cache identity covers
+the GGUF digest, chat template, snapshot payload version and numerics id, so
+files from another artifact or numeric revision are never loaded. The numerics
+id is a CMake-derived SHA-256 of the kernel sources, HIP compiler version and
+flags, target architectures, ROCm release and prefill batch; the payload
+version covers only the byte layout. Every pair of planned checkpoints stays at
+least 9 tokens apart and `--prefill-chunk` is raised to 18 for Ling, so restored
+runs keep the numerics of uncached ones (only prompts or suffixes under 9
+tokens, and decode, differ, as always). Prompts under 128 tokens are not
+retained (a snapshot is 75.5 MiB before the first token).
+
+The GGUF identity reads the whole artifact (about 69 GiB) once and caches the
+digest under `$XDG_CACHE_HOME/gufo/gguf-sha256-v1` (default `~/.cache`), keyed by
+the open file's device, inode, size and times. Keep that directory on a
+persistent volume (set `XDG_CACHE_HOME` to it), or every pod start re-reads the
+model; where the model volume's device or inode changes per pod the key misses
+and the digest is recomputed (the proposal, not implemented, is a
+`--model-digest` option that pins a known digest). Size `--cache-disk-bytes`
+for a few snapshots of the longest contexts (0.5 GiB at 60k tokens) and keep the
+staging area (`--cache-disk-staging-bytes`, default up to 1 GiB) at least one
+snapshot larger than that.
 
 Each model chooses its prefill chunk. `--prefill-chunk` limits prompt work
 between active decode rounds without changing a lone request's kernel policy.
@@ -802,6 +846,16 @@ value of their types when nothing can be enforced. Qwen tags carry no type, so
 Qwen generates declared parameters only; DeepSeek's `string` flag also carries
 wildcard fields. A value that must contain the native closing tag cannot be
 written natively. Only runners without a native syntax use the JSON envelope.
+Ling-3.0-flash keeps its template's markup (`<tool_call>NAME`, then
+`<arg_key>`/`<arg_value>` pairs) under the same contract: string values are raw
+text and end at the first `</arg_value>`, other values are JSON, and unions
+split per branch. A call opener in the reasoning ends it, as the parser
+reads it, except that a quoted or fenced `<tool_call>` stays reasoning. Schemas
+the markup cannot carry exactly (object-level unions, keys the markup
+cannot carry, a literal that would close its value early) keep
+the declared arguments it can carry, as on the Qwen and DeepSeek loose route.
+With `response_format`, the Ling grammar admits one tool call or the JSON
+answer, as for Qwen and DeepSeek.
 Historical calls render typed argument values with the chat template's
 `tojson` spelling (`", "` and `": "` separators, raw UTF-8), as llama.cpp's
 Jinja runtime does. Cache reuse requires identical tokens; normalizing an

@@ -155,15 +155,51 @@ void TestInvalidWorkload() {
          "zero still disables an individual workload");
 }
 
+void TestLingBenchShape() {
+  // The llama-bench comparison shape, with machine-readable output.
+  const char* args[] = {"-p", "2048", "-n", "128",  "-d", "0,4096,16384,65536",
+                        "-r", "3",    "-o", "jsonl"};
+  const auto options = gufo::cli::ParseBenchOptions(args);
+  Expect(options && options->output_format == "jsonl" &&
+             options->repetitions == 3 && options->n_depths.size() == 4 &&
+             options->n_depths.back() == 65536,
+         "llama-bench shape and jsonl output parse");
+  const std::array<const char*, 0> none{};
+  Expect(gufo::cli::ParseBenchOptions(none)->output_format == "md",
+         "markdown remains the default output");
+  const char* bad[] = {"-o", "xml"};
+  Expect(!gufo::cli::ParseBenchOptions(bad), "unknown output format");
+}
+
 }  // namespace
 
+void TestSpeculativeDefaultIsNotExplicit() {
+  const std::array<const char*, 0> none{};
+  const auto implicit = gufo::cli::ParseBenchOptions(none);
+  Expect(implicit.has_value() && !implicit->speculative_explicit &&
+             implicit->speculative_backend.empty(),
+         "no --speculative leaves the model default (Ling selects MTP)");
+  const std::array<const char*, 2> off = {"--speculative", "off"};
+  const auto parsed_off = gufo::cli::ParseBenchOptions(off);
+  Expect(parsed_off.has_value() && parsed_off->speculative_explicit &&
+             parsed_off->speculative_backend.empty(),
+         "--speculative off is an explicit autoregressive choice");
+  const std::array<const char*, 2> mtp = {"--speculative", "mtp"};
+  const auto parsed_mtp = gufo::cli::ParseBenchOptions(mtp);
+  Expect(parsed_mtp.has_value() && parsed_mtp->speculative_explicit &&
+             parsed_mtp->speculative_backend == "mtp",
+         "--speculative mtp is explicit");
+}
+
 int main() {
+  TestSpeculativeDefaultIsNotExplicit();
   TestDefaultOptions();
   TestDs4SamplingOptions();
   TestFlashMtpSamplingOptions();
   TestDepthOptions();
   TestInvalidDepth();
   TestInvalidWorkload();
+  TestLingBenchShape();
   std::cout << "All benchmark CLI tests passed.\n";
   return 0;
 }

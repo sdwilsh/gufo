@@ -97,9 +97,6 @@ struct SnapshotSections {
   return SnapshotLayout(position, mtp).total;
 }
 
-/// Largest chunk of tokens of the small-batch numeric family (engine.hpp).
-inline constexpr std::size_t kSmallBatchMaxTokens = 8;
-
 /// Tokens a prefill call should consume next so that checkpoints keep their
 /// numeric family. `left` is the number of prompt tokens up to the next cache
 /// boundary (checkpoint, learned prefix end or prompt end), `grant` the most

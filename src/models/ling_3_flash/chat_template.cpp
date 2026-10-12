@@ -402,6 +402,9 @@ std::string RenderChat(std::span<const ChatMessage> messages,
 
   for (std::size_t i = 0; i < messages.size(); ++i) {
     const ChatMessage& m = messages[i];
+    if (i + 1 == messages.size() && options.stable_prefix_bytes != nullptr) {
+      *options.stable_prefix_bytes = out.size();
+    }
     if (m.role == "user") {
       out += "<role>HUMAN</role>";
       data(m.content);

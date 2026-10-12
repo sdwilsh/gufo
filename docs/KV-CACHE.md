@@ -492,6 +492,15 @@ differ from the pre-restart response, because the re-prefilled gap follows
 different chunk shapes, as with any partial hit. Plain continuation from RAM is
 unaffected.
 
+**Shutdown drains the write queue.** Writes are asynchronous, so a graceful
+stop (SIGINT, SIGTERM or a normal exit) waits for every accepted checkpoint to
+reach disk, for at most 20 seconds, and logs
+`event=disk_cache action=drained reason=saved` with the bytes and the time
+spent. At the deadline the queued checkpoints that did not start are discarded
+and logged as `reason=timeout`; a write already running always finishes. A
+checkpoint absent after a restart is therefore either one the 2048-token
+spacing rule skipped (`min_step`, see above) or one logged as `timeout`.
+
 Disk entries are evicted by global LRU on last access, so one active run whose
 checkpoints are all recent will displace every other conversation in age order
 **(measured)**. See #275.
@@ -543,6 +552,7 @@ result can still populate the cache. `null` keeps the default, `true`.
 | `event=disk_cache action=removed reason=lru` | a disk entry was evicted to stay inside `--cache-disk-bytes` |
 | `event=disk_cache action=skipped reason=staging_capacity` | a checkpoint exceeded `--cache-disk-staging-bytes` and was never written |
 | `event=disk_cache action=skipped reason=min_step` | a checkpoint was less than 2048 tokens past a stored prefix; RAM still retains it |
+| `event=disk_cache action=drained reason=saved\|timeout` | shutdown wrote every accepted checkpoint, or gave up on the queued ones at the 20 s deadline |
 
 Per-request outcomes appear in the completion log and in `usage.gufo`:
 `cache_hit`, `cache_miss_reason`, `cache_common_prefix_tokens`,
