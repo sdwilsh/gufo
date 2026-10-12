@@ -897,7 +897,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
     result->stop = true;
     return true;
   }
-  const auto begin = std::chrono::steady_clock::now();
+  auto begin = std::chrono::steady_clock::now();
   const auto cap = static_cast<std::uint32_t>(
       std::min<std::size_t>({max_tokens, room, kMaxVerifyTokens}));
   const bool sampled = sampler.config().uses_random_sampling();
@@ -916,7 +916,12 @@ bool Session::DecodeStep(std::size_t max_tokens,
   c.greedy_fast = greedy_fast;
   c.stop_at_eos = stop_at_eos;
   c.chain = {anchor};
-  const bool copying = MtpActive() && cap > 1 && ProposeCopies(c, cap - 1);
+  const bool lookup_enabled = MtpActive() && cap > 1;
+  const auto lookup_start = std::chrono::steady_clock::now();
+  const bool copying = lookup_enabled && ProposeCopies(c, cap - 1);
+  // The controller's cost samples (greedy) are the cycle's time as without
+  // prompt lookup: the lookup itself is left out of them.
+  begin += std::chrono::steady_clock::now() - lookup_start;
   std::uint32_t drafts =
       MtpActive() && cap > 1 && !copying
           ? draft_length_.Choose(cap - 1, !sampled, session_->position())

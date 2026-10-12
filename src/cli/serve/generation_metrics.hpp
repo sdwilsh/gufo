@@ -168,7 +168,9 @@ inline std::string GenerationLogDetails(
       << " plan=" << result.execution_plan
       << " draft_accepted=" << result.draft_accepted_tokens
       << " draft_proposed=" << result.draft_tokens
-      << " draft_rounds=" << result.draft_rounds;
+      << " draft_rounds=" << result.draft_rounds
+      << " draft_copied=" << result.draft_copied_tokens
+      << " draft_copied_accepted=" << result.draft_copied_accepted_tokens;
   if (result.component_cache)
     out << " cache_schema=component-cache-v1 cache_reuse="
         << result.component_cache->reuse
