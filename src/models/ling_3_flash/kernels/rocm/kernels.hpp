@@ -249,13 +249,15 @@ void PrefillSequence(float* state, const float* q, std::uint32_t ld_q,
 void OutputNormGate(const float* o, const float* proj, const float* ssm_norm,
                     float* out, std::uint32_t n_tokens, hipStream_t stream);
 
-/// One-token (decode) fusion of Conv3Decode, GateBetaPrep and L2NormHeads on q
-/// and k: `conv_out` `[3 * 4096]` (q|k normalised, v), g `[4096]`, beta `[32]`.
-/// Bit-identical to calling those three (n_tokens = 1).
+/// Decode-family (1..8 tokens) fusion of Conv3Prefill, GateBetaPrep and
+/// L2NormHeads on q and k (and, with `conv_ckpt`, Conv3Checkpoint):
+/// `conv_out` `[t][3 * 4096]` (q|k normalised, v), g `[t][4096]`, beta
+/// `[t][32]`. Bit-identical to calling those separately.
 void PrepDecode(const float* proj, const float* w_q, const float* w_k,
                 const float* w_v, float* conv_state, const float* ssm_a,
                 const float* dt_bias, float* conv_out, float* g, float* beta,
-                hipStream_t stream);
+                std::uint32_t n_tokens, float* conv_ckpt,
+                std::size_t ckpt_stride, hipStream_t stream);
 /// OutputNormGate that also writes the activation planes of `out` for the
 /// following Q8_0 GEMV (dense::QuantLayout(quant, n_tokens, 4096)).
 void OutputNormGateQuant(const float* o, const float* proj,

@@ -1,0 +1,24 @@
+# Ling-3.0-flash decode-family checks for decode kernel / launch changes (WS34: routed-expert
+# GEMVs, fused 1..8-token KDA prep, shared-expert branch in eager verify/draft steps).
+# Pod: memory 19Gi, amd.com/gpu: 1, /models read-only, /work emptyDir >= 4Gi, NO HSA_OVERRIDE.
+#   run-suite --suite /opt/gufo/suites/decode-tests.txt --timeout 7200      (~100 min)
+# Pair it with `ling-int-bench --stages digest_ab`, which compares every decode digest
+# line with the parent build's. Op tests first (bit identity of the fused/reworked
+# kernels against the separate launches and the CPU reference), then the decode digests
+# (graph == eager, every chunk size), MTP (greedy MTP == greedy AR, rollback, sampled
+# replay), session isolation and snapshots.
+@label=kda_ops @timeout=900 ling_3_flash_kda_ops_test
+@label=moe_ops @timeout=3600 ling_3_flash_moe_ops_test
+@label=moe_ops_invariance @timeout=900 ling_3_flash_moe_ops_test --invariance
+@label=dense_ops @timeout=1800 ling_3_flash_dense_ops_test
+@label=decode_digest @timeout=3000 ling_3_flash_decode_digest --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --graph-compare --max-context 1200 --prompt-tokens 700 --decode-tokens 6
+@label=decode_digest_long @timeout=3000 ling_3_flash_decode_digest --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --graph-compare --layers 8 --max-batch 512 --max-context 25000 --prompt-tokens 24570 --decode-tokens 12
+@label=decode_digest_mtp @timeout=3000 ling_3_flash_decode_digest --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --mtp --graph-compare --max-context 1200 --prompt-tokens 700 --decode-tokens 6
+@label=mtp_policy @timeout=300 ling_3_flash_mtp_policy_test
+@label=mtp_sampled_chain @timeout=600 ling_3_flash_mtp_sampled_chain_test
+@label=mtp_ops @timeout=1800 ling_3_flash_mtp_ops_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --golden /opt/gufo/fixtures/mtp_reference_golden.txt
+@label=mtp_session @timeout=3600 ling_3_flash_mtp_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --gen-tokens 64 --max-context 1024
+@label=mtp_distribution @timeout=5400 ling_3_flash_mtp_distribution --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --samples 400 --tokens 12 --prompts 2 --configs preset,penalties --max-context 1024 --timeout-seconds 5300
+@label=session @timeout=3600 ling_3_flash_session_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf
+@label=interleave @timeout=3600 ling_3_flash_interleave_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --prefix-tokens 5421 --sessions 4 --rounds 12 --max-context 6144
+@label=snapshot @timeout=3600 ling_3_flash_snapshot_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf

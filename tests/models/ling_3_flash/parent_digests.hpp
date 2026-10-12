@@ -95,6 +95,85 @@ inline constexpr MlaPrefill kMlaPrefill[] = {
     {16384, 64, 0, 0xd2e01b4044c69407ULL},
     {0, 0, 0, 0}};
 
+// Routed-expert decode GEMVs and routing (moe_ops_test TestDecodeDigest /
+// TestRouteDigest) as of the parent of WS34 (block-wide top-8 extraction).
+// WS34 rewrote the routing with wave reductions and kept the decode GEMVs
+// (a register-staged rewrite was slower on gfx1151); every bit is the same.
+// Keys: decode (label, types, n, routing, clamp): act, out digests; routing
+// (n): ids ^ plan, weights digests.
+struct Decode {
+  const char* key;
+  unsigned long long a, b;
+};
+inline constexpr Decode kDecode[] = {
+    {"route-decode n=1", 0x46b8af560ff86360ULL, 0x3bdd9d688d2c1b90ULL},
+    {"route-decode n=2", 0xc9bc1c3c9e6d4093ULL, 0x905a5a9245e5fbc1ULL},
+    {"route-decode n=3", 0x19c3bb1e89432a74ULL, 0x122872206472c110ULL},
+    {"route-decode n=5", 0x135d3cb2abe91146ULL, 0xe13ab69291d140d7ULL},
+    {"route-decode n=8", 0xc631e6872c63bc16ULL, 0xe5e93705589228a1ULL},
+    {"route n=513", 0xe07667a2f6b79780ULL, 0x0678ea1bf3cc2b10ULL},
+    {"decode pool16 IQ4_XS/Q4_K n=1 L=0", 0xb1952cd32b04f745ULL,
+     0x9911dde9ba91622fULL},
+    {"decode pool16 IQ4_XS/Q4_K n=2 L=0", 0x29f6eb74553ea114ULL,
+     0x7630a67b7bd38ff4ULL},
+    {"decode pool16 IQ4_XS/Q4_K n=3 L=0", 0x459ce0f4b044fa63ULL,
+     0xa738f7c684e8bfbeULL},
+    {"decode pool16 IQ4_XS/Q4_K n=5 L=0", 0x903f4ae2f6cc1042ULL,
+     0xb780f13dad049570ULL},
+    {"decode pool16 IQ4_XS/Q4_K n=8 L=0", 0x1b45c88b0bf8c1c6ULL,
+     0xca6b4f2bd2549d19ULL},
+    {"decode pool16 IQ4_XS/Q4_K n=8 same-ids L=0", 0x5cca8251006f356cULL,
+     0xbb32e5ce2e85b081ULL},
+    {"decode pool16 IQ4_XS/Q4_K n=1 L=4", 0x7747f16677c780f1ULL,
+     0x9911dde9ba91622fULL},
+    {"decode pool16 IQ4_XS/Q4_K n=2 L=4", 0x284fc08cd2580d6aULL,
+     0x7630a67b7bd38ff4ULL},
+    {"decode pool16 IQ4_XS/Q4_K n=3 L=4", 0xf111d56fe93af29fULL,
+     0xa738f7c684e8bfbeULL},
+    {"decode pool16 IQ4_XS/Q4_K n=5 L=4", 0x829feec74d1147acULL,
+     0xb780f13dad049570ULL},
+    {"decode pool16 IQ4_XS/Q4_K n=8 L=4", 0xec4f16bbe27b80c2ULL,
+     0xca6b4f2bd2549d19ULL},
+    {"decode pool16 IQ4_XS/Q4_K n=8 same-ids L=4", 0x9a9b989f27e9553dULL,
+     0xbb32e5ce2e85b081ULL},
+    {"decode pool16 Q5_K/Q6_K n=1 L=0", 0x6ec5b1b2ad076349ULL,
+     0x5721edc095b16e48ULL},
+    {"decode pool16 Q5_K/Q6_K n=2 L=0", 0x2bf478056365556aULL,
+     0x254281d62bd4ae03ULL},
+    {"decode pool16 Q5_K/Q6_K n=3 L=0", 0xcb7a938807e7cd1cULL,
+     0xda8b6f688950446eULL},
+    {"decode pool16 Q5_K/Q6_K n=5 L=0", 0x4b303bd819e07dabULL,
+     0xd03f5f86d2abc191ULL},
+    {"decode pool16 Q5_K/Q6_K n=8 L=0", 0xdac6473f2abb9f64ULL,
+     0x8eac46d3504d63dcULL},
+    {"decode pool16 Q5_K/Q6_K n=8 same-ids L=0", 0x0cdd3204b90dcc43ULL,
+     0x8a9be7bab27b1dbeULL},
+    {"decode pool16 Q5_K/Q6_K n=1 L=4", 0xc8f49f22e28478aaULL,
+     0x5721edc095b16e48ULL},
+    {"decode pool16 Q5_K/Q6_K n=2 L=4", 0x2eac5310225be46eULL,
+     0x254281d62bd4ae03ULL},
+    {"decode pool16 Q5_K/Q6_K n=3 L=4", 0x04c04604db2765f2ULL,
+     0xda8b6f688950446eULL},
+    {"decode pool16 Q5_K/Q6_K n=5 L=4", 0x4cfad168ad112760ULL,
+     0xd03f5f86d2abc191ULL},
+    {"decode pool16 Q5_K/Q6_K n=8 L=4", 0x416c44d8f37b5befULL,
+     0x8eac46d3504d63dcULL},
+    {"decode pool16 Q5_K/Q6_K n=8 same-ids L=4", 0xe97a2adb53c635a1ULL,
+     0x8a9be7bab27b1dbeULL},
+    {"decode real-shape IQ4_XS/Q4_K n=1 L=4", 0x3c4450c90aace73aULL,
+     0xd673fbd54ea6da13ULL},
+    {"decode real-shape IQ4_XS/Q4_K n=2 L=4", 0xf398b5f2ad6a6e83ULL,
+     0x08cc3737b08f948aULL},
+    {"decode real-shape IQ4_XS/Q4_K n=8 L=4", 0x87ba200aadd042c0ULL,
+     0xcc6601624d57912fULL},
+    {"decode real-shape Q5_K/Q6_K n=1 L=4", 0x4418d223185d9b53ULL,
+     0x2a9d4c088097e1fcULL},
+    {"decode real-shape Q5_K/Q6_K n=2 L=4", 0x77d26a44a8c3a48eULL,
+     0xb7deb1b2835cf092ULL},
+    {"decode real-shape Q5_K/Q6_K n=8 L=4", 0xde6a5d1ff3840671ULL,
+     0x69ea3ff32c182402ULL},
+    {"", 0, 0}};
+
 }  // namespace parent_digests
 
 #endif  // GUFO_TESTS_MODELS_LING_3_FLASH_PARENT_DIGESTS_HPP_
