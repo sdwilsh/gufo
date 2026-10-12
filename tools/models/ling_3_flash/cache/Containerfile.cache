@@ -1,0 +1,26 @@
+# Prompt-cache validation image for Ling-3.0-Flash (WS15). It holds gufo
+# (release build), the functional test harness (tests/functional, OpenAI SDK),
+# and ling-cache-suite. The suite starts `gufo serve` with the model inside one
+# restricted pod and runs the cache suites plus the Hermes-Agent replay. It uses
+# the same ROCm user space as Containerfile. The build context is
+# build/ling-cache-image-ctx (see build-cache-image.sh).
+FROM registry.fedoraproject.org/fedora:44
+RUN dnf -y install --setopt=install_weak_deps=False \
+      python3 python3-openai python3-httpx python3-jsonschema libicu libcurl libpng libjpeg-turbo libwebp libgomp \
+      openssl-libs libatomic elfutils-libs numactl-libs libdrm \
+      rocm-hip rocm-runtime hipblas hipblaslt rocblas rocsolver \
+  && dnf clean all && rm -rf /var/cache/* /usr/share/doc /usr/share/man \
+  && find /usr/lib64/rocblas/library /usr/lib64/hipblaslt/library -type f -name '*gfx[0-9]*' ! -name '*gfx1151*' -delete
+COPY gufo /usr/local/bin/gufo
+COPY ling-cache-suite /usr/local/bin/ling-cache-suite
+COPY functional/ /opt/gufo/tests/functional/
+COPY flake.lock /opt/gufo/flake.lock
+RUN chmod a+rx /usr/local/bin/gufo /usr/local/bin/ling-cache-suite \
+  && chmod -R a+rX /opt/gufo && mkdir -p /work && chmod 1777 /work
+USER 1000:1000
+WORKDIR /work
+ENV HOME=/work XDG_CACHE_HOME=/work/cache TMPDIR=/work/tmp PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 PATH=/usr/local/bin:/usr/bin:/bin
+ARG IMAGE=localhost/gufo:ling-ws15r2
+ENV GUFO_IMAGE=${IMAGE}
+CMD ["ling-cache-suite"]

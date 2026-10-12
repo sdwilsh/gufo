@@ -1,0 +1,30 @@
+# Ling-3.0-Flash integration image. It holds the gfx1151 test binaries
+# (run-suite), the release gufo, the measured-peak microbenchmark, the
+# functional harness, and the suite drivers. It uses the same ROCm user space
+# as artifacts/.../Containerfile. The build context is build/ling-int-image-ctx
+# (see build-int-image.sh).
+FROM registry.fedoraproject.org/fedora:44
+RUN dnf -y install --setopt=install_weak_deps=False \
+      python3 python3-openai python3-httpx python3-jsonschema python3-pydantic libicu libcurl libpng libjpeg-turbo libwebp libgomp \
+      openssl-libs libatomic elfutils-libs numactl-libs libdrm \
+      rocm-hip rocm-runtime hipblas hipblaslt rocblas rocsolver \
+  && dnf clean all && rm -rf /var/cache/* /usr/share/doc /usr/share/man \
+  && find /usr/lib64/rocblas/library /usr/lib64/hipblaslt/library -type f -name '*gfx[0-9]*' ! -name '*gfx1151*' -delete
+COPY run-suite /usr/local/bin/run-suite
+COPY tests/ /opt/gufo/tests/
+COPY suites/ /opt/gufo/suites/
+COPY oracle/ /opt/gufo/oracle/
+COPY oracle-novel/ /opt/gufo/oracle-novel/
+COPY functional/ /opt/gufo/tests/functional/
+COPY flake.lock /opt/gufo/flake.lock
+COPY gufo gfx1151_peak ling-int-suite ling-int-bench ling-serve-suite ling-cache-suite /usr/local/bin/
+RUN chmod -R a+rX /opt/gufo && chmod a+rx /usr/local/bin/* /opt/gufo/tests/ling_3_flash_* \
+  && mkdir -p /work && chmod 1777 /work
+# Restricted PSS: non-root, read-only rootfs. The only writable path is /work (emptyDir).
+USER 1000:1000
+WORKDIR /work
+ENV HOME=/work XDG_CACHE_HOME=/work/cache TMPDIR=/work/tmp PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 PATH=/usr/local/bin:/usr/bin:/bin
+ARG IMAGE=localhost/gufo:ling-int2
+ENV GUFO_IMAGE=${IMAGE}
+CMD ["ling-int-suite"]

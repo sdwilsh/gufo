@@ -11,6 +11,7 @@
 
 #include "src/models/ling_3_flash/config.hpp"
 #include "src/models/ling_3_flash/gpu_dump.hpp"
+#include "src/models/ling_3_flash/snapshot_format.hpp"
 #include "src/models/ling_3_flash/tokenizer.hpp"
 
 namespace gufo::core {
@@ -24,7 +25,6 @@ namespace rocm {
 class DeviceModel;
 class Executor;
 class Session;
-class RecurrentSnapshot;
 struct ForwardTiming;
 }  // namespace rocm
 
@@ -204,8 +204,35 @@ private:
 ///     that collects more than 8 rows moves the final row (and the all_logits
 ///     rows) to the GEMM format, so use the same logits_from class when
 ///     comparing logits.
-///   * Snapshots restore state bit for bit; the contract concerns only how
-///     later tokens are chunked.
+///   * Snapshots restore state bit for bit (recurrent state, conv windows and
+///     every MLA cache row, into any session, not only the origin); the
+///     contract concerns only how later tokens are chunked.
+///
+/// What the server prompt cache (RAM, disk, learned shared prefixes) therefore
+/// guarantees:
+///   * Restore is exact: a restored session is bit-identical to the session
+///     the snapshot was taken from, whatever it held before.
+///   * A request answered from a snapshot at position p reproduces the cold
+///     (uncached) run of the same prompt exactly iff every token after p is
+///     computed in the family it has in the cold run. The server therefore
+///     keeps every checkpoint it plans inside a prompt (grid, shared-prefix,
+///     learned and stable-prefix boundaries) at least 9 tokens before the
+///     prompt end (TextRunnerCapabilities::min_checkpoint_tail_tokens), and
+///     its prefill never leaves a 1..8-token tail before a checkpoint when it
+///     can rebalance (snapshot_format.hpp PrefillChunkTokens, the Feed rule).
+///     A prompt's own state (and its checkpoints) are then prefill-family
+///     states, like a cold prefill's. Every pair of consecutive cut points
+///     (reused frontier, snapshot and stable positions, learned boundaries,
+///     grid and shared checkpoints, prompt end) is kept at least 9 tokens
+///     apart; a point that would be closer is dropped. Residual differences,
+///     all inherent: a prompt (or the rest of one) shorter than 9 tokens past
+///     a restored frontier runs in the small-batch family, decoded tokens
+///     always do, and a client grant below two tails (--prefill-chunk) is
+///     raised to two tails, so very small values do not shrink chunks below 18.
+///   * Cached frontiers computed in different families are different numeric
+///     states of the same text (agreement about 1e-3 per layer, not bitwise);
+///     the disk-cache identity carries kSnapshotPayloadVersion so a change of
+///     numerics invalidates old files.
 /// Verified bit-exact over all 42 blocks (block output, KDA state/conv, MLA
 /// cache rows) by `layer_check --invariance` and end to end by session_test.
 ///
@@ -246,15 +273,30 @@ public:
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
   void Reset();
 
-  /// Rollback point: the recurrent state (device copy), position, tokens and
-  /// last logits. The MLA cache is not copied; rows past the position are
-  /// rewritten before use.
+  /// Complete, self-contained copy of the context at Position(): KDA state,
+  /// conv windows, the MLA latent rows [0, Position()), the tokens and the
+  /// last logits, in host memory (snapshot_format.hpp; SnapshotBytes() is its
+  /// exact size). It reads only this session's buffers on a private stream, so
+  /// it may run on a worker thread while another session executes; this
+  /// session must be idle. Fails on an invalid or empty session.
   [[nodiscard]] std::unique_ptr<SessionSnapshot> SaveSnapshot(
       std::string* error_msg = nullptr) const;
-  /// Restores a snapshot of this session. The session's tokens must still
-  /// start with the snapshot's tokens (the cache rows below the snapshot
-  /// position are then intact); otherwise it fails without changing state.
+  /// Payload size SaveSnapshot would produce now (0 when it would fail).
+  [[nodiscard]] std::size_t SnapshotBytes() const noexcept;
+  /// Makes this session's context equal to the snapshot's, bit for bit, in any
+  /// session whose capacity holds the snapshot (not only the one it came
+  /// from): recurrent state, conv windows and cache rows are overwritten, so
+  /// no property of the session's previous contents survives. State derived
+  /// from the rows or positions is never stored in a snapshot. The restore
+  /// reports the replacement through rocm::Session::OnStateReplaced (contract
+  /// in kernels/rocm/executor.hpp: device-side positions and the expanded K/V
+  /// watermark, lock-protected when pooled), and that state is rebuilt from
+  /// the rows.
   [[nodiscard]] bool RestoreSnapshot(const SessionSnapshot& snapshot,
+                                     std::string* error_msg = nullptr);
+  /// Same from serialized bytes (the disk-cache payload); validates magic,
+  /// version, geometry and exact size before touching the session.
+  [[nodiscard]] bool RestoreSnapshot(std::span<const std::uint8_t> payload,
                                      std::string* error_msg = nullptr);
 
   // Debug and test access.
@@ -280,23 +322,24 @@ private:
   bool valid_{true};
 };
 
-/// Host-held handle to a rollback point of one session.
+/// Immutable host-held snapshot payload of one session (snapshot_format.hpp).
 class SessionSnapshot final {
 public:
   ~SessionSnapshot();
   SessionSnapshot(const SessionSnapshot&) = delete;
   SessionSnapshot& operator=(const SessionSnapshot&) = delete;
-  [[nodiscard]] std::uint32_t Position() const noexcept {
-    return static_cast<std::uint32_t>(tokens_.size());
+  [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
+  [[nodiscard]] std::size_t SizeBytes() const noexcept { return size_; }
+  /// The serialized payload (RAM entry and disk file are these same bytes).
+  [[nodiscard]] std::span<const std::uint8_t> bytes() const noexcept {
+    return {data_.get(), size_};
   }
-  /// Device plus host bytes.
-  [[nodiscard]] std::size_t SizeBytes() const noexcept;
 
 private:
-  SessionSnapshot();
-  std::unique_ptr<rocm::RecurrentSnapshot> recurrent_;
-  std::vector<std::int32_t> tokens_;
-  std::vector<float> logits_;
+  SessionSnapshot(std::uint32_t position, std::size_t size);
+  std::unique_ptr<std::uint8_t[]> data_;
+  std::size_t size_{0};
+  std::uint32_t position_{0};
   friend class Session;
 };
 
