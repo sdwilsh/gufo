@@ -46,7 +46,7 @@ if (ENGINE_ENABLE_HIP)
   set(LING_MODEL_BINARIES)
   foreach(name IN ITEMS session_test snapshot_test interleave_test restore_tail_test
                         logit_dump layer_check b2 decode_digest handoff_study
-                        reload_test)
+                        batch_segments_test reload_test)
     set(target ling_3_flash_${name})
     add_executable(${target} EXCLUDE_FROM_ALL ${name}.cpp)
     target_link_libraries(${target} PRIVATE gufo_ling_3_flash hip::host)
@@ -55,6 +55,21 @@ if (ENGINE_ENABLE_HIP)
     if (name STREQUAL "decode_digest")
       # Graph replay vs eager, bit for bit.
       list(APPEND model_args --graph-compare)
+    endif()
+    if (name STREQUAL "mtp_test" OR name STREQUAL "batch_test")
+      # serving_strict_tool_* (mtp_test), serving_* (batch_test): the
+      # InferenceBackend path (scheduler, runner pool, Ling runner; grammar
+      # binding, MTP decode), compiled in as for the
+      # Flash-Next session test.
+      target_sources(${target} PRIVATE
+        ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_cache.cpp
+        ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_disk_store.cpp
+        ${PROJECT_SOURCE_DIR}/src/cli/serve/component_text_cache.cpp
+        ${PROJECT_SOURCE_DIR}/src/cli/serve/text_model_runner.cpp
+        ${PROJECT_SOURCE_DIR}/src/cli/serve/text_generation_scheduler.cpp
+        ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp)
+      target_link_libraries(${target} PRIVATE gufo_logging
+        gufo_qwen38_flash_next gufo_deepseek_v4_flash gufo_cache_hip)
     endif()
     if (GUFO_LING_MODEL)
       add_test(NAME ling_3_flash.model_${name}
@@ -72,6 +87,28 @@ if (ENGINE_ENABLE_HIP)
         --graph-compare --layers 8 --max-batch 512 --max-context 25000
         --prompt-tokens 24570 --decode-tokens 12)
     set_tests_properties(ling_3_flash.model_decode_digest_long PROPERTIES
+      LABELS "ling_3_flash;hip;gpu;gfx1151;model" SKIP_RETURN_CODE 77
+      TIMEOUT 3600)
+    # Batched decode without any persistent expanded K/V store, and with the
+    # MTP block (its cache rows and carry are part of the compared state).
+    add_test(NAME ling_3_flash.model_batch_test_no_store
+      COMMAND ling_3_flash_batch_test --model ${GUFO_LING_MODEL}
+        --expanded-kv-bytes 0)
+    add_test(NAME ling_3_flash.model_batch_test_mtp
+      COMMAND ling_3_flash_batch_test --model ${GUFO_LING_MODEL} --mtp)
+    add_test(NAME ling_3_flash.model_batch_segments_test_mtp
+      COMMAND ling_3_flash_batch_segments_test --model ${GUFO_LING_MODEL} --mtp)
+    set_tests_properties(ling_3_flash.model_batch_test_no_store
+      ling_3_flash.model_batch_test_mtp
+      ling_3_flash.model_batch_segments_test_mtp PROPERTIES
+      LABELS "ling_3_flash;hip;gpu;gfx1151;model" SKIP_RETURN_CODE 77
+      TIMEOUT 3600)
+    # A restore must also be exact across a 2048-key expanded K/V block edge
+    # (Session::OnStateReplaced invalidates the derived rows).
+    add_test(NAME ling_3_flash.model_snapshot_test_block_edge
+      COMMAND ling_3_flash_snapshot_test --model ${GUFO_LING_MODEL}
+        --prompt-tokens 2300 --max-context 4096)
+    set_tests_properties(ling_3_flash.model_snapshot_test_block_edge PROPERTIES
       LABELS "ling_3_flash;hip;gpu;gfx1151;model" SKIP_RETURN_CODE 77
       TIMEOUT 3600)
   endif()
