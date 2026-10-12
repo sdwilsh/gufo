@@ -212,20 +212,29 @@ void Route(const float* logits, const float* bias, std::int32_t* ids,
 
 /// Device bytes of scratch (sorted token lists) the prefill kernels need.
 std::size_t PrefillScratchBytes(std::uint32_t n_tokens);
+/// Device bytes of scratch (unique-expert list) the decode kernels need.
+std::size_t DecodeScratchBytes();
 
-/// Decode, one token: act[k][f] = swiglu_clamped(gate_e . x, up_e . x) for the
-/// 8 experts e = ids[k] (gate/up `[512][768][2560]`, type IQ4_XS or Q5_K,
-/// clamp L = swiglu_clamp_exp[layer], 0 = off); act `[8][768]`.
+/// Decode / small verify batch, `n_tokens` in 1..8: act[t][k][f] =
+/// swiglu_clamped(gate_e . x[t], up_e . x[t]) for the 8 experts e = ids[t][k]
+/// (gate/up `[512][768][2560]`, type IQ4_XS or Q5_K (Q4_K/Q6_K also work),
+/// clamp L = swiglu_clamp_exp[layer], 0 = off); x `[t][2560]`, ids `[t][8]`,
+/// act `[t][8][768]`. Each distinct selected expert is read once per call
+/// even when several tokens pick it. `scratch` is DecodeScratchBytes().
 void ExpertGateUpDecode(const void* gate, const void* up, WeightType type,
-                        const float* x, const std::int32_t* ids, float limit,
-                        float* act, void* scratch, hipStream_t stream);
-/// Decode, one token: out[k][:] = down_e . act[k] for e = ids[k] (down
-/// `[512][2560][768]`, type Q4_K or Q6_K); out `[8][2560]`, unweighted.
+                        const float* x, const std::int32_t* ids,
+                        std::uint32_t n_tokens, float limit, float* act,
+                        void* scratch, hipStream_t stream);
+/// Decode, `n_tokens` in 1..8: out[t][k][:] = down_e . act[t][k] for e =
+/// ids[t][k] (down `[512][2560][768]`, type Q4_K or Q6_K); act `[t][8][768]`,
+/// out `[t][8][2560]`, unweighted. Same single-read-per-expert guarantee.
 void ExpertDownDecode(const void* down, WeightType type, const float* act,
-                      const std::int32_t* ids, float* out, void* scratch,
-                      hipStream_t stream);
+                      const std::int32_t* ids, std::uint32_t n_tokens,
+                      float* out, void* scratch, hipStream_t stream);
 /// Prefill grouped form of ExpertGateUpDecode for `n_tokens` rows; x
-/// `[t][2560]`, ids `[t][8]`, act `[t][8][768]`. Tokens are grouped per expert.
+/// `[t][2560]`, ids `[t][8]`, act `[t][8][768]`. Tokens are grouped per expert
+/// and run through F16 WMMA tiles (F32 accumulation). `scratch` is
+/// PrefillScratchBytes(n_tokens).
 void ExpertGateUpPrefill(const void* gate, const void* up, WeightType type,
                          const float* x, const std::int32_t* ids,
                          std::uint32_t n_tokens, float limit, float* act,
