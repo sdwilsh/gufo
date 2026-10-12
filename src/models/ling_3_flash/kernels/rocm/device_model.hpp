@@ -53,6 +53,14 @@ struct DeviceLayer {
   DeviceTensor gate_shexp, up_shexp, down_shexp;
 };
 
+/// MTP block (block 42): a full MLA + MoE block and the nextn projections.
+struct DeviceMtp {
+  DeviceLayer block;
+  DeviceTensor eh_proj;            ///< Q8_0 [5120 -> 2560]
+  DeviceTensor enorm, hnorm;       ///< F32 [2560]
+  DeviceTensor layer_output_norm;  ///< F32 [2560], the shared-head norm
+};
+
 struct UploadStats {
   std::size_t bytes{0};
   std::size_t tensors{0};
@@ -69,11 +77,12 @@ public:
   /// Streams tensors disk to device with core::hip::WeightUpload; the mapped
   /// GGUF payloads are never read. `layer_first` and `layer_limit` (0 = to the
   /// end) upload only blocks [first, first + limit): a debug aid for GPUs too
-  /// small for the full artifact. Progress goes to stderr.
+  /// small for the full artifact. `with_mtp` also uploads the MTP block
+  /// (block 42; an error when the artifact has none). Progress goes to stderr.
   [[nodiscard]] static std::unique_ptr<DeviceModel> Upload(
       const ModelWeights& weights, const core::GgufReader& reader,
       std::uint32_t layer_first, std::uint32_t layer_limit,
-      std::string* error_msg = nullptr);
+      std::string* error_msg = nullptr, bool with_mtp = false);
 
   [[nodiscard]] const Config& config() const noexcept { return config_; }
   [[nodiscard]] const DeviceTensor& token_embd() const noexcept {
@@ -87,6 +96,10 @@ public:
   [[nodiscard]] const std::vector<DeviceLayer>& layers() const noexcept {
     return layers_;
   }
+  /// The MTP block, or null when it was not uploaded.
+  [[nodiscard]] const DeviceMtp* mtp() const noexcept {
+    return has_mtp_ ? &mtp_ : nullptr;
+  }
   [[nodiscard]] std::uint32_t first_layer() const noexcept { return first_; }
   [[nodiscard]] const UploadStats& stats() const noexcept { return stats_; }
   [[nodiscard]] std::size_t resident_bytes() const noexcept {
@@ -99,6 +112,8 @@ private:
   Config config_;
   DeviceTensor token_embd_, output_norm_, output_;
   std::vector<DeviceLayer> layers_;
+  DeviceMtp mtp_;
+  bool has_mtp_{false};
   std::uint32_t first_{0};
   std::vector<void*> allocations_;
   UploadStats stats_;

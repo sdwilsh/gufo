@@ -41,8 +41,19 @@ public:
     return state_.cache.capacity;
   }
   [[nodiscard]] std::size_t bytes() const noexcept {
-    return SessionBytes(state_.cache.capacity).Total();
+    return SessionBytes(state_.cache.capacity, state_.mtp_cache != nullptr)
+        .Total();
   }
+  /// True when the session carries the MTP block's latent cache.
+  [[nodiscard]] bool mtp_enabled() const noexcept {
+    return state_.mtp_cache != nullptr;
+  }
+  /// True when the MTP cache rows [0, position - 1) and the trunk-hidden carry
+  /// are consistent with the session's tokens (always after an MTP forward
+  /// from position 0; false after Reset and after a restore from a snapshot
+  /// without MTP state, until the session is reset).
+  [[nodiscard]] bool mtp_valid() const noexcept { return mtp_valid_; }
+  void set_mtp_valid(bool valid) noexcept { mtp_valid_ = valid; }
   /// Zeroes the recurrent state. The latent cache needs no clearing: rows at
   /// or past the position are always rewritten before they are read.
   [[nodiscard]] bool Reset(std::string* error_msg = nullptr);
@@ -62,19 +73,53 @@ public:
   }
   /// Hook called after the whole session state (recurrent state, conv
   /// windows, cache rows [0, position)) was replaced outside a forward pass,
-  /// by a snapshot restore. Contract for state that is derived from, or kept
-  /// beside, the session state (it must be rebuilt or updated here, never
-  /// stored in snapshots):
-  ///   * it runs with the session idle, after the copies completed and the
-  ///     position was set to `position`;
-  ///   * device-side positions (WS10) must take `position` as the new next
-  ///     position;
-  ///   * derived caches (WS12 expanded K/V) must lower their valid-rows
-  ///     watermark to 0 and be rebuilt lazily with identical bits; a pool
-  ///     shared between sessions must be updated under its own lock, because
-  ///     a restore may run while another session executes.
-  /// Nothing is derived yet, so it is empty.
-  void OnStateReplaced(std::uint32_t position) noexcept { (void)position; }
+  /// by a snapshot restore. It runs with the session idle, after the copies
+  /// completed, and makes everything that is derived from, or kept beside,
+  /// the session state consistent with the new contents (derived state is
+  /// never stored in snapshots):
+  ///   * the position becomes `position` (the next step uploads it to the
+  ///     device-side token/position inputs that the eager launches and the
+  ///     captured decode graphs read; the graphs hold no position of their
+  ///     own, so a replay after a restore starts at the restored position; the
+  ///     shared-expert branch stream and its fork/join events exist only
+  ///     inside a graph capture, whose branches join before the capture ends,
+  ///     so no stream or event is left pending across a restore);
+  ///   * the persistent expanded K/V rows (the watermark of every MLA layer)
+  ///     are invalidated to 0, because the restore rewrote cache rows below
+  ///     the old watermark; they are re-expanded lazily with identical bits.
+  ///     The watermark is session-private; the only cross-session state, the
+  ///     executor's byte budget, is an atomic counter that a restore does not
+  ///     touch (the store itself keeps its size), so no lock is needed.
+  void OnStateReplaced(std::uint32_t position) noexcept {
+    state_.position = position;
+    for (std::uint32_t& rows : state_.mla_expanded_to) {
+      rows = 0;
+    }
+  }
+  /// As above, for a restore that verified `same[m]` leading latent rows of
+  /// MLA layer m to be bit-identical to the rows they replace: those rows keep
+  /// their expansion (it is a pure function of the row), the rest is
+  /// invalidated.
+  void OnStateReplaced(std::uint32_t position,
+                       const std::uint32_t (&same)[kMlaLayers]) noexcept {
+    state_.position = position;
+    for (std::uint32_t m = 0; m < kMlaLayers; ++m) {
+      state_.mla_expanded_to[m] =
+          std::min({state_.mla_expanded_to[m], same[m], position});
+    }
+  }
+  /// Rows of the persistent expanded K/V that are current in the layer that has
+  /// the most (all resident MLA layers agree; tests: how much a restore had to
+  /// re-expand).
+  [[nodiscard]] std::uint32_t expanded_rows_valid() const noexcept {
+    return *std::max_element(std::begin(state_.mla_expanded_to),
+                             std::end(state_.mla_expanded_to));
+  }
+  /// Rows of this session's persistent expanded K/V store (whole 2048-row
+  /// blocks granted at creation; 0 = every row is expanded per call).
+  [[nodiscard]] std::uint32_t expanded_store_rows() const noexcept {
+    return state_.expanded_rows;
+  }
 
 private:
   friend class Executor;
@@ -96,6 +141,7 @@ private:
   /// Recorded at the end of every forward pass on this session; snapshot
   /// copies wait on it instead of trusting that the pass has been synchronized.
   hipEvent_t forward_done_{nullptr};
+  bool mtp_valid_{false};
 };
 
 /// Time spent by the last Forward, from device events.
@@ -118,6 +164,34 @@ struct ForwardRequest {
   /// Merges per-operation device times of this step into the vector (eager).
   std::vector<OpTiming>* op_profile{nullptr};
   GpuTensorSink* sink{nullptr};
+  /// Records rollback points (the KDA state and conv window after every row
+  /// but the last) so the step can be cut back with MtpRollback(). Needs a
+  /// small-batch chunk (n <= 8) and Options::mtp; such a step runs eagerly.
+  bool rollback{false};
+  /// When not empty, the index of the largest logit of each row from
+  /// `logits_from` on (rows = n - from entries), computed on the device; the
+  /// output head runs even if `logits` is empty. The rows' logits stay in the
+  /// executor (ReadLogitRow) until the next forward or draft.
+  std::span<std::int32_t> argmax;
+};
+
+/// One MTP draft step: the draft block at `position` for `token` (the token
+/// after the position's trunk token), with the trunk hidden of the session's
+/// last committed position (`chain` false) or the previous draft's own hidden
+/// output (`chain` true, positions advance by one per step).
+struct DraftRequest {
+  std::int32_t token{0};
+  std::uint32_t position{0};
+  bool chain{false};
+  /// Host destination of the draft logits (vocab floats); empty = argmax only.
+  std::span<float> logits;
+  /// Test hook: when not empty, the hidden input (kHidden floats) comes from
+  /// the host instead of the session/chain and the step needs no valid MTP
+  /// state (the caller owns the positions: row `position` is written and rows
+  /// 0..position are attended). `h_out`, when not empty, receives the draft's
+  /// shared-head-normed hidden output.
+  std::span<const float> h_host;
+  std::span<float> h_out;
 };
 
 /// Single-stream layer loop of the Ling-3.0-flash trunk (PLAN section 1) over
@@ -138,6 +212,10 @@ public:
     /// rows beyond it are expanded per call with identical bits. 12 GiB covers
     /// 109,000 tokens of one session; 0 disables the store.
     std::uint64_t expanded_kv_bytes{std::uint64_t{12} << 30};
+    /// Run the MTP block: sessions get an MTP latent cache, every forward
+    /// keeps it filled, and verify steps can record rollback points (about
+    /// 0.5 GiB of executor scratch). Needs a DeviceModel with the MTP block.
+    bool mtp{false};
   };
   [[nodiscard]] static std::unique_ptr<Executor> Create(
       const DeviceModel& model, const Options& options,
@@ -169,22 +247,29 @@ public:
   /// (snapshot_format.hpp). Uses a private stream and only the session's own
   /// buffers, so it may run on a worker while another session executes; the
   /// session must be idle (its last forward completed).
+  /// `mtp_h` (kHidden floats) and `mtp` (F16 rows [0, rows - 1) of the MTP
+  /// latent cache, packed) are copied only when not null (MTP sessions).
   struct SnapshotBuffers {
     std::uint8_t* kda_state{nullptr};
     std::uint8_t* kda_conv{nullptr};
     std::uint8_t* mla{nullptr};
+    std::uint8_t* mtp_h{nullptr};
+    std::uint8_t* mtp{nullptr};
   };
   struct ConstSnapshotBuffers {
     const std::uint8_t* kda_state{nullptr};
     const std::uint8_t* kda_conv{nullptr};
     const std::uint8_t* mla{nullptr};
+    const std::uint8_t* mtp_h{nullptr};
+    const std::uint8_t* mtp{nullptr};
   };
   [[nodiscard]] bool SaveSnapshot(const Session& session, std::uint32_t rows,
                                   const SnapshotBuffers& out,
                                   std::string* error_msg = nullptr) const;
   /// Overwrites the session's KDA state, conv window and MLA rows
-  /// [0, rows) bit for bit and invalidates derived caches. The position is
-  /// the caller's to set.
+  /// [0, rows) bit for bit and invalidates derived caches; with MTP buffers
+  /// also the MTP rows and carry (the session becomes mtp_valid), otherwise an
+  /// MTP session becomes not mtp_valid. The position is the caller's to set.
   [[nodiscard]] bool RestoreSnapshot(Session& session, std::uint32_t rows,
                                      const ConstSnapshotBuffers& in,
                                      std::string* error_msg = nullptr) const;
@@ -200,9 +285,49 @@ public:
                                   std::vector<std::uint16_t>* out,
                                   std::string* error_msg = nullptr);
 
+  /// Runs the MTP draft block for one position (see DraftRequest) and returns
+  /// the index of the largest draft logit. The session must be mtp_valid().
+  /// Writes MTP cache row `position` (rows past the committed frontier are
+  /// rewritten by the next forward, so a draft chain needs no cleanup).
+  [[nodiscard]] bool MtpDraft(Session& session, const DraftRequest& request,
+                              std::int32_t* argmax,
+                              std::string* error_msg = nullptr);
+  /// Cuts the last Forward(rollback = true) of `n` tokens from `first_pos` back
+  /// to its first `keep` rows (1 <= keep <= n): restores the KDA state and conv
+  /// window after row keep - 1, sets the position and the MTP carry. MLA
+  /// caches need no restore (the position truncates them).
+  [[nodiscard]] bool MtpRollback(Session& session, std::uint32_t first_pos,
+                                 std::uint32_t n, std::uint32_t keep,
+                                 std::string* error_msg = nullptr);
+  /// Copies row `row` of the logits left by the last head launch (a Forward
+  /// with logits or argmax, or MtpDraft) to the host.
+  [[nodiscard]] bool ReadLogitRow(std::uint32_t row, std::span<float> out,
+                                  std::string* error_msg = nullptr);
+  [[nodiscard]] bool mtp_enabled() const noexcept { return options_.mtp; }
+
+  /// Copies the MTP latent cache rows [0, rows) / the trunk-hidden carry to the
+  /// host (tests).
+  [[nodiscard]] bool ReadMtpCache(const Session& session, std::uint32_t rows,
+                                  std::vector<std::uint16_t>* out,
+                                  std::string* error_msg = nullptr);
+  [[nodiscard]] bool ReadMtpHidden(const Session& session,
+                                   std::vector<float>* out,
+                                   std::string* error_msg = nullptr);
+
   /// Graph replays so far (tests and the bench check the graph path ran).
   [[nodiscard]] std::uint64_t graph_replays() const noexcept {
     return graph_replays_;
+  }
+  /// Decode-graph captures invalidated by another thread's runtime call; the
+  /// step ran eagerly and the next one captures again (logged at 1, 2, 4, ...).
+  [[nodiscard]] std::uint64_t capture_invalidations() const noexcept {
+    return capture_invalidations_;
+  }
+  /// Test hook: the next `count` decode-graph captures are invalidated the
+  /// way an unserialized snapshot wait used to break them (another thread
+  /// waits on the session's forward event mid-capture).
+  void BreakCapturesForTest(std::uint32_t count) noexcept {
+    capture_breaks_for_test_ = count;
   }
   [[nodiscard]] const ForwardTiming& last_timing() const noexcept {
     return timing_;
@@ -232,6 +357,14 @@ private:
   bool Block(const Session& session, std::uint32_t il, std::uint32_t first_pos,
              std::uint32_t n, GpuTensorSink* sink, bool fuse, bool x_ready,
              const DeviceLayer* next, std::string* error_msg);
+  bool BlockOf(const DeviceLayer& l, const Session& session, std::uint32_t il,
+               std::uint32_t first_pos, std::uint32_t n, GpuTensorSink* sink,
+               bool fuse, bool x_ready, const DeviceLayer* next,
+               std::string* error_msg);
+  /// After a forward of n tokens from first_pos: advances the MTP cache and
+  /// the trunk-hidden carry (no-op without MTP).
+  bool MtpAfterForward(Session& session, std::uint32_t n,
+                       std::uint32_t first_pos, std::string* error_msg);
   void Kda(const DeviceLayer& l, const Session& session, std::uint32_t il,
            std::uint32_t n, bool fuse, GpuTensorSink* sink);
   void Mla(const DeviceLayer& l, const Session& session, std::uint32_t il,
@@ -256,7 +389,7 @@ private:
   bool UploadInputs(std::span<const std::int32_t> tokens, std::uint32_t n,
                     std::uint32_t first_pos, std::string* error_msg);
   bool Head(std::uint32_t n, std::uint32_t from, std::span<float> logits,
-            std::string* error_msg);
+            std::span<std::int32_t> argmax, std::string* error_msg);
   /// Embedding, all blocks and (head_from < n) the output norm, logits GEMV
   /// and argmax of rows [head_from, n) (at most logit_group of them), as
   /// launches only: no host synchronisation, so it can be graph-captured.
@@ -281,12 +414,21 @@ private:
   hipStream_t transfer_stream_{nullptr};
   void* transfer_staging_{nullptr};
   mutable std::mutex transfer_mutex_;
+  /// Held while a decode graph is captured on `stream_` and by any other
+  /// thread's host wait on an event recorded on `stream_` (a snapshot worker
+  /// waiting for its session's last forward). HIP fails such a wait during a
+  /// thread-local capture of that stream and breaks the capture: the broken
+  /// capture's shared-expert branch launches then ran outside the graph,
+  /// racing the eager fallback, and the executor stream could be left in the
+  /// failed capture. Lock order: transfer_mutex_ before capture_mutex_.
+  mutable std::mutex capture_mutex_;
   std::unique_ptr<Buffers> b_;
   std::shared_ptr<std::atomic<std::uint64_t>> expanded_pool_;
   std::size_t scratch_total_{0};
   std::vector<hipEvent_t> events_;
   ForwardTiming timing_;
   bool graphs_enabled_{true};
+  bool rollback_active_{false};  ///< Kda() stores rollback points this step
   bool capture_invalidated_{false};
   bool capturing_{false};  ///< Trunk() is being recorded into a graph
   hipStream_t branch_stream_{nullptr};  ///< parallel branch inside a capture
@@ -301,6 +443,8 @@ private:
   std::vector<hipEvent_t>
       mark_events_;  ///< [0] = start, [i + 1] after marks_[i]
   std::uint64_t graph_replays_{0};
+  std::uint64_t capture_invalidations_{0};
+  std::uint32_t capture_breaks_for_test_{0};
   /// Pinned staging for the per-step host inputs of graph replays (tokens,
   /// positions).
   std::int32_t* staging_{nullptr};

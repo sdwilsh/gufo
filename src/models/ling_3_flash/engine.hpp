@@ -3,14 +3,17 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "src/core/sampling.hpp"
 #include "src/models/ling_3_flash/config.hpp"
 #include "src/models/ling_3_flash/gpu_dump.hpp"
+#include "src/models/ling_3_flash/mtp.hpp"
 #include "src/models/ling_3_flash/snapshot_format.hpp"
 #include "src/models/ling_3_flash/tokenizer.hpp"
 
@@ -56,6 +59,12 @@ struct ModelOptions {
   /// Replay small-batch decode steps as HIP graphs (default). Tests clear it to
   /// compare with the eager launch sequence; results are bit-identical.
   bool graphs = true;
+  /// Upload the MTP block (block 42, about 1.2 GiB) and run speculative
+  /// decoding (Session::DecodeStep drafts and verifies; every forward keeps the
+  /// session's MTP cache filled). Costs 0.5 GiB of verify rollback scratch and
+  /// 1152 bytes per context token and session. Without it nothing changes: the
+  /// default path is bit-identical to a build without MTP. See mtp.hpp.
+  bool mtp = false;
 };
 
 /// Timing of one forward pass (device events), kept per chunk.
@@ -126,11 +135,20 @@ public:
   /// Device bytes of the uploaded weights.
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
   [[nodiscard]] std::size_t ScratchBytes() const noexcept;
-  [[nodiscard]] static std::size_t SessionBytes(std::uint32_t context) noexcept;
+  [[nodiscard]] static std::size_t SessionBytes(std::uint32_t context,
+                                                bool mtp = false) noexcept;
+  [[nodiscard]] bool HasMtp() const noexcept { return options_.mtp; }
   [[nodiscard]] double LoadSeconds() const noexcept { return load_seconds_; }
   [[nodiscard]] double UploadSeconds() const noexcept;
   /// HIP-graph decode replays so far (tests and the bench check the path ran).
   [[nodiscard]] std::uint64_t GraphReplays() const noexcept;
+  /// Decode-graph captures that another thread's runtime call invalidated
+  /// (each such step ran eagerly and the capture is retried on the next one).
+  [[nodiscard]] std::uint64_t CaptureInvalidations() const noexcept;
+  /// Test hook: invalidates the next `count` decode-graph captures (as an
+  /// unserialized wait from another thread would); each such step must still
+  /// run eagerly with identical bits and leave the executor usable.
+  void BreakCapturesForTest(std::uint32_t count) noexcept;
 
 private:
   Model() = default;
@@ -266,12 +284,99 @@ public:
   /// Index of the largest logit (lowest index on ties); -1 without logits.
   [[nodiscard]] std::int32_t Argmax() const noexcept;
   [[nodiscard]] std::uint32_t Position() const noexcept;
+  /// Leading cache rows whose persistent expanded K/V is current (the most of
+  /// any MLA layer) (tests: how much of a restore had to be re-expanded).
+  [[nodiscard]] std::uint32_t ExpandedRowsValid() const noexcept;
+  /// Rows of the session's persistent expanded K/V store (whole 2048-row
+  /// blocks of the shared --expanded-kv-bytes budget; tests).
+  [[nodiscard]] std::uint32_t ExpandedStoreRows() const noexcept;
   [[nodiscard]] std::span<const std::int32_t> Tokens() const noexcept {
     return tokens_;
   }
   [[nodiscard]] bool IsValid() const noexcept { return valid_; }
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
+  /// Empties the session now and zeroes its recurrent state on the device.
   void Reset();
+  /// Empties the session without any device call; the recurrent state is
+  /// zeroed by the next Feed (a restore overwrites it anyway). Safe after a
+  /// failed step on a lost GPU, where device cleanup can block forever.
+  void Invalidate() noexcept;
+
+  /// Result of one speculative decode step (DecodeStep).
+  struct DecodeResult {
+    /// Committed tokens, already part of the session (anchor first). Empty
+    /// with `stop` when the next token would stop generation.
+    std::vector<std::int32_t> tokens;
+    bool stop{false};
+  };
+  struct DraftStats {
+    std::uint64_t cycles{0};    ///< Cycles that verified at least one draft.
+    std::uint64_t drafted{0};   ///< Draft tokens verified.
+    std::uint64_t accepted{0};  ///< Draft tokens accepted.
+  };
+  /// One decode step of at most `max_tokens` committed tokens (max_tokens 1
+  /// is plain decoding): samples the anchor token from the session's logits
+  /// with `sampler`, proposes up to 7 drafts with the MTP block (the count
+  /// from the adaptive controller), verifies [anchor, drafts] in one forward
+  /// pass and rolls the session back to the accepted prefix (mtp.hpp). Greedy
+  /// results equal plain greedy decoding token for token; sampled results
+  /// follow the lossless p/q rule of mtp_sampling.hpp. `sampler` receives the
+  /// accepted tokens (history, RNG, deferred residual draw). Without MTP
+  /// (Model::HasMtp() false or an invalid MTP state) it decodes one token.
+  [[nodiscard]] bool DecodeStep(std::size_t max_tokens,
+                                sampling::SamplerState& sampler,
+                                DecodeResult* result,
+                                std::string* error_msg = nullptr,
+                                bool stop_at_eos = true);
+  [[nodiscard]] const DraftStats& Statistics() const noexcept { return stats_; }
+  /// Forgets the acceptance history (a new request over retained state).
+  void ResetDraftPolicy() noexcept;
+  /// Largest number of drafts per step (1..7, default 7).
+  void SetMaxDrafts(std::uint32_t drafts) noexcept;
+  /// Test hooks (greedy only): a fixed number of drafts per cycle instead of
+  /// the controller's choice, and a draft source replacing the MTP chain
+  /// (called with the chain so far, anchor first, it returns the next draft
+  /// token) so tests can force full, partial and zero acceptance.
+  struct DraftHooks {
+    std::uint32_t fixed_drafts{0};  ///< 0 = adaptive
+    std::function<std::int32_t(std::span<const std::int32_t>)> source;
+    /// Test seam, called between Verify() and Rollback() (may throw).
+    std::function<void()> after_verify;
+  };
+  void SetDraftHooks(DraftHooks hooks) { hooks_ = std::move(hooks); }
+  /// True when drafting is possible: an MTP model and a consistent MTP state.
+  [[nodiscard]] bool MtpActive() const noexcept;
+
+  // MTP building blocks, public for tests and tools (DecodeStep composes them).
+  /// Appends `tokens` (2..8) as one verify step that records rollback points.
+  /// Fills `argmax` (one entry per token) with the device argmax of every row,
+  /// and `rows` (when given) with all rows' logits (`tokens.size()` * vocab).
+  /// The session then holds the whole chunk until Rollback().
+  [[nodiscard]] bool Verify(std::span<const std::int32_t> tokens,
+                            std::span<std::int32_t> argmax,
+                            std::vector<float>* rows,
+                            std::string* error_msg = nullptr);
+  /// Completes a Verify keeping its first `keep` tokens (1..n): the recurrent
+  /// state, position, tokens and logits become those after row keep - 1.
+  [[nodiscard]] bool Rollback(std::uint32_t keep,
+                              std::string* error_msg = nullptr);
+  /// One MTP draft step for `token` (the token after the last committed one,
+  /// or after the previous draft when `chain`); see rocm::DraftRequest.
+  [[nodiscard]] bool Draft(std::int32_t token, bool chain,
+                           std::span<float> logits, std::int32_t* argmax,
+                           std::string* error_msg = nullptr);
+  /// Test hook: draft block alone on a host hidden row at an explicit MTP
+  /// position (no trunk state needed; writes MTP cache row `position`).
+  [[nodiscard]] bool DraftWithHidden(
+      std::int32_t token, std::span<const float> h, std::uint32_t position,
+      std::span<float> logits, std::span<float> h_next, std::int32_t* argmax,
+      std::string* error_msg = nullptr);
+  [[nodiscard]] bool ReadMtpCache(std::uint32_t rows,
+                                  std::vector<std::uint16_t>* out,
+                                  std::string* error_msg = nullptr) const;
+  /// Output-normed trunk hidden carry (the MTP input of the next draft).
+  [[nodiscard]] bool ReadMtpHidden(std::vector<float>* out,
+                                   std::string* error_msg = nullptr) const;
 
   /// Complete, self-contained copy of the context at Position(): KDA state,
   /// conv windows, the MLA latent rows [0, Position()), the tokens and the
@@ -319,6 +424,23 @@ private:
   std::vector<std::int32_t> tokens_;
   std::vector<float> logits_;
   bool valid_{true};
+  /// Set by Invalidate(): the device state still holds the old context.
+  bool reset_pending_{false};
+
+  // MTP.
+  struct PendingVerify {
+    bool active{false};
+    std::uint32_t first_pos{0};
+    std::uint32_t n{0};
+    bool have_rows{false};
+  };
+  PendingVerify pending_;
+  std::vector<float> verify_rows_;
+  std::vector<float> draft_logits_;
+  std::uint32_t draft_position_{0};
+  MtpLengthController draft_length_;
+  DraftStats stats_;
+  DraftHooks hooks_;
 };
 
 /// Immutable host-held snapshot payload of one session (snapshot_format.hpp).
