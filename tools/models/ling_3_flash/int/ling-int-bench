@@ -32,7 +32,28 @@ Stages (each prints one JSON line {"stage": NAME, ...} when it finishes):
             of one layer, n 9/16/64/128/512 at depth 0/16384/65536, ms and
             output digests, which must match) alternately, two passes each,
             and `ling_3_flash_dense_ops_test --bench` (every GEMM tile shape and
-            the dispatch's choice, n 16..2048). ~3 min.
+            the dispatch's choice, n 16..2048), and the routed-expert decode
+            GEMVs: ling-moe-decode-bench-{parent,candidate} (gate/up and down
+            of one MoE layer over full 512-expert tensors, IQ4_XS/Q4_K and
+            Q5_K/Q6_K, 1..8 tokens with the measured expert unions, graph
+            replay, GB/s and output digests, which must match), alternately,
+            two passes each, plus any ling-moe-decode-bench-var-* variants
+            (experiment builds; digests must match too). ~10 min.
+  decode_ab  decode throughput, parent (/opt/gufo/base/gufo-parent) against this build:
+            gufo bench -n 128 -d 0,16384,65536 -r 3 --text-file CORPUS with
+            --speculative off and with --speculative mtp, alternating parent,
+            candidate, parent, candidate per mode (one {"stage": "decode_ab-run"}
+            line per run), then one --op-profile MTP run of each binary at depth 0
+            and 65,536 (the mtp_profile records: AR graph/eager, draft, verify
+            widths 2..8 with per-op device ms). Summary: per (mode, depth) t/s
+            means, candidate/parent ratio, each binary's MTP acceptance (equal
+            when the decode bits are equal), and the per-op ms of both binaries
+            side by side for AR, draft and verify widths 2..4. ~75 min.
+  digest_ab  bit identity of the decode family, parent against this build:
+            ling_3_flash_decode_digest (prefill, token-by-token decode, chunks
+            2..8, rollback, reset, profiled steps) on the full model with and
+            without --mtp; the candidate also runs --graph-compare (graph replay
+            == eager). Every digest line must be equal. ~30 min.
   mtp_profile  MTP decode-cycle profile on the full model at depth 0 and 65,536:
             gufo bench -n 64 -d 0,65536 -r 2 --speculative mtp --op-profile
             --text-file CORPUS -o jsonl. Its "mtp_profile" records: AR one-token
@@ -194,7 +215,7 @@ def stage_env(a):
                                                "ROCR_VISIBLE_DEVICES") if k in os.environ}}
 
 
-PEAK_LINE = re.compile(r"^\s*(?P<name>.+?)\s{2,}(?P<value>[\d.]+)\s+(?P<unit>TOPS|TFLOPS|GB/s)\b")
+PEAK_LINE = re.compile(r"^\s*(?P<name>.+?)\s{2,}(?P<value>[\d.]+)\s+(?P<unit>TOPS|TFLOPS|GB/s|us)\b")
 
 
 def stage_peak(a):
@@ -207,7 +228,8 @@ def stage_peak(a):
         mt = PEAK_LINE.match(line)
         if mt:
             rows.append({"section": section, "name": mt["name"].strip(), "value": float(mt["value"]),
-                         "unit": mt["unit"], "verified": "checksums verified" in line})
+                         "unit": mt["unit"], "verified": "checksums verified" in line
+                         or mt["unit"] == "us"})
     return {"exit": code, "seconds": secs, "rows": rows, "raw": out[-6000:], "stderr_tail": err[-1500:]}
 
 
@@ -338,6 +360,9 @@ def stage_kernels_ab(a):
                                    "digests_identical": same}
         if not same:
             codes.append(1)
+    moe = moe_decode_ab()
+    out.update(moe)
+    codes.append(moe["moe_exit"])
     if os.path.exists(DENSE_TEST):
         code, stdout, err, secs = run([DENSE_TEST, "--bench"], 1800)
         codes.append(code)
@@ -349,6 +374,204 @@ def stage_kernels_ab(a):
         out["gemm_seconds"] = secs
     out["exit"] = 0 if all(c == 0 for c in codes) else 1
     return out
+
+
+MOE_BENCH = "/usr/local/bin/ling-moe-decode-bench-"
+
+
+def moe_decode_ab():
+    """Routed-expert decode GEMV microbenchmark: parent, candidate and any
+    experiment variants, alternating, two passes each; digests must agree."""
+    labels = ["parent", "candidate"] + sorted(
+        os.path.basename(p)[len("ling-moe-decode-bench-"):]
+        for p in glob.glob(MOE_BENCH + "var-*"))
+    runs, gbps, digests, codes = [], {}, {}, []
+    for pass_no in (1, 2):
+        for label in labels:
+            path = MOE_BENCH + label
+            if not os.path.exists(path):
+                runs.append({"binary": label, "error": "missing " + path})
+                codes.append(1)
+                continue
+            code, stdout, err, secs = run([path, "--reps", "15", "--calls", "64"], 1800)
+            codes.append(code)
+            rows = []
+            for line in stdout.splitlines():
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    pass
+            runs.append({"binary": label, "pass": pass_no, "exit": code, "seconds": secs,
+                         "rows": rows, "stderr_tail": err[-1500:]})
+            for r in rows:
+                if "types" not in r:
+                    continue
+                key = "%s n=%d" % (r["types"], r["n"])
+                digests.setdefault(key, set()).add((r["digest_act"], r["digest_out"]))
+                g = gbps.setdefault(key, {}).setdefault(label, {"gate_up": [], "down": [], "pair": []})
+                g["gate_up"].append(r["gate_up_gbps"])
+                g["down"].append(r["down_gbps"])
+                g["pair"].append(r["pair_gbps"])
+    summary = {}
+    for key, by in gbps.items():
+        row = {"digests_identical": len(digests[key]) == 1}
+        if not row["digests_identical"]:
+            codes.append(1)
+        for label, g in by.items():
+            row[label] = {k: round(max(v), 1) for k, v in g.items() if v}
+        p, c = by.get("parent"), by.get("candidate")
+        if p and c:
+            row["candidate_over_parent"] = {k: round(max(c[k]) / max(p[k]), 3)
+                                            for k in ("gate_up", "down", "pair")}
+        summary[key] = row
+    return {"moe_decode": runs, "moe_decode_summary": summary,
+            "moe_exit": 0 if all(c == 0 for c in codes) else 1,
+            "moe_note": "GB/s = distinct experts' weight bytes / median device ms per call "
+                        "(best of two passes); bit identity: one digest pair per key"}
+
+
+def bench_records(out):
+    records = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                records.append(json.loads(line))
+            except ValueError:
+                records.append({"record": "unparsed", "text": line[:300]})
+    return records
+
+
+DECODE_AB_DEPTHS = "0,16384,65536"
+
+
+def stage_decode_ab(a):
+    """Decode t/s of the parent and this build (MTP off and on), alternating,
+    then one op-profiled MTP run of each."""
+    if not os.path.exists(PARENT_GUFO):
+        return {"error": "no parent build at " + PARENT_GUFO, "exit": 1}
+    corpus = fit_corpus()
+    binaries = {"parent": PARENT_GUFO, "candidate": GUFO}
+    runs, tps, accept = [], {}, {}
+    for mode in ("off", "mtp"):
+        for pass_no in (1, 2):
+            for label in ("parent", "candidate"):
+                cmd = [binaries[label], "bench", "-m", a.model, "-n", "128",
+                       "-d", DECODE_AB_DEPTHS, "-r", str(a.repetitions), "--speculative", mode,
+                       "--text-file", corpus, "-o", "jsonl"]
+                code, out, err, secs = run(cmd, a.bench_timeout)
+                records = bench_records(out)
+                emit({"stage": "decode_ab-run", "binary": label, "mode": mode, "pass": pass_no,
+                      "command": cmd, "exit": code, "seconds": secs, "records": records,
+                      "stderr_tail": err[-2000:]})
+                runs.append({"binary": label, "mode": mode, "pass": pass_no, "exit": code,
+                             "seconds": secs})
+                for r in records:
+                    if r.get("record") == "result" and r.get("n_gen"):
+                        key = "%s tg128@d%d" % (mode, r["n_depth"])
+                        tps.setdefault(key, {}).setdefault(label, []).extend(r.get("samples_ts", []))
+                    elif r.get("record") == "mtp":
+                        key = "mtp@d%d" % r["n_depth"]
+                        accept.setdefault(key, {}).setdefault(label, []).append(
+                            {k: r.get(k) for k in ("acceptance", "tokens_per_verified_cycle",
+                                                   "drafted", "accepted")})
+    mean = lambda v: round(sum(v) / len(v), 3) if v else None
+    summary = {}
+    for key, by in tps.items():
+        p, c = mean(by.get("parent", [])), mean(by.get("candidate", []))
+        summary[key] = {"parent_ts": p, "candidate_ts": c,
+                        "ratio": round(c / p, 4) if p and c else None,
+                        "parent_samples_ts": by.get("parent", []),
+                        "candidate_samples_ts": by.get("candidate", [])}
+    # Per-op device times of both binaries (eager, event-bracketed).
+    ops = {}
+    for label in ("parent", "candidate"):
+        cmd = [binaries[label], "bench", "-m", a.model, "-n", "64", "-d", "0,65536", "-r", "2",
+               "--speculative", "mtp", "--op-profile", "--text-file", corpus, "-o", "jsonl"]
+        code, out, err, secs = run(cmd, a.bench_timeout)
+        records = bench_records(out)
+        emit({"stage": "decode_ab-profile", "binary": label, "command": cmd, "exit": code,
+              "seconds": secs, "records": records, "stderr_tail": err[-2000:]})
+        runs.append({"binary": label, "mode": "mtp --op-profile", "pass": 1, "exit": code,
+                     "seconds": secs})
+        for r in records:
+            if r.get("record") != "mtp_profile" or "ops" not in r:
+                continue
+            if r["part"] == "verify" and r.get("width", 0) > 4:
+                continue
+            step = "%s%s@d%d" % (r["part"], "" if r.get("width") is None else "_w%d" % r["width"],
+                                 r["n_depth"])
+            ent = ops.setdefault(step, {})
+            ent.setdefault("ms_per_step", {})[label] = r.get("ms_per_step")
+            if r["part"] == "ar":
+                ent.setdefault("graph_device_ms", {})[label] = r["graph"]["device_ms"]
+            elif "launch" in r:
+                ent.setdefault("device_ms", {})[label] = r["launch"]["device_ms"]
+            for op in r["ops"]:
+                ent.setdefault("ops", {}).setdefault(op["name"], {})[label] = op["ms"]
+    codes = [r["exit"] for r in runs]
+    return {"exit": 0 if all(c == 0 for c in codes) else 1, "runs": runs, "summary": summary,
+            "mtp_acceptance": accept, "op_ms": ops, "corpus": corpus,
+            "note": "ratio = candidate / parent mean t/s over both passes; per request and "
+                    "depth, never averaged across depths; op_ms from one eager "
+                    "--op-profile run per binary (verify shared-expert ops are serial "
+                    "when profiled)"}
+
+
+DIGEST_TEST = "/opt/gufo/tests/ling_3_flash_decode_digest"
+PARENT_DIGEST_TEST = "/opt/gufo/base/ling_3_flash_decode_digest"
+
+
+def digest_report(out):
+    """The decode_digest JSON line: {"test", "pass", "digests": [...], ...}."""
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                pass
+    return {}
+
+
+def stage_digest_ab(a):
+    """decode_digest of the parent and this build must print the same lines."""
+    if not os.path.exists(PARENT_DIGEST_TEST):
+        return {"error": "no parent decode_digest at " + PARENT_DIGEST_TEST, "exit": 1}
+    cases = {"standard": ["--max-context", "1200", "--prompt-tokens", "700",
+                          "--decode-tokens", "6"],
+             "mtp": ["--mtp", "--max-context", "1200", "--prompt-tokens", "700",
+                     "--decode-tokens", "6"]}
+    results, codes = {}, []
+    for name, args in cases.items():
+        lines = {}
+        entry = {}
+        for label, path, extra in (("parent", PARENT_DIGEST_TEST, []),
+                                   ("candidate", DIGEST_TEST, ["--graph-compare"])):
+            cmd = [path, "--model", a.model, *args, *extra]
+            code, out, err, secs = run(cmd, 3000)
+            codes.append(code)
+            rep = digest_report(out)
+            lines[label] = rep.get("digests") or []
+            if rep.get("pass") is not True:
+                codes.append(1)
+            entry[label] = {"command": cmd, "exit": code, "seconds": secs,
+                            "pass": rep.get("pass"), "digest_lines": len(lines[label]),
+                            "graph_vs_eager_differ": rep.get("graph_vs_eager_differ"),
+                            "graph_replays": rep.get("graph_replays"),
+                            "stdout_tail": out[-3000:], "stderr_tail": err[-1500:]}
+        diff = [{"parent": p, "candidate": c}
+                for p, c in zip(lines["parent"], lines["candidate"]) if p != c]
+        same = (bool(lines["parent"]) and len(lines["parent"]) == len(lines["candidate"])
+                and not diff)
+        entry["identical"] = same
+        entry["first_differences"] = diff[:8]
+        if not same:
+            codes.append(1)
+        results[name] = entry
+    return {"exit": 0 if all(c == 0 for c in codes) else 1, "cases": results,
+            "note": "identical = every digest line (logits FNV-1a and device argmax per step) "
+                    "of the parent equals the candidate's"}
 
 
 def peak_dram_read():
@@ -726,6 +949,7 @@ STAGES = {"env": stage_env, "peak": stage_peak, "bench": stage_bench, "small": s
           "maxbatch": stage_maxbatch, "long": stage_long, "long24": stage_long24,
           "profile": stage_profile, "fit": stage_fit, "small_ab": stage_small_ab,
           "kernels_ab": stage_kernels_ab, "mtp_profile": stage_mtp_profile,
+          "decode_ab": stage_decode_ab, "digest_ab": stage_digest_ab,
           "mtp_head_ab": stage_mtp_head_ab}
 
 

@@ -15,6 +15,12 @@ COPY tests/ /opt/gufo/tests/
 COPY suites/ /opt/gufo/suites/
 COPY oracle/ /opt/gufo/oracle/
 COPY oracle-novel/ /opt/gufo/oracle-novel/
+COPY floor/ /opt/gufo/floor/
+COPY adjudicated/ /opt/gufo/adjudicated/
+COPY fixtures/ /opt/gufo/fixtures/
+COPY bin/ /usr/local/bin/
+COPY corpus/ /opt/gufo/corpus/
+COPY compare_routing.py /opt/gufo/compare_routing.py
 COPY functional/ /opt/gufo/tests/functional/
 COPY flake.lock /opt/gufo/flake.lock
 COPY gufo gfx1151_peak ling-int-suite ling-int-bench ling-serve-suite ling-cache-suite ling-token26 \

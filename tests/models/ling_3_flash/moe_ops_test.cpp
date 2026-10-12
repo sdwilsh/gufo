@@ -575,6 +575,105 @@ std::uint64_t Fnv(const void* p, std::size_t bytes) {
   return h;
 }
 
+// ---- decode / routing: golden digests of the parent kernels (bit-exact) ---
+/// Checks `key`'s digests against parent_digests::kDecode; a key without a
+/// golden fails too, so a new case must be added on purpose.
+void CheckDecodeGolden(const std::string& key, std::uint64_t a,
+                       std::uint64_t b) {
+  std::printf("DIGEST %s %016llx %016llx\n", key.c_str(),
+              static_cast<unsigned long long>(a),
+              static_cast<unsigned long long>(b));
+  bool found = false, ok = false;
+  for (const auto& g : parent_digests::kDecode)
+    if (key == g.key) {
+      found = true;
+      ok = g.a == a && g.b == b;
+    }
+  std::printf("%-52s %s\n", (key + " == parent digest").c_str(),
+              ok ? "PASS" : (found ? "FAIL" : "FAIL (no golden)"));
+  if (!ok)
+    ++g_failures;
+}
+
+/// Decode gate/up + down (the per-expert GEMVs of 1..8 tokens): the bits of
+/// every output equal the parent kernels' (memory access and launch structure
+/// may change, the arithmetic may not).
+void TestDecodeDigest(Setup& s, int n, int pool, int mode, float limit,
+                      hipStream_t st, const std::string& label) {
+  Rng rng(8000 + n * 5 + pool + mode);
+  const auto ids = MakeIds(n, pool, mode, rng);
+  std::vector<float> x(static_cast<std::size_t>(n) * kHidden);
+  for (auto& v : x)
+    v = rng.Normal();
+  std::vector<float> act_in(static_cast<std::size_t>(n) * kUsed * kFf);
+  for (auto& v : act_in)
+    v = rng.Normal();
+  Dev<float> dx(x), dact_in(act_in);
+  Dev<std::int32_t> dids(ids);
+  Dev<float> dact(act_in.size()),
+      dout(static_cast<std::size_t>(n) * kUsed * kHidden);
+  Dev<std::uint8_t> scratch(rocm::moe::DecodeScratchBytes());
+  rocm::moe::ExpertGateUpDecode(s.dgate.get(), s.dup.get(), s.gate.type,
+                                dx.get(), dids.get(), n, limit, dact.get(),
+                                scratch.get(), st);
+  rocm::moe::ExpertDownDecode(s.ddown.get(), s.down.type, dact_in.get(),
+                              dids.get(), n, dout.get(), scratch.get(), st);
+  CheckHip(hipStreamSynchronize(st), "decode digest sync");
+  const auto act = dact.Read();
+  const auto out = dout.Read();
+  CheckDecodeGolden(
+      "decode " + label + " " + Name(s.gate.type) + "/" + Name(s.down.type) +
+          " n=" + std::to_string(n) + (mode == 1 ? " same-ids" : "") +
+          " L=" + std::to_string(static_cast<int>(limit)),
+      Fnv(act.data(), act.size() * 4), Fnv(out.data(), out.size() * 4));
+}
+
+/// RouteDecode (ids, weights and the expert plan it leaves in scratch) and
+/// Route: the bits equal the parent kernel's, ties included.
+void TestRouteDigest(int n, hipStream_t st) {
+  Rng rng(9500 + n);
+  std::vector<float> lg(static_cast<std::size_t>(n) * 512), bias(512);
+  for (auto& v : bias)
+    v = 0.05F * rng.Normal();
+  for (int t = 0; t < n; ++t)
+    for (int i = 0; i < 512; ++i)
+      lg[static_cast<std::size_t>(t) * 512 + i] =
+          t % 3 == 1 ? static_cast<float>(static_cast<int>(rng.Next() % 3) - 1)
+                     : 2.0F * rng.Normal();
+  Dev<float> dl(lg), db(bias), dw(static_cast<std::size_t>(n) * 8);
+  Dev<std::int32_t> di(static_cast<std::size_t>(n) * 8);
+  if (n <= 8) {
+    Dev<std::uint8_t> scratch(rocm::moe::DecodeScratchBytes());
+    Dev<std::uint32_t> counter(std::vector<std::uint32_t>{0});
+    CheckHip(hipMemset(scratch.get(), 0, rocm::moe::DecodeScratchBytes()),
+             "memset");
+    rocm::moe::RouteDecode(dl.get(), db.get(), di.get(), dw.get(), n,
+                           scratch.get(), counter.get(), st);
+    CheckHip(hipStreamSynchronize(st), "route digest sync");
+    const auto ids = di.Read();
+    const auto w = dw.Read();
+    const auto plan = scratch.Read();
+    std::int32_t count = 0;
+    std::memcpy(&count, plan.data(), 4);
+    // Header word, then the live 40-byte entries (expert, count, pairs).
+    const std::uint64_t dp =
+        Fnv(plan.data() + 16,
+            static_cast<std::size_t>(std::clamp(count, 0, 64)) * 40) ^
+        static_cast<std::uint64_t>(count);
+    CheckDecodeGolden("route-decode n=" + std::to_string(n),
+                      Fnv(ids.data(), ids.size() * 4) ^ dp,
+                      Fnv(w.data(), w.size() * 4));
+  } else {
+    rocm::moe::Route(dl.get(), db.get(), di.get(), dw.get(), n, st);
+    CheckHip(hipStreamSynchronize(st), "route digest sync");
+    const auto ids = di.Read();
+    const auto w = dw.Read();
+    CheckDecodeGolden("route n=" + std::to_string(n),
+                      Fnv(ids.data(), ids.size() * 4),
+                      Fnv(w.data(), w.size() * 4));
+  }
+}
+
 /// Runs gate/up + down over `n` tokens in one call (default dispatch), then
 /// again with every token tile variant, then as several chunks of the same
 /// tokens. Every run must match the first one bit for bit, because an output
@@ -788,6 +887,8 @@ int main(int argc, char** argv) {
     if (!quick) {
       for (int n : {1, 2, 8, 64, 513})
         TestRoute(n, st);
+      for (int n : {1, 2, 3, 5, 8, 513})
+        TestRouteDigest(n, st);
       for (int n : {1, 8, 64})
         TestCombine(n, st);
     }
@@ -808,6 +909,9 @@ int main(int argc, char** argv) {
         }
         TestExperts(s, 8, 16, 1, limit, true, 8, st,
                     "decode n=8 same-ids L=" + std::to_string(int(limit)));
+        for (int n : {1, 2, 3, 5, 8})
+          TestDecodeDigest(s, n, 16, 0, limit, st, "pool16");
+        TestDecodeDigest(s, 8, 16, 1, limit, st, "pool16");
         for (int n : {1, 2, 8, 64, 513}) {
           TestExperts(s, n, 16, 0, limit, false, n > 64 ? 24 : 64, st,
                       "prefill n=" + std::to_string(n) +
@@ -826,6 +930,8 @@ int main(int argc, char** argv) {
       if (!quick) {
         TestExperts(s, 8, kExperts, 0, 4.0F, true, 3, st,
                     "real-shape 512x768x2560 decode n=8 L=4");
+        for (int n : {1, 2, 8})
+          TestDecodeDigest(s, n, kExperts, 0, 4.0F, st, "real-shape");
         TestExperts(s, 64, kExperts, 0, 4.0F, false, 3, st,
                     "real-shape 512x768x2560 prefill n=64 L=4");
       }
@@ -835,6 +941,10 @@ int main(int argc, char** argv) {
     {
       // Real shapes for the second expert type pair (layers 2, 3, 39-41).
       Setup s(WeightType::kQ5_K, WeightType::kQ6_K, kExperts, 78, 0.06F);
+      if (!quick) {
+        for (int n : {1, 2, 8})
+          TestDecodeDigest(s, n, kExperts, 0, 4.0F, st, "real-shape");
+      }
       for (int n : {9, 64, 512, 2048})
         TestPrefillInvariance(s, n, kExperts, 4.0F, st, "real-shape");
     }

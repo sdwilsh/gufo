@@ -741,33 +741,51 @@ void TestFusedDecode() {
   const auto ssm_a = Randn(rng, kH, 0.5F, -1.0F);
   const auto dt = Randn(rng, kInner, 1.0F);
   Dev<float> da(ssm_a), ddt(dt);
-  for (int round = 0; round < 3; ++round) {
-    const auto proj = Randn(rng, kProj, round == 2 ? 6.0F : 1.5F);
-    const auto state0 = Randn(rng, l::kKdaConvStateFloats, 1.0F);
-    Dev<float> dp(proj);
-    // Reference: Conv3Decode, GateBetaPrep, L2NormHeads on q and k.
-    Dev<float> s_ref(state0), conv_ref(kCh), g_ref(kInner), b_ref(kH);
-    k::Conv3Decode(dp.get(), dwq.get(), dwk.get(), dwv.get(), s_ref.get(),
-                   conv_ref.get(), nullptr);
-    k::GateBetaPrep(dp.get(), da.get(), ddt.get(), g_ref.get(), b_ref.get(), 1,
-                    nullptr);
-    k::L2NormHeads(conv_ref.get(), kCh, 1, nullptr);
-    k::L2NormHeads(conv_ref.get() + kInner, kCh, 1, nullptr);
-    // Fused.
-    Dev<float> s_new(state0), conv_new(kCh), g_new(kInner), b_new(kH);
-    k::PrepDecode(dp.get(), dwq.get(), dwk.get(), dwv.get(), s_new.get(),
-                  da.get(), ddt.get(), conv_new.get(), g_new.get(), b_new.get(),
-                  nullptr);
-    Check(hipDeviceSynchronize(), "sync");
-    const std::string r = " round " + std::to_string(round);
-    ExactVerdict(SameBits(conv_ref.Get(), conv_new.Get()),
-                 "PrepDecode conv/q/k/v == separate" + r);
-    ExactVerdict(SameBits(s_ref.Get(), s_new.Get()),
-                 "PrepDecode conv state == separate" + r);
-    ExactVerdict(SameBits(g_ref.Get(), g_new.Get()),
-                 "PrepDecode gate == separate" + r);
-    ExactVerdict(SameBits(b_ref.Get(), b_new.Get()),
-                 "PrepDecode beta == separate" + r);
+  // Every decode-family chunk size, with and without the rollback windows of
+  // a verify chunk; round 2 uses large (saturating) projections.
+  const std::size_t cf = l::kKdaConvStateFloats;
+  for (const std::uint32_t n : {1U, 2U, 3U, 5U, 8U}) {
+    for (int round = 0; round < 3; ++round) {
+      const bool ckpt = round == 1 && n > 1;
+      const auto proj =
+          Randn(rng, std::size_t{n} * kProj, round == 2 ? 6.0F : 1.5F);
+      const auto state0 = Randn(rng, cf, 1.0F);
+      Dev<float> dp(proj);
+      // Reference: Conv3Checkpoint, Conv3Prefill, GateBetaPrep, L2NormHeads.
+      Dev<float> s_ref(state0), conv_ref(std::size_t{n} * kCh),
+          g_ref(std::size_t{n} * kInner), b_ref(std::size_t{n} * kH),
+          ck_ref(cf * 8);
+      Dev<float> s_new(state0), conv_new(std::size_t{n} * kCh),
+          g_new(std::size_t{n} * kInner), b_new(std::size_t{n} * kH),
+          ck_new(cf * 8);
+      Check(hipMemset(ck_ref.get(), 0, cf * 8 * sizeof(float)), "memset");
+      Check(hipMemset(ck_new.get(), 0, cf * 8 * sizeof(float)), "memset");
+      if (ckpt)
+        k::Conv3Checkpoint(dp.get(), s_ref.get(), ck_ref.get(), cf, n, nullptr);
+      k::Conv3Prefill(dp.get(), dwq.get(), dwk.get(), dwv.get(), s_ref.get(),
+                      conv_ref.get(), n, nullptr);
+      k::GateBetaPrep(dp.get(), da.get(), ddt.get(), g_ref.get(), b_ref.get(),
+                      n, nullptr);
+      k::L2NormHeads(conv_ref.get(), kCh, n, nullptr);
+      k::L2NormHeads(conv_ref.get() + kInner, kCh, n, nullptr);
+      k::PrepDecode(dp.get(), dwq.get(), dwk.get(), dwv.get(), s_new.get(),
+                    da.get(), ddt.get(), conv_new.get(), g_new.get(),
+                    b_new.get(), n, ckpt ? ck_new.get() : nullptr, cf, nullptr);
+      Check(hipDeviceSynchronize(), "sync");
+      const std::string r = " n=" + std::to_string(n) + " round " +
+                            std::to_string(round) + (ckpt ? " +ckpt" : "");
+      ExactVerdict(SameBits(conv_ref.Get(), conv_new.Get()),
+                   "PrepDecode conv/q/k/v == separate" + r);
+      ExactVerdict(SameBits(s_ref.Get(), s_new.Get()),
+                   "PrepDecode conv state == separate" + r);
+      ExactVerdict(SameBits(g_ref.Get(), g_new.Get()),
+                   "PrepDecode gate == separate" + r);
+      ExactVerdict(SameBits(b_ref.Get(), b_new.Get()),
+                   "PrepDecode beta == separate" + r);
+      if (ckpt)
+        ExactVerdict(SameBits(ck_ref.Get(), ck_new.Get()),
+                     "PrepDecode rollback windows == Conv3Checkpoint" + r);
+    }
   }
   // OutputNormGateQuant == OutputNormGate + QuantizeActivations.
   const auto gamma = Randn(rng, kD, 0.4F, 1.0F);
