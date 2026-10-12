@@ -109,11 +109,13 @@
 /// position alone. The restored state is bit-identical to feeding the kept rows
 /// alone (they use the same arithmetic), which the rollback tests check.
 ///
-/// Memory: 0.5 GiB shared checkpoint scratch, per session 1152 bytes per
-/// context token (the MTP latent cache, 75 MiB at 64k) plus 10 KiB, and the
-/// block-42 weights (about 1.2 GiB: Q8_0 MLA/shared/eh_proj, IQ4_XS/Q4_K
-/// experts) plus the 0.40 GiB Q8_0 draft head. Snapshots carry the MTP rows and
-/// hidden carry so restored sessions keep drafting.
+/// Memory: 0.5 GiB shared checkpoint scratch. Per session, 1152 bytes per
+/// context token (the MTP latent cache, 75 MiB at 64k) plus 10 KiB. The
+/// block-42 weights are the experts (1.52 GiB with the original IQ4_XS/Q4_K
+/// quant, 1.58 GiB with AD-Q4_K_S's Q4_K, and 1.93 GiB with AD-Q5_K_M's Q5_K)
+/// plus 0.05 GiB of Q8_0 MLA/shared/eh_proj tensors. The Q8_0 draft head adds
+/// 0.40 GiB. Snapshots carry the MTP rows and the hidden carry so restored
+/// sessions keep drafting.
 ///
 /// Wiring. The block lives in the main GGUF, so `--speculative mtp` needs no
 /// `--mtp-model` for Ling (the option is refused for this architecture): the

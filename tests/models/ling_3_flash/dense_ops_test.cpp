@@ -733,6 +733,38 @@ void TestEmbed() {
         ref.size(), 1e-6);
 }
 
+// ---- Q8_0 embedding (AD-Q4_K_S / AD-Q5_K_M token_embd)
+void TestEmbedQ8_0() {
+  constexpr std::uint32_t vocab = 157184, hidden = 2560;
+  constexpr std::size_t row_bytes = hidden / 32 * 34;
+  std::vector<std::uint8_t> table(std::size_t{vocab} * row_bytes);
+  {
+    std::uniform_int_distribution<int> bd(0, 255);
+    std::uniform_real_distribution<float> dd(0.0001F, 0.01F);
+    for (auto& b : table)
+      b = static_cast<std::uint8_t>(bd(g_rng));
+    for (std::size_t blk = 0; blk < table.size() / 34; ++blk) {
+      const std::uint16_t d = HalfBits(dd(g_rng));
+      std::memcpy(&table[blk * 34], &d, 2);
+    }
+  }
+  const std::vector<std::int32_t> tokens = {0,     1,     157183, 12345,
+                                            99999, 12345, 777,    156000};
+  Dev<std::uint8_t> dt(table);
+  Dev<std::int32_t> dtok(tokens);
+  Dev<float> dout(tokens.size() * hidden);
+  dn::Embed(WeightType::kQ8_0, dt.p, dtok.p, dout.p,
+            static_cast<std::uint32_t>(tokens.size()), hidden, nullptr);
+  HIP_OK(hipDeviceSynchronize());
+  std::vector<float> ref(tokens.size() * hidden);
+  for (std::size_t t = 0; t < tokens.size(); ++t)
+    gufo::quant::DequantizeQ8_0(
+        table.data() + std::size_t(tokens[t]) * row_bytes,
+        ref.data() + t * hidden, hidden);
+  Check("EmbedQ8_0 vocab=157184 hidden=2560 n=8", dout.Get(), ref.data(),
+        ref.size(), 0.0);
+}
+
 // ---- Norm / residual / SwiGLU ----------------------------------------------
 void TestRmsNorm(std::uint32_t n_rows, std::uint32_t dim, std::uint32_t groups,
                  bool gamma, bool in_place) {
@@ -1035,6 +1067,7 @@ int main(int argc, char** argv) {
   TestQuantizeF16ToQ8(157184, 2560);
   TestQuantizeF16ToQ8(33, 2560);
   TestEmbed();
+  TestEmbedQ8_0();
   TestRmsNorm(5, 2560, 1, true, false);
   TestRmsNorm(3, 2560, 1, false, true);
   TestRmsNorm(7, 4096, 32, true, false);     // per-head norm, d = 128

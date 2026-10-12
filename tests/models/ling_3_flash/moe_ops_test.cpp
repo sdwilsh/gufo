@@ -628,6 +628,65 @@ void TestDecodeDigest(Setup& s, int n, int pool, int mode, float limit,
       Fnv(act.data(), act.size() * 4), Fnv(out.data(), out.size() * 4));
 }
 
+/// Decode lane-alone vs batch: each token run alone (n = 1) gives the same
+/// bits as its rows of one n = 8 batch (the verify batch of MTP, and the
+/// batching of concurrent sessions, rely on it).
+void TestDecodeLaneIdentity(Setup& s, int pool, float limit, hipStream_t st,
+                            const std::string& label) {
+  constexpr int kN = 8;
+  Rng rng(8800 + pool);
+  const auto ids = MakeIds(kN, pool, 0, rng);
+  std::vector<float> x(static_cast<std::size_t>(kN) * kHidden);
+  for (auto& v : x)
+    v = rng.Normal();
+  std::vector<float> act_in(static_cast<std::size_t>(kN) * kUsed * kFf);
+  for (auto& v : act_in)
+    v = rng.Normal();
+  Dev<std::uint8_t> scratch(rocm::moe::DecodeScratchBytes());
+  const auto run = [&](int first, int n, std::vector<float>& act,
+                       std::vector<float>& out) {
+    const std::vector<float> xs(x.begin() + std::size_t{first} * kHidden,
+                                x.begin() + std::size_t{first + n} * kHidden);
+    const std::vector<float> as(
+        act_in.begin() + std::size_t{first} * kUsed * kFf,
+        act_in.begin() + std::size_t{first + n} * kUsed * kFf);
+    const std::vector<std::int32_t> is(
+        ids.begin() + std::size_t{first} * kUsed,
+        ids.begin() + std::size_t{first + n} * kUsed);
+    Dev<float> dx(xs), dact_in(as);
+    Dev<std::int32_t> dids(is);
+    Dev<float> dact(as.size()),
+        dout(static_cast<std::size_t>(n) * kUsed * kHidden);
+    rocm::moe::ExpertGateUpDecode(s.dgate.get(), s.dup.get(), s.gate.type,
+                                  dx.get(), dids.get(), n, limit, dact.get(),
+                                  scratch.get(), st);
+    rocm::moe::ExpertDownDecode(s.ddown.get(), s.down.type, dact_in.get(),
+                                dids.get(), n, dout.get(), scratch.get(), st);
+    CheckHip(hipStreamSynchronize(st), "lane identity sync");
+    act = dact.Read();
+    out = dout.Read();
+  };
+  std::vector<float> bact, bout;
+  run(0, kN, bact, bout);
+  bool ok = true;
+  for (int t = 0; t < kN; ++t) {
+    std::vector<float> lact, lout;
+    run(t, 1, lact, lout);
+    ok =
+        ok &&
+        std::memcmp(lact.data(), bact.data() + std::size_t{t} * kUsed * kFf,
+                    lact.size() * 4) == 0 &&
+        std::memcmp(lout.data(), bout.data() + std::size_t{t} * kUsed * kHidden,
+                    lout.size() * 4) == 0;
+  }
+  const std::string name = "decode lane-alone == n=8 batch " + label + " " +
+                           Name(s.gate.type) + "/" + Name(s.down.type) +
+                           " L=" + std::to_string(static_cast<int>(limit));
+  std::printf("%-52s %s\n", name.c_str(), ok ? "PASS" : "FAIL");
+  if (!ok)
+    ++g_failures;
+}
+
 /// RouteDecode (ids, weights and the expert plan it leaves in scratch) and
 /// Route: the bits equal the parent kernel's, ties included.
 void TestRouteDigest(int n, hipStream_t st) {
@@ -896,8 +955,14 @@ int main(int argc, char** argv) {
     struct Pair {
       WeightType gu, dn;
     };
+    // The first two are the original quant's pairs; the rest are the
+    // AD-Q4_K_S (Q4_K/Q4_K middle, Q5_K/Q5_K edge) and AD-Q5_K_M (Q5_K/Q5_K
+    // middle, Q6_K/Q6_K edge) pairs.
     for (const Pair pr : {Pair{WeightType::kIQ4_XS, WeightType::kQ4_K},
-                          Pair{WeightType::kQ5_K, WeightType::kQ6_K}}) {
+                          Pair{WeightType::kQ5_K, WeightType::kQ6_K},
+                          Pair{WeightType::kQ4_K, WeightType::kQ4_K},
+                          Pair{WeightType::kQ5_K, WeightType::kQ5_K},
+                          Pair{WeightType::kQ6_K, WeightType::kQ6_K}}) {
       Setup s(pr.gu, pr.dn, 16, 42, 0.06F);
       for (float limit : {0.0F, 4.0F}) {
         if (quick)
@@ -912,6 +977,7 @@ int main(int argc, char** argv) {
         for (int n : {1, 2, 3, 5, 8})
           TestDecodeDigest(s, n, 16, 0, limit, st, "pool16");
         TestDecodeDigest(s, 8, 16, 1, limit, st, "pool16");
+        TestDecodeLaneIdentity(s, 16, limit, st, "pool16");
         for (int n : {1, 2, 8, 64, 513}) {
           TestExperts(s, n, 16, 0, limit, false, n > 64 ? 24 : 64, st,
                       "prefill n=" + std::to_string(n) +
@@ -944,6 +1010,23 @@ int main(int argc, char** argv) {
       if (!quick) {
         for (int n : {1, 2, 8})
           TestDecodeDigest(s, n, kExperts, 0, 4.0F, st, "real-shape");
+      }
+      for (int n : {9, 64, 512, 2048})
+        TestPrefillInvariance(s, n, kExperts, 4.0F, st, "real-shape");
+    }
+    for (const Pair pr : {Pair{WeightType::kQ4_K, WeightType::kQ4_K},
+                          Pair{WeightType::kQ5_K, WeightType::kQ5_K},
+                          Pair{WeightType::kQ6_K, WeightType::kQ6_K}}) {
+      // Real shapes for the AD-Q4_K_S / AD-Q5_K_M expert type pairs.
+      Setup s(pr.gu, pr.dn, kExperts, 79, 0.06F);
+      if (!quick) {
+        TestExperts(s, 8, kExperts, 0, 4.0F, true, 3, st,
+                    "real-shape 512x768x2560 decode n=8 L=4");
+        for (int n : {1, 2, 8})
+          TestDecodeDigest(s, n, kExperts, 0, 4.0F, st, "real-shape");
+        TestDecodeLaneIdentity(s, kExperts, 4.0F, st, "real-shape");
+        TestExperts(s, 64, kExperts, 0, 4.0F, false, 3, st,
+                    "real-shape 512x768x2560 prefill n=64 L=4");
       }
       for (int n : {9, 64, 512, 2048})
         TestPrefillInvariance(s, n, kExperts, 4.0F, st, "real-shape");

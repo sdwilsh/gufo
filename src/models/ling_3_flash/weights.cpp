@@ -12,10 +12,10 @@ namespace {
 using core::GgmlType;
 
 /// The accepted routed expert formats, in one place (see weights.hpp).
-constexpr std::array<GgmlType, 2> kExpertGateUpTypes{GgmlType::kIQ4_XS,
-                                                     GgmlType::kQ5_K};
-constexpr std::array<GgmlType, 2> kExpertDownTypes{GgmlType::kQ4_K,
-                                                   GgmlType::kQ6_K};
+constexpr std::array<GgmlType, 4> kExpertGateUpTypes{
+    GgmlType::kIQ4_XS, GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K};
+constexpr std::array<GgmlType, 3> kExpertDownTypes{
+    GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K};
 
 struct Format {
   std::uint32_t block;
@@ -237,8 +237,8 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
   w.config = *config;
   const Config& c = w.config;
 
-  w.token_embd =
-      b.Get("token_embd.weight", kHidden, kVocab, 1, {GgmlType::kQ4_K});
+  w.token_embd = b.Get("token_embd.weight", kHidden, kVocab, 1,
+                       {GgmlType::kQ4_K, GgmlType::kQ8_0});
   w.output_norm = b.Get("output_norm.weight", kHidden, 1, 1, {GgmlType::kF32});
   w.output = b.Get("output.weight", kHidden, kVocab, 1, {GgmlType::kF16});
   w.layers.reserve(c.num_layers);
