@@ -35,4 +35,9 @@ if (ENGINE_ENABLE_HIP)
   # --- WS4c: MoE routing and routed-expert op tests ---
   add_ling_3_flash_test(moe_ops gufo_ling_3_flash "hip;gpu;gfx1151")
   # --- end WS4c ---
+  # --- WS4d dense kernel op tests ---
+  add_ling_3_flash_test(dense_ops gufo_ling_3_flash "hip;gpu;gfx1151")
+  set_tests_properties(ling_3_flash.dense_ops PROPERTIES
+    SKIP_RETURN_CODE 77 TIMEOUT 600)
+  # --- end WS4d ---
 endif()
