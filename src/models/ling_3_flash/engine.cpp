@@ -21,6 +21,11 @@
 namespace gufo::models::ling_3_flash {
 namespace {
 
+/// Most tokens one Feed chunk or decode cycle adds to the prompt-lookup index
+/// beyond what it appends itself (about 0.1 ms): a 64k-token restore catches
+/// up over a few cycles instead of stalling the first one.
+constexpr std::size_t kLookupIndexStep = 4096;
+
 void AssignError(std::string* error_msg, std::string_view message) {
   if (error_msg != nullptr) {
     *error_msg = message;
@@ -227,6 +232,7 @@ void Session::Reset() {
 
 void Session::Invalidate() noexcept {
   tokens_.clear();
+  lookup_.Clear();
   logits_.clear();
   pending_ = {};
   // Controller state (successes, retry backoff, measured costs) must not leak
@@ -460,6 +466,11 @@ bool Session::Feed(std::span<const std::int32_t> tokens,
       return false;
     }
     tokens_.insert(tokens_.end(), request.tokens.begin(), request.tokens.end());
+    if (model_->options_.mtp) {
+      // Index the prompt as it arrives, a bounded step per chunk (a restored
+      // prefix catches up over the next chunks and decode cycles).
+      lookup_.Extend(tokens_, n + kLookupIndexStep);
+    }
     if (want_from < n) {
       if (collect) {
         // Rows requested by the caller are the ones at or past logits_from.
@@ -646,6 +657,7 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
   }
   pending_ = {};
   tokens_ = std::move(tokens);
+  lookup_.Clear();
   logits_ = std::move(logits);
   valid_ = true;
   reset_pending_ = false;  // every recurrent state was overwritten
@@ -680,10 +692,65 @@ bool Session::MtpActive() const noexcept {
 
 void Session::ResetDraftPolicy() noexcept {
   draft_length_.Reset();
+  copy_length_.Reset();
 }
 
 void Session::SetMaxDrafts(std::uint32_t drafts) noexcept {
   draft_length_ = MtpLengthController(drafts);
+  copy_length_ = MtpLengthController::ForCopies(drafts);
+}
+
+bool Session::ProposeCopies(Cycle& c, std::uint32_t room) {
+  // The forced-draft test hooks decide the drafts themselves.
+  if (room == 0 || hooks_.no_lookup || hooks_.source ||
+      hooks_.fixed_drafts != 0) {
+    return false;
+  }
+  std::vector<std::int32_t> forced;
+  std::span<const std::int32_t> found;
+  if (hooks_.copy_source) {
+    forced = {c.anchor};
+    while (forced.size() <= room) {
+      const std::int32_t next = hooks_.copy_source(forced);
+      if (next < 0) {
+        break;
+      }
+      forced.push_back(next);
+    }
+    found = std::span(forced).subspan(1);
+  } else {
+    const std::size_t min_match = hooks_.lookup_min_match != 0
+                                      ? hooks_.lookup_min_match
+                                      : PromptLookup::kMinMatch;
+    if (lookup_.min_match() != std::max(min_match, PromptLookup::kKeyTokens)) {
+      lookup_ = PromptLookup(min_match);
+    }
+    // tokens_ is the committed run here (no verify pending): the context the
+    // cycle continues is tokens_ followed by the anchor.
+    lookup_.Extend(tokens_, kLookupIndexStep);
+    const auto match = lookup_.Find(tokens_, std::span(&c.anchor, 1));
+    if (match.length != 0) {
+      found = std::span<const std::int32_t>(tokens_).subspan(match.start);
+    }
+  }
+  if (found.empty()) {
+    return false;
+  }
+  const std::uint32_t copies = copy_length_.Choose(
+      static_cast<std::uint32_t>(std::min<std::size_t>(room, found.size())),
+      false, session_->position());
+  if (copies == 0) {
+    return false;  // copying is backing off after failed copies
+  }
+  c.chain.insert(c.chain.end(), found.begin(), found.begin() + copies);
+  c.copies = true;
+  if (c.sampled) {
+    for (const std::int32_t token : found.first(copies)) {
+      c.copy_proposals.push_back(
+          CopyProposal(static_cast<sampling::TokenId>(token)));
+    }
+  }
+  return true;
 }
 
 bool Session::Verify(std::span<const std::int32_t> tokens,
@@ -839,8 +906,17 @@ bool Session::DecodeStep(std::size_t max_tokens,
     result->stop = true;
     return true;
   }
+  // A cycle whose context continues an earlier passage copies it instead of
+  // running the drafter (prompt_lookup.hpp); the chain is [anchor, copies].
+  Cycle c;
+  c.anchor = anchor;
+  c.sampled = sampled;
+  c.greedy_fast = greedy_fast;
+  c.stop_at_eos = stop_at_eos;
+  c.chain = {anchor};
+  const bool copying = MtpActive() && cap > 1 && ProposeCopies(c, cap - 1);
   std::uint32_t drafts =
-      MtpActive() && cap > 1
+      MtpActive() && cap > 1 && !copying
           ? draft_length_.Choose(cap - 1, !sampled, session_->position())
           : 0;
   if (hooks_.fixed_drafts != 0 && cap > 1 && MtpActive()) {
@@ -851,7 +927,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
                std::chrono::steady_clock::now() - begin)
         .count();
   };
-  if (drafts == 0) {
+  if (drafts == 0 && !copying) {
     if (!Evaluate(anchor, error_msg)) {
       return false;
     }
@@ -859,6 +935,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
     result->tokens = {anchor};
     if (MtpActive()) {
       draft_length_.ObservePlainToken();
+      copy_length_.ObservePlainToken();
       if (!sampled) {
         draft_length_.ObserveCost(0, elapsed_ms());
       }
@@ -867,19 +944,13 @@ bool Session::DecodeStep(std::size_t max_tokens,
   }
 
   // Draft chain. A sampled proposal uses its own stream (MtpProposer).
-  Cycle c;
-  c.anchor = anchor;
-  c.sampled = sampled;
-  c.greedy_fast = greedy_fast;
-  c.stop_at_eos = stop_at_eos;
-  if (sampled) {
+  if (sampled && !copying) {
     c.proposer.emplace(sampler, static_cast<sampling::TokenId>(anchor));
   }
-  c.chain = {anchor};
-  if (sampled && draft_logits_.size() != kVocab) {
+  if (sampled && !copying && draft_logits_.size() != kVocab) {
     draft_logits_.resize(kVocab);
   }
-  for (std::uint32_t j = 0; j < drafts; ++j) {
+  for (std::uint32_t j = 0; j < drafts && !copying; ++j) {
     std::int32_t index = -1;
     if (hooks_.source && !sampled) {
       c.chain.push_back(hooks_.source(c.chain));
@@ -933,11 +1004,13 @@ bool Session::FinishCycle(Cycle& c, sampling::SamplerState& sampler,
       hooks_.after_verify();
     }
     if (sampled) {
-      const auto verified =
-          VerifySampledChain(row_logits, c.proposer->proposals(), sampler,
-                             [&](sampling::TokenId token) {
-                               return is_stop(static_cast<std::int32_t>(token));
-                             });
+      const std::span<const MtpProposal> proposals =
+          c.copies ? std::span<const MtpProposal>(c.copy_proposals)
+                   : c.proposer->proposals();
+      const auto verified = VerifySampledChain(
+          row_logits, proposals, sampler, [&](sampling::TokenId token) {
+            return is_stop(static_cast<std::int32_t>(token));
+          });
       keep = verified.keep;
       result->stop = verified.stop;
       if (verified.correction) {
@@ -986,13 +1059,24 @@ bool Session::FinishCycle(Cycle& c, sampling::SamplerState& sampler,
   stats_.accepted += keep - 1;
   // A target stop ends the request; it does not classify the remaining
   // proposals as failed predictions.
-  draft_length_.Observe(keep - 1, result->stop ? keep - 1 : k - 1, !sampled,
-                        session_->position());
-  if (!sampled && begin != nullptr) {
-    draft_length_.ObserveCost(k - 1,
-                              std::chrono::duration<float, std::milli>(
-                                  std::chrono::steady_clock::now() - *begin)
-                                  .count());
+  if (c.copies) {
+    // Copies have their own acceptance and cost; the MTP estimates do not see
+    // them (they only advance their backoff clock).
+    stats_.copied += k - 1;
+    stats_.copied_accepted += keep - 1;
+    copy_length_.Observe(keep - 1, result->stop ? keep - 1 : k - 1, false,
+                         session_->position());
+    draft_length_.ObservePlainToken();
+  } else {
+    draft_length_.Observe(keep - 1, result->stop ? keep - 1 : k - 1, !sampled,
+                          session_->position());
+    copy_length_.ObservePlainToken();
+    if (!sampled && begin != nullptr) {
+      draft_length_.ObserveCost(k - 1,
+                                std::chrono::duration<float, std::milli>(
+                                    std::chrono::steady_clock::now() - *begin)
+                                    .count());
+    }
   }
   if (correction) {
     // The residual draw is the next cycle's anchor; resampling would bias it.
@@ -1012,7 +1096,8 @@ void Session::DecodeBatch(std::span<BatchDecode> lanes) {
     Session* s;
     Cycle c;
     std::uint32_t k{0};
-    bool cohort{false};  // greedy lane taking the cohort's draft width
+    bool cohort{false};   // greedy lane taking the cohort's draft width
+    bool copying{false};  // prompt-lookup lane: chain = anchor + copies
     bool live{true};
   };
   std::vector<Work> work;
@@ -1119,7 +1204,18 @@ void Session::DecodeBatch(std::span<BatchDecode> lanes) {
     }
     w.c.chain = {w.c.anchor};
     if (s->MtpActive() && cap > 1) {
-      if (s->hooks_.fixed_drafts != 0) {
+      try {
+        // A lane whose context continues an earlier passage verifies copies
+        // and runs no drafter; a function of the lane alone, so batching does
+        // not change it.
+        w.copying = s->ProposeCopies(w.c, cap - 1);
+      } catch (const std::exception& e) {
+        fail(d, e.what());
+        continue;
+      }
+      if (w.copying) {
+        // Its rows are the chain; it takes no part in the draft steps.
+      } else if (s->hooks_.fixed_drafts != 0) {
         w.k = std::min(s->hooks_.fixed_drafts, cap - 1);
       } else if (w.c.sampled) {
         // The width of the lane's own history, as DecodeStep (seeded replay).
@@ -1145,6 +1241,8 @@ void Session::DecodeBatch(std::span<BatchDecode> lanes) {
     if (w.cohort) {
       rows.push_back({&w.s->draft_length_, w.k});
       context = std::max(context, w.s->session_->position());
+    } else if (w.copying) {
+      other_rows += static_cast<std::uint32_t>(w.c.chain.size());
     } else {
       other_rows += w.k + 1;
     }
@@ -1344,6 +1442,7 @@ void Session::DecodeBatch(std::span<BatchDecode> lanes) {
         d.result.tokens = {w.c.anchor};
         if (s.MtpActive()) {
           s.draft_length_.ObservePlainToken();
+          s.copy_length_.ObservePlainToken();
         }
         d.ok = true;
       } else {

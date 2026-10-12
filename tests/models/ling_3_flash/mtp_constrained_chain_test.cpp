@@ -10,6 +10,11 @@
 // partial `</arg` inside the code) with noise, over a small byte vocabulary
 // whose pieces split and join the markup.
 //
+// Prompt-lookup copies (prompt_lookup.hpp) run as a further mode. The copied
+// tokens are a deterministic function of the context (here the draft model's
+// argmax, which the grammar often forbids). The same VerifySampledChain, with
+// the request's grammar, verifies them as point-mass proposals (CopyProposal).
+//
 // Checks per grammar, sampling setting and mode:
 //   * grammar consistency: every committed sequence is re-validated from
 //     scratch by walking its bytes through the grammar (no token masks, no
@@ -395,13 +400,15 @@ enum class Mode {
   kAutoregressive,
   kVaryingDrafts,
   kController,
-  kUnrelatedDrafts
+  kUnrelatedDrafts,
+  kCopies
 };
 
 const char* ModeName(Mode m) {
   return m == Mode::kAutoregressive  ? "ar"
          : m == Mode::kVaryingDrafts ? "mtp_varying_drafts"
          : m == Mode::kController    ? "mtp_controller"
+         : m == Mode::kCopies        ? "lookup_copies"
                                      : "mtp_unrelated_drafts";
 }
 
@@ -581,7 +588,8 @@ Generated Generate(const Model& model, const sampling::SamplingConfig& config,
         break;
       }
       std::uint32_t drafts = 0;
-      if (mode == Mode::kVaryingDrafts || mode == Mode::kUnrelatedDrafts) {
+      if (mode == Mode::kVaryingDrafts || mode == Mode::kUnrelatedDrafts ||
+          mode == Mode::kCopies) {
         drafts = static_cast<std::uint32_t>(
             Mix(static_cast<std::uint64_t>(config.seed) * 131 + cycle) % 8);
       } else if (mode == Mode::kController) {
@@ -598,13 +606,27 @@ Generated Generate(const Model& model, const sampling::SamplingConfig& config,
         committed = {static_cast<std::int32_t>(anchor)};
         controller.ObservePlainToken();
       } else {
-        l3::MtpProposer proposer(working, anchor);
+        // Copies draw nothing from the request's stream; MTP proposals take
+        // their own stream from it (MtpProposer).
+        std::optional<l3::MtpProposer> proposer;
+        std::vector<l3::MtpProposal> copies;
+        if (mode != Mode::kCopies) {
+          proposer.emplace(working, anchor);
+        }
         std::vector<std::int32_t> chain{static_cast<std::int32_t>(anchor)};
         std::vector<ModelState> after{context};
         model.Advance(&after.back(), anchor);
         for (std::uint32_t j = 0; j < drafts; ++j) {
-          const auto token = proposer.Propose(
-              model.Draft(after.back(), mode == Mode::kUnrelatedDrafts));
+          sampling::TokenId token;
+          if (mode == Mode::kCopies) {
+            const auto draft = model.Draft(after.back(), false);
+            token = static_cast<sampling::TokenId>(
+                std::max_element(draft.begin(), draft.end()) - draft.begin());
+            copies.push_back(l3::CopyProposal(token));
+          } else {
+            token = proposer->Propose(
+                model.Draft(after.back(), mode == Mode::kUnrelatedDrafts));
+          }
           chain.push_back(static_cast<std::int32_t>(token));
           after.push_back(after.back());
           model.Advance(&after.back(), token);
@@ -614,8 +636,10 @@ Generated Generate(const Model& model, const sampling::SamplingConfig& config,
           rows.push_back(model.Target(after[j]));
         }
         working.Accept(anchor);
-        const auto verified =
-            VerifyWithBug(bug, rows, proposer.proposals(), working, chain);
+        const auto verified = VerifyWithBug(
+            bug, rows,
+            mode == Mode::kCopies ? std::span(copies) : proposer->proposals(),
+            working, chain);
         committed.assign(chain.begin(), chain.begin() + verified.keep);
         stop = verified.stop;
         if (verified.keep < chain.size()) {
@@ -921,8 +945,9 @@ int main(int argc, char** argv) {
     binding->vocabulary = vocabulary;
     const Model model(pieces, grammar.template_text);
     for (const auto& setting : settings) {
-      for (const Mode mode : {Mode::kAutoregressive, Mode::kVaryingDrafts,
-                              Mode::kController, Mode::kUnrelatedDrafts}) {
+      for (const Mode mode :
+           {Mode::kAutoregressive, Mode::kVaryingDrafts, Mode::kController,
+            Mode::kUnrelatedDrafts, Mode::kCopies}) {
         const std::string label =
             grammar.name + "/" + setting.name + "/" + ModeName(mode);
         if (label.find(only) == std::string::npos) {

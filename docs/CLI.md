@@ -105,15 +105,21 @@ seed. Speed depends on acceptance and verification cost.
 
 - `speculative` — `dflash2` for Qwen3.8-27B, `dspark` for DeepSeek V4 Flash,
   `mtp` for models with a supported MTP head, or `off`. HTTP serving
-  supports `dflash2`, `dspark`, and `mtp` (Flash-Next, Ling-3.0-flash).
-  Ling-3.0-flash carries its MTP block (block 42) in the main GGUF, so
-  `--speculative mtp` needs no `--mtp-model` (it is refused there). Ling
-  defaults to MTP: `gufo serve llm` and `gufo bench` use it whenever the GGUF
-  carries the block and `--speculative` is not given (bench also needs greedy
-  sampling and `--min-draft-tokens 1` for the default; otherwise it runs AR).
-  A GGUF without the block runs AR and logs why. `--speculative off` selects AR
-  (costs 2.1 GiB less memory, decodes 1.1-1.5x slower). `gufo bench
-  --text-file FILE` measures MTP on real text. Other models default to AR.
+  supports `dflash2`, `dspark`, and `mtp` (Flash-Next and Ling-3.0-Flash).
+  Ling-3.0-Flash carries its MTP block (block 42) in the main GGUF, so
+  `--speculative mtp` needs no `--mtp-model`, and gufo refuses one there.
+  Ling-3.0-Flash defaults to MTP. `gufo serve llm` and `gufo bench` use MTP when
+  the GGUF carries the block and `--speculative` is not given. For that default,
+  `gufo bench` also needs greedy sampling and `--min-draft-tokens 1`, and
+  otherwise runs AR. A GGUF without the block runs AR and logs why. With MTP,
+  Ling-3.0-Flash also copies repeated passages. When the context ends in 12 or
+  more tokens that occurred earlier in the prompt or reply (code edits,
+  tool-output echoes, quotes), the target verifies the tokens that followed as
+  the draft, without running the drafter, up to 7 per step. Greedy output is
+  unchanged, and sampled output keeps the target distribution.
+  `--speculative off` selects AR, which uses 2.1 GiB less memory and decodes
+  1.1-1.5x slower. `gufo bench --text-file FILE` measures MTP on real text.
+  Other models default to AR.
 - `dflashModel` — path to the DFlash2 companion draft.
 - `dsparkModel` — path to the DSpark support GGUF.
 - `mtpModel` — path to the MTP draft model (the Flash-Next sidecar, not used by

@@ -75,6 +75,30 @@
 /// than a dense target would: the controller below decides k from measured
 /// costs.
 ///
+/// Prompt lookup (prompt_lookup.hpp). Before the drafter runs, the cycle looks
+/// for the context [committed tokens, anchor] earlier in the session's own
+/// tokens (a 12-token match, found through an incremental 3-gram index). On a
+/// match the tokens that followed it are the drafts and the drafter is not
+/// run: the cycle is [anchor, copies] (at most 7 copies, so the verify pass
+/// stays at 8 rows or fewer, in the decode family) with the same verify,
+/// acceptance and rollback as an MTP cycle. Greedy output is token-identical
+/// to AR for any drafts. A sampled cycle verifies each copy as a point-mass
+/// proposal (q = 1: accepted with probability p(x), a rejection draws from p
+/// without x; MtpProposal via CopyProposal), exact like a deterministic draft
+/// of speculative sampling. The number of copies comes from a second
+/// MtpLengthController that sees only copy cycles (prior costs without the
+/// drafter step), so a region where copies keep failing backs off like MTP
+/// does and prose without matches pays only the index probe. Copies are
+/// decided once, at the anchor, by a function of the lane's tokens and its own
+/// history, so batched lanes and sampled replay do not depend on peers.
+///
+/// Runner-up ("sibling") verification, as in gufo#426, is NOT done for Ling: an
+/// extra verify row costs 0.11-0.25 of a decode step here (the expert union
+/// grows by 3-5 experts per layer per row), a KDA branch needs a second
+/// recurrence launch per layer plus a post-branch state, and the break-even
+/// runner-up hit rate is above 0.6 against about 0.4 measured on Gemma. See
+/// artifacts/ling-3-flash/item-c-design.md.
+///
 /// Rollback. Rejected rows must not change the recurrent state. While a verify
 /// step runs, the KDA layers store the state (2 MiB per layer) and the conv
 /// window after every row but the last (kernels kda::RecurrentSequence /
@@ -112,6 +136,11 @@ namespace gufo::models::ling_3_flash {
   return 0.33F + 0.11F * depth / 65536.0F;
 }
 
+/// Share of MtpDraftCostPrior that the drafter step itself makes up (the 4.3 ms
+/// step the prior was derived with, over the 27.9 ms decode step); a
+/// prompt-lookup copy costs the verify row alone.
+inline constexpr float kMtpDraftStepShare = 0.15F;
+
 /// Draft-length controller. Acceptance of the depth-d draft is estimated from
 /// the committed history only (decayed counts; the first rejected draft is a
 /// failure, its unverified tail is not observed); the choice maximises
@@ -122,9 +151,17 @@ namespace gufo::models::ling_3_flash {
 /// plain-step time until two samples exist).
 class MtpLengthController {
 public:
-  explicit MtpLengthController(std::uint32_t limit = kMaxDrafts)
-      : limit_(std::clamp(limit, 1U, kMaxDrafts)) {
+  explicit MtpLengthController(std::uint32_t limit = kMaxDrafts,
+                               float skipped_step = 0.0F)
+      : limit_(std::clamp(limit, 1U, kMaxDrafts)), skipped_step_(skipped_step) {
     Reset();
+  }
+
+  /// The controller of prompt-lookup copies: the same estimates, with the
+  /// drafter step left out of a draft's cost.
+  [[nodiscard]] static MtpLengthController ForCopies(
+      std::uint32_t limit = kMaxDrafts) {
+    return MtpLengthController(limit, kMtpDraftStepShare);
   }
 
   void Reset() noexcept {
@@ -236,7 +273,7 @@ public:
   /// Cost of a cycle with k drafts relative to a plain step.
   [[nodiscard]] float RelativeCost(std::uint32_t drafts, bool measured,
                                    std::uint32_t context = 0) const noexcept {
-    const float per_draft = MtpDraftCostPrior(context);
+    const float per_draft = MtpDraftCostPrior(context) - skipped_step_;
     const float prior = 1.0F + per_draft * static_cast<float>(drafts);
     if (!measured || samples_[0] == 0) {
       return prior;
@@ -282,6 +319,7 @@ private:
   }
 
   std::uint32_t limit_;
+  float skipped_step_;
   std::array<float, kMaxDrafts> successes_{};
   std::array<float, kMaxDrafts> failures_{};
   std::uint32_t retry_tokens_{0};

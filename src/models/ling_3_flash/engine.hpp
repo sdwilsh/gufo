@@ -19,6 +19,7 @@
 #include "src/models/ling_3_flash/gpu_dump.hpp"
 #include "src/models/ling_3_flash/mtp.hpp"
 #include "src/models/ling_3_flash/mtp_sampling.hpp"
+#include "src/models/ling_3_flash/prompt_lookup.hpp"
 #include "src/models/ling_3_flash/snapshot_format.hpp"
 #include "src/models/ling_3_flash/tokenizer.hpp"
 
@@ -380,6 +381,10 @@ public:
     std::uint64_t cycles{0};    ///< Cycles that verified at least one draft.
     std::uint64_t drafted{0};   ///< Draft tokens verified.
     std::uint64_t accepted{0};  ///< Draft tokens accepted.
+    /// Of `drafted` / `accepted`, the prompt-lookup copies (prompt_lookup.hpp);
+    /// the rest came from the MTP block.
+    std::uint64_t copied{0};
+    std::uint64_t copied_accepted{0};
   };
   /// One decode step of at most `max_tokens` committed tokens (max_tokens 1
   /// is plain decoding): samples the anchor token from the session's logits
@@ -427,6 +432,9 @@ public:
   /// cohort controller (greedy tokens do not depend on it), sampled lanes the
   /// width of their own history (MtpLengthController, prior costs), never cut
   /// to fit a step. Draft counters (Statistics) are outside the contract.
+  /// A lane whose context continues an earlier passage verifies copies of it
+  /// (prompt_lookup.hpp) and takes no part in the draft steps, as in its own
+  /// DecodeStep.
   /// A lane DecodeStep would refuse fails alone; a pass that fails after
   /// launch fails its lanes and empties their sessions without device calls.
   static void DecodeBatch(std::span<BatchDecode> lanes);
@@ -434,10 +442,12 @@ public:
   void ResetDraftPolicy() noexcept;
   /// Largest number of drafts per step (1..7, default 7).
   void SetMaxDrafts(std::uint32_t drafts) noexcept;
-  /// Test hooks (greedy only): a fixed number of drafts per cycle instead of
-  /// the controller's choice, and a draft source replacing the MTP chain
-  /// (called with the chain so far, anchor first, it returns the next draft
-  /// token) so tests can force full, partial and zero acceptance.
+  /// Test hooks (fixed drafts and draft source: greedy only): a fixed number of
+  /// drafts per cycle instead of the controller's choice, and a draft source
+  /// replacing the MTP chain (called with the chain so far, anchor first, it
+  /// returns the next draft token) so tests can force full, partial and zero
+  /// acceptance. Either one also switches prompt lookup off (they force the
+  /// drafts).
   struct DraftHooks {
     std::uint32_t fixed_drafts{0};  ///< 0 = adaptive
     std::function<std::int32_t(std::span<const std::int32_t>)> source;
@@ -446,6 +456,15 @@ public:
     /// Also a stop token for decoding with stop_at_eos (tests: a stop at a
     /// chosen point of a truncated trunk's text); -1 = none.
     std::int32_t stop_token{-1};
+    /// Prompt lookup off (A/B measurements and tests of the MTP-only path;
+    /// results are token-identical either way).
+    bool no_lookup{false};
+    /// Forced copies in place of the index (tests): called with the chain so
+    /// far (anchor first) it returns the next copy token, or -1 for no more.
+    std::function<std::int32_t(std::span<const std::int32_t>)> copy_source;
+    /// Shortest context match that proposes copies (0 = the default of 12;
+    /// tests lower it so a truncated trunk's loops are copied).
+    std::uint32_t lookup_min_match{0};
   };
   void SetDraftHooks(DraftHooks hooks) { hooks_ = std::move(hooks); }
   /// True when drafting is possible: an MTP model and a consistent MTP state.
@@ -570,7 +589,15 @@ private:
     bool greedy_fast{false};
     bool stop_at_eos{true};
     std::optional<MtpProposer> proposer;
+    /// A prompt-lookup cycle: chain[1..] are copies (no drafter ran), and a
+    /// sampled cycle verifies them as point-mass proposals.
+    bool copies{false};
+    std::vector<MtpProposal> copy_proposals;
   };
+  /// Looks the context [tokens_, c.anchor] up in the session's own tokens and,
+  /// on a long enough match, fills `c.chain` with up to `room` copies (the
+  /// copy controller decides how many). False: an ordinary cycle.
+  [[nodiscard]] bool ProposeCopies(Cycle& c, std::uint32_t room);
   /// After a verify of `c.chain`: acceptance with `sampler`, Rollback, the
   /// result, statistics and the length controller (ObserveCost from `begin`
   /// when given, for serial cycles only).
@@ -583,6 +610,10 @@ private:
   /// Position of the last draft step (UINT32_MAX: none since Invalidate).
   std::uint32_t draft_position_{UINT32_MAX};
   MtpLengthController draft_length_;
+  /// Prompt lookup: the index of tokens_ (cleared when tokens_ is replaced)
+  /// and the length controller of copy cycles.
+  PromptLookup lookup_;
+  MtpLengthController copy_length_{MtpLengthController::ForCopies()};
   DraftStats stats_;
   DraftHooks hooks_;
 };

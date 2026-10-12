@@ -9,6 +9,12 @@
 //   * seeded sampled lanes, alone and mixed with greedy lanes (cohorts whose
 //     own-history widths overflow one 8-row verify split it): tokens and final
 //     state equal DecodeStep of the same seed alone;
+//   * lanes that verify prompt-lookup copies instead of drafting
+//     (DraftHooks::copy_source replays a lane's own continuation with
+//     mistakes, alternating with MTP cycles on some lanes; the greedy
+//     reference is plain AR, the sampled one DecodeStep alone with the same
+//     hook): tokens and whole final state equal, in cohorts whose copy lanes
+//     overflow one 8-row verify and split it;
 //   * greedy lanes through the sampler (a repetition penalty: verify rows and
 //     VerifyDraft) and lanes stopping at a stop token (DraftHooks::stop_token,
 //     the stop paths of a prompt that reaches EOS) equal DecodeStep alone;
@@ -147,8 +153,30 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
   // A lane alone: DecodeStep with the lane's sampler, fixed width (0 =
   // adaptive; part of a sampled lane's seeded trace) and stop token, until T
   // tokens or a stop.
+  // Forced copies for lane i: its AR continuation, every fifth token wrong;
+  // `alternate` leaves every other 8 committed tokens to the MTP drafter. A
+  // function of the lane's own committed tokens, so alone and batched agree.
+  const auto copy_hook = [&](const l3::Session* s, std::size_t i,
+                             bool alternate) {
+    const auto base = static_cast<std::size_t>(start[i]->Position());
+    return [s, base, i, alternate,
+            &ar](std::span<const std::int32_t> chain) -> std::int32_t {
+      const std::size_t committed = s->Tokens().size() - base;
+      if (alternate && (committed / 8) % 2 == 1) {
+        return -1;
+      }
+      const std::size_t at = committed + chain.size();
+      if (at >= ar[i].tokens.size()) {
+        return -1;
+      }
+      const std::int32_t truth = ar[i].tokens[at];
+      return at % 5 == 4 ? (truth + 1) % static_cast<std::int32_t>(l3::kVocab)
+                         : truth;
+    };
+  };
   const auto solo_run = [&](std::size_t i, Kind kind, std::uint32_t fixed,
-                            std::int32_t stop_token, Outcome* out) {
+                            std::int32_t stop_token, Outcome* out,
+                            int copy = 0) {
     *out = {};
     if (!solo->RestoreSnapshot(*start[i], &error)) {
       return false;
@@ -157,6 +185,9 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
     l3::Session::DraftHooks hooks;
     hooks.fixed_drafts = fixed;
     hooks.stop_token = stop_token;
+    if (copy != 0) {
+      hooks.copy_source = copy_hook(solo.get(), i, copy == 2);
+    }
     solo->SetDraftHooks(hooks);
     sampling::SamplerState sampler(config_of(kind, i));
     bool ok = true;
@@ -181,11 +212,16 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
     std::vector<std::uint32_t> fixed;  // drafts per lane, 0 = adaptive
     std::vector<Kind> kind;
     bool stop{false};  // stop at the lane's 11th token (DraftHooks::stop_token)
+    /// Per lane: 0 MTP, 1 forced copies, 2 forced copies alternating with MTP.
+    std::vector<int> copy;
   };
   const auto run = [&](const Plan& plan) -> int {
     const std::size_t count = plan.members.size();
     std::vector<Outcome> want(count);
     std::vector<std::int32_t> stop_token(count, -1);
+    const auto copy_of = [&](std::size_t m) {
+      return m < plan.copy.size() ? plan.copy[m] : 0;
+    };
     for (std::size_t m = 0; m < count; ++m) {
       const std::size_t i = plan.members[m];
       if (plan.kind[m] == kGreedy && !plan.stop) {
@@ -199,7 +235,8 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
         }
         stop_token[m] = free.tokens.at(10);
       }
-      if (!solo_run(i, plan.kind[m], plan.fixed[m], stop_token[m], &want[m])) {
+      if (!solo_run(i, plan.kind[m], plan.fixed[m], stop_token[m], &want[m],
+                    copy_of(m))) {
         return fatal("solo reference");
       }
     }
@@ -216,6 +253,9 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
       l3::Session::DraftHooks hooks;
       hooks.fixed_drafts = plan.fixed[m];
       hooks.stop_token = stop_token[m];
+      if (copy_of(m) != 0) {
+        hooks.copy_source = copy_hook(lanes[i].get(), i, copy_of(m) == 2);
+      }
       lanes[i]->SetDraftHooks(hooks);
       samplers.emplace_back(config_of(plan.kind[m], i));
     }
@@ -223,6 +263,12 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
     std::uint32_t widest = 0;
     bool failed = false;
     bool stopped = false;
+    std::uint64_t copied = 0;
+    std::uint64_t copied_accepted = 0;
+    std::vector<l3::Session::DraftStats> before(count);
+    for (std::size_t m = 0; m < count; ++m) {
+      before[m] = lanes[plan.members[m]]->Statistics();
+    }
     while (true) {
       std::vector<l3::Session::BatchDecode> batch;
       std::vector<std::size_t> which;
@@ -265,6 +311,9 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
     for (std::size_t m = 0; m < count; ++m) {
       const std::size_t i = plan.members[m];
       tokens_equal = tokens_equal && got[m] == want[m].tokens;
+      const auto after = lanes[i]->Statistics();
+      copied += after.copied - before[m].copied;
+      copied_accepted += after.copied_accepted - before[m].copied_accepted;
       Bytes end;
       if (!State(*lanes[i], &end, &error)) {
         return fatal("lane state");
@@ -279,10 +328,19 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
     o["tokens_equal"] = tokens_equal;
     o["states_equal"] = states_equal;
     o["stopped"] = stopped;
-    check(
-        plan.name,
-        tokens_equal && states_equal && widest >= 2 && (!plan.stop || stopped),
-        std::move(o));
+    o["copied"] = U(copied);
+    o["copied_accepted"] = U(copied_accepted);
+    const bool has_copies = !plan.copy.empty();
+    // Greedy copies replay the greedy continuation: some must be accepted.
+    bool greedy_copies = false;
+    for (std::size_t m = 0; m < count; ++m) {
+      greedy_copies = greedy_copies || (plan.kind[m] == kGreedy && copy_of(m));
+    }
+    check(plan.name,
+          tokens_equal && states_equal && widest >= 2 &&
+              (!plan.stop || stopped) && (!has_copies || copied > 0) &&
+              (!greedy_copies || copied_accepted > 0),
+          std::move(o));
     return 0;
   };
   const auto lanes_of = [](std::size_t n) {
@@ -321,6 +379,27 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
        lanes_of(3),
        {3, 7, 0},
        all(3, kPenalty)},
+      // Forced copies (prompt lookup) in cohorts with MTP lanes.
+      {"copies_greedy_b4_equals_ar",
+       lanes_of(4),
+       {0, 0, 0, 0},
+       all(4, kGreedy),
+       false,
+       {1, 0, 2, 1}},
+      {"copies_sampled_b3_equals_solo",
+       lanes_of(3),
+       {0, 0, 0},
+       all(3, kSampled),
+       false,
+       {1, 2, 0}},
+      // Copy lanes (up to 8 rows each) overflow one forward and split it.
+      {"copies_mixed_b8_split_equals_solo",
+       lanes_of(8),
+       {0, 0, 0, 0, 0, 0, 0, 0},
+       {kSampled, kGreedy, kSampled, kGreedy, kPenalty, kGreedy, kSampled,
+        kGreedy},
+       false,
+       {1, 1, 2, 0, 1, 2, 1, 0}},
       {"stop_greedy_b4_equals_solo",
        lanes_of(4),
        {7, 3, 1, 0},
