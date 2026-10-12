@@ -361,7 +361,13 @@ Argument Coerce(std::string name, std::string_view value,
 // what the format allows next: another `<arg_key>`, the call's `</tool_call>`
 // or the end of `text`. Otherwise the first closer wins, as in vLLM, where a
 // stray closer ends the value and the rest of the body is ignored.
-std::size_t FindValueClose(std::string_view text, std::size_t from) {
+//
+// With `partial` the text may still grow. Then a closer whose continuation is
+// not yet known (nothing, or the start of what could become `<arg_key>` or
+// `</tool_call>`) does not close the value, and neither does the first-closer
+// fallback: a later closer may still qualify.
+std::size_t FindValueClose(std::string_view text, std::size_t from,
+                           bool partial = false) {
   const auto first = text.find(kValueEnd, from);
   for (auto at = first; at != std::string_view::npos;
        at = text.find(kValueEnd, at + 1)) {
@@ -369,11 +375,43 @@ std::size_t FindValueClose(std::string_view text, std::size_t from) {
     while (after < text.size() && IsSpace(text[after]))
       ++after;
     const auto rest = text.substr(after);
-    if (rest.empty() || rest.starts_with(kKeyStart) ||
-        rest.starts_with(kCallEnd))
+    if (rest.empty()
+            ? !partial
+            : rest.starts_with(kKeyStart) || rest.starts_with(kCallEnd))
       return at;
+    if (partial && (kKeyStart.starts_with(rest) || kCallEnd.starts_with(rest)))
+      return std::string_view::npos;
   }
-  return first;
+  return partial ? std::string_view::npos : first;
+}
+
+// The part of an unfinished value `tail` that cannot change: nothing from the
+// first `</arg_value>` on (it may or may not close the value), and no tail
+// that could still grow into one or into half a UTF-8 character.
+std::string_view StableValuePrefix(std::string_view tail) {
+  if (const auto first = tail.find(kValueEnd); first != std::string_view::npos)
+    return tail.substr(0, first);
+  for (auto size = std::min(tail.size(), kValueEnd.size() - 1); size > 0;
+       --size)
+    if (kValueEnd.starts_with(tail.substr(tail.size() - size))) {
+      tail.remove_suffix(size);
+      break;
+    }
+  std::size_t back = 0;
+  while (back < tail.size() && back < 4 &&
+         (static_cast<unsigned char>(tail[tail.size() - 1 - back]) & 0xC0) ==
+             0x80)
+    ++back;
+  if (back < tail.size()) {
+    const auto lead = static_cast<unsigned char>(tail[tail.size() - 1 - back]);
+    const std::size_t need = lead >= 0xF0   ? 4
+                             : lead >= 0xE0 ? 3
+                             : lead >= 0xC0 ? 2
+                                            : 1;
+    if (need > back + 1)
+      tail.remove_suffix(back + 1);
+  }
+  return tail;
 }
 
 // The `</tool_call>` ending the call whose body starts at `body_begin`: the
@@ -384,7 +422,7 @@ std::size_t FindValueClose(std::string_view text, std::size_t from) {
 // only when the model `finished` the output: in output a stop string or the
 // token limit cut, that closer is still inside the unfinished value.
 std::size_t FindCallEnd(std::string_view text, std::size_t body_begin,
-                        bool finished) {
+                        bool finished, bool partial = false) {
   std::size_t cursor = body_begin;
   while (true) {
     const auto call_end = text.find(kCallEnd, cursor);
@@ -403,7 +441,7 @@ std::size_t FindCallEnd(std::string_view text, std::size_t body_begin,
     if (!text.substr(value_open).starts_with(kValueStart))
       continue;
     const auto value_begin = value_open + kValueStart.size();
-    const auto value_close = FindValueClose(text, value_begin);
+    const auto value_close = FindValueClose(text, value_begin, partial);
     if (value_close == std::string_view::npos)
       return finished ? text.find(kCallEnd, value_begin)
                       : std::string_view::npos;
@@ -413,20 +451,28 @@ std::size_t FindCallEnd(std::string_view text, std::size_t body_begin,
 
 struct Parsed {
   std::vector<std::pair<std::string, std::string>> arguments;
+  // A key repeated with a different value, as for Qwen calls: the call is
+  // invalid rather than letting either value win.
+  bool conflict{false};
+  // A value opened but never closed.
+  bool dangling{false};
+  // Partial parsing only: the argument whose value is still being written.
+  std::optional<std::pair<std::string, std::string>> pending;
   // True when the body ends after a complete argument and nothing else.
   bool tidy_end{false};
 };
 
 // <arg_key>K</arg_key>\s*<arg_value>V</arg_value> pairs in `body`; text that
-// does not belong to a pair is ignored, a repeated key keeps its first
-// position and takes the last value (Python dict semantics). Keys are
-// stripped as in vLLM, except a key spelled exactly as one of the declared
+// does not belong to a pair is ignored, a repeated key with the same value is
+// dropped and one with another value makes the call invalid (as for Qwen). Keys
+// are stripped as in vLLM, except a key spelled exactly as one of the declared
 // `properties` (which may begin or end with spaces) keeps that spelling.
 // Cost: every `find` resumes at the cursor and a pair that fails to close
 // breaks out, so the scan is linear except that an `<arg_key>` without its
 // partner rescans the tail once per such key: O(n * k) for k unmatched keys in
 // one call body. Generation length bounds both.
-Parsed ParseArguments(std::string_view body, const json::Value* properties) {
+Parsed ParseArguments(std::string_view body, const json::Value* properties,
+                      bool partial = false) {
   Parsed parsed;
   std::size_t cursor = 0;
   std::size_t last_end = 0;
@@ -445,19 +491,24 @@ Parsed ParseArguments(std::string_view body, const json::Value* properties) {
     if (!body.substr(value_open).starts_with(kValueStart))
       continue;
     const auto value_begin = value_open + kValueStart.size();
-    const auto value_close = FindValueClose(body, value_begin);
-    if (value_close == std::string_view::npos)
-      break;
+    const auto value_close = FindValueClose(body, value_begin, partial);
     const auto spelled = body.substr(key_begin, key_close - key_begin);
     const std::string key(properties &&
                                   properties->contains(std::string(spelled))
                               ? spelled
                               : Strip(spelled));
+    if (value_close == std::string_view::npos) {
+      parsed.dangling = true;
+      if (partial)
+        parsed.pending.emplace(
+            key, std::string(StableValuePrefix(body.substr(value_begin))));
+      break;
+    }
     std::string value(body.substr(value_begin, value_close - value_begin));
     const auto existing = std::ranges::find(
         parsed.arguments, key, [](const auto& item) { return item.first; });
     if (existing != parsed.arguments.end())
-      existing->second = std::move(value);
+      parsed.conflict |= existing->second != value;  // identical: dropped
     else
       parsed.arguments.emplace_back(key, std::move(value));
     cursor = last_end = value_close + kValueEnd.size();
@@ -493,7 +544,8 @@ const json::Value* FindProperties(const json::Value& root) {
 BailingScan ScanBailingToolCalls(
     std::string_view text, std::span<const tokenization::ChatTool> tools,
     bool accept_unterminated, bool emit_undeclared,
-    const std::function<bool(std::size_t)>& quoted) {
+    const std::function<bool(std::size_t)>& quoted, bool partial,
+    const std::function<void(std::size_t)>& accepted) {
   BailingScan scan;
   std::size_t cursor = 0;
   while (true) {
@@ -505,7 +557,8 @@ BailingScan ScanBailingToolCalls(
       cursor = body_begin;
       continue;
     }
-    const auto close = FindCallEnd(text, body_begin, accept_unterminated);
+    const auto close =
+        FindCallEnd(text, body_begin, accept_unterminated, partial);
     const bool terminated = close != std::string_view::npos;
     const auto body_end = terminated ? close : text.size();
     const auto end = terminated ? close + kCallEnd.size() : text.size();
@@ -533,14 +586,27 @@ BailingScan ScanBailingToolCalls(
     if (tool)
       schema = TryParse(tool->parameters_json);
     const auto* properties = schema ? FindProperties(*schema) : nullptr;
-    auto parsed = ParseArguments(body, properties);
+    // A call still being written: its name is complete once the first argument
+    // opens, and only then is it safe to publish.
+    bool streaming = partial && !terminated && declared &&
+                     (tool != nullptr || tools.empty()) &&
+                     name_end != std::string_view::npos;
+    auto parsed = ParseArguments(body, properties, streaming);
+    // A call is published only once an argument value has opened or one has
+    // finished, not on its name and first key alone. The grammar forces the
+    // header tokens, so a length cut within them would otherwise leave an
+    // empty, incomplete call in the final output.
+    streaming = streaming && (parsed.dangling || !parsed.arguments.empty());
     // A call with no tag at all after its name is `name {}`, as in vLLM.
     const bool bare = name_end == std::string_view::npos;
     const bool complete =
         terminated ||
         (accept_unterminated && (tool != nullptr || tools.empty()) &&
          ((!parsed.arguments.empty() && parsed.tidy_end) || bare));
-    if (!declared || !complete) {
+    // A conflicting repeat, or a value cut off by an early `</tool_call>`,
+    // leaves no safe call: a stream may already have published either.
+    const bool invalid = parsed.conflict || (terminated && parsed.dangling);
+    if (!declared || invalid || !(complete || streaming)) {
       scan.rejected.emplace_back(begin, end);
       continue;
     }
@@ -558,7 +624,25 @@ BailingScan ScanBailingToolCalls(
         call.arguments.push_back(
             {.name = key, .value = std::move(value), .is_string = true});
     }
+    if (streaming && !complete) {
+      call.partial = true;
+      // Only a value that is certainly text can be published before it
+      // closes; the others are typed from their final spelling.
+      if (parsed.pending) {
+        auto& [key, value] = *parsed.pending;
+        const auto* property = properties ? properties->find(key) : nullptr;
+        const bool text =
+            !property || !property->is_object() ||
+            SchemaTypes(*schema, *property) == std::set<std::string>{"string"};
+        const bool repeated = std::ranges::any_of(
+            call.arguments, [&](const auto& item) { return item.name == key; });
+        if (text && !repeated)
+          call.pending = std::move(parsed.pending);
+      }
+    }
     scan.calls.push_back(std::move(call));
+    if (accepted && !scan.calls.back().partial)
+      accepted(end);
   }
   return scan;
 }

@@ -3,9 +3,11 @@
 
 #include <cstddef>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "src/cli/serve/text_generation_backend.hpp"
@@ -28,6 +30,11 @@ struct BailingScan {
     /// Byte range of the call, `<tool_call>` through `</tool_call>`.
     std::size_t begin{0};
     std::size_t end{0};
+    /// Partial scans only: the call is still being written. `arguments` holds
+    /// the finished ones; `pending` is the key and the settled start of a
+    /// text argument whose value is still open.
+    bool partial{false};
+    std::optional<std::pair<std::string, std::string>> pending;
   };
   /// Valid calls to declared tools, in order of appearance.
   std::vector<Call> calls;
@@ -59,11 +66,21 @@ struct BailingScan {
 /// must not become a call. An empty `tools` list declares everything.
 /// `quoted(position)`, when set, says whether a byte of `text` lies in a
 /// quoted example (code span or fence); an opener there is ordinary text.
+/// With `partial` (the output is still growing) the last call may be unfinished
+/// and is then returned flagged `partial`: it needs a declared name that the
+/// first `<arg_key>` has ended, and is never a call the final scan would not
+/// accept. Everything it publishes is final: a finished argument, or the part
+/// of a text argument that no later byte can change (see StableValuePrefix).
+/// `accepted(end)` is called after each finished call with the end of its
+/// bytes, so the caller can stop quote state from running across them. A key
+/// repeated with another value, or a value cut off by an early `</tool_call>`,
+/// rejects the call.
 /// Never throws.
 [[nodiscard]] BailingScan ScanBailingToolCalls(
     std::string_view text, std::span<const tokenization::ChatTool> tools,
     bool accept_unterminated, bool emit_undeclared,
-    const std::function<bool(std::size_t)>& quoted = {});
+    const std::function<bool(std::size_t)>& quoted = {}, bool partial = false,
+    const std::function<void(std::size_t)>& accepted = {});
 
 }  // namespace gufo::server
 

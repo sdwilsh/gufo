@@ -138,11 +138,17 @@ void TestStructure() {
   Expect(scan.calls.size() == 1 &&
              Arguments(scan.calls[0]) == "{\"city\":\"\\n a < b \\n\"}",
          "values keep whitespace");
-  // Repeated key: first position, last value.
+  // A repeated key: an identical copy is dropped, a conflicting one rejects
+  // the call (as for Qwen calls).
+  scan =
+      Scan(One("typed", Pair("n", "1") + Pair("text", "a") + Pair("n", "1")));
+  Expect(scan.calls.size() == 1 &&
+             Arguments(scan.calls.at(0)) == R"({"n":1,"text":"a"})",
+         "identical repeated key is dropped");
   scan =
       Scan(One("typed", Pair("n", "1") + Pair("text", "a") + Pair("n", "2")));
-  Expect(Arguments(scan.calls.at(0)) == R"({"n":2,"text":"a"})",
-         "duplicate key semantics");
+  Expect(scan.calls.empty() && scan.rejected.size() == 1,
+         "conflicting repeated key rejects the call");
   // Parallel calls, spans and surrounding prose.
   const std::string first = One("ping", "");
   const std::string second = One("get_weather", Pair("city", "Oslo"));
@@ -237,15 +243,14 @@ void TestCloserInsideValue() {
   Expect(scan.calls.size() == 1 &&
              Arguments(scan.calls[0]) == R"({"text":"a</tool_call>b","n":3})",
          "closer in a middle value");
-  // A value that never closes still ends at the first closer (vLLM) when
-  // the model finished the output.
+  // A value that never closes is not a call even when the model finished the
+  // output: a stream may already have published it.
   const std::string unclosed =
       "<tool_call>get_weather<arg_key>city</arg_key><arg_value>x"
       "</tool_call>";
   scan = Scan(unclosed, true);
-  Expect(scan.calls.size() == 1 && scan.calls[0].arguments.empty() &&
-             scan.rejected.empty(),
-         "unterminated value falls back to the first closer");
+  Expect(scan.calls.empty() && scan.rejected.size() == 1,
+         "a value cut off by an early closer rejects the call");
   // Cut by a stop string or the token limit, that closer is value text: the
   // call is unfinished, even when the value quotes a whole call.
   scan = Scan(unclosed);
