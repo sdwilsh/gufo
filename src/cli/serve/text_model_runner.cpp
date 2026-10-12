@@ -25,20 +25,29 @@ std::optional<ChatRequest> ConstrainChatRequest(
   // (for example Qwen's whitespace boundary after </think>).
   if (tool_format)
     *tool_format = runner.ToolFormat();
-  if (!request.response_format &&
-      (request.tools.empty() ||
-       request.tool_choice == ChatRequest::ToolChoice::kNone))
+  // Bailing (Ling) calls use the markup its chat template teaches. The grammar
+  // steers that markup and adds no tool instruction. Beside a response_format
+  // it appends only "The JSON response schema applies to the final answer." to
+  // the framing suffix, and admits one call or the JSON answer, as for Qwen.
+  const auto syntax = runner.ToolSyntax();
+  const bool bailing =
+      syntax == TextGenerationBackend::ToolCallSyntax::kBailing;
+  const bool grammar_tools =
+      !request.tools.empty() &&
+      request.tool_choice != ChatRequest::ToolChoice::kNone &&
+      (syntax == TextGenerationBackend::ToolCallSyntax::kDefault || bailing);
+  if (!request.response_format && !grammar_tools)
     return std::nullopt;
   auto constrained = request;
   auto instruction = request.response_format ? request.response_format->prompt()
                                              : std::string();
   auto grammar = request.response_format;
-  if (!request.tools.empty() &&
-      request.tool_choice != ChatRequest::ToolChoice::kNone) {
+  if (grammar_tools) {
     std::vector<sampling::JsonConstraint::Tool> tools;
     const bool required =
         request.tool_choice == ChatRequest::ToolChoice::kRequired;
-    auto format = runner.ToolFormat();
+    auto format = bailing ? sampling::JsonConstraint::ToolFormat::kBailing
+                          : runner.ToolFormat();
     for (const auto& tool : request.tools) {
       const auto definition = tool.definition_json.empty()
                                   ? json::Value()

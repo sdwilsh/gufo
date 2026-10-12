@@ -1,0 +1,9 @@
+# Binding rows only (~40 min on gfx1151): run-suite --suite /opt/gufo/suites/mtp-binding.txt --timeout 7200
+# grammar_force (prompts 8 thinking off, 9 thinking on): a strict `record` whose const string and enum the
+# prompt does not reveal, forced; the mask must remove filtered mass inside the call. 80 samples, ar and mtp:
+# 128 tokens (off), 320 tokens (on: reasoning first, then the call).
+# grammar_bind (prompts 6, 7): the realistic strict write_file; gated on the mask excluding tokens the
+# unfiltered softmax allows (the preset filters may already hide them). See suites-mtp-long-tests.txt.
+@label=mtp_force @timeout=1500 ling_3_flash_mtp_distribution --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --prompt-ids 8 --configs grammar_force --modes ar,mtp --samples 80 --tokens 128 --require-binding --require-calls --max-context 2048 --permutations 20000 --timeout-seconds 1400
+@label=mtp_force_think @timeout=2400 ling_3_flash_mtp_distribution --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --prompt-ids 9 --configs grammar_force --modes ar,mtp --samples 80 --tokens 320 --require-binding --require-calls --max-context 2048 --permutations 20000 --timeout-seconds 2300
+@label=mtp_binding @timeout=4500 ling_3_flash_mtp_distribution --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --prompt-ids 6,7 --configs grammar_bind --modes ar,mtp --samples 80 --tokens 600 --require-binding --require-calls --max-context 2048 --permutations 20000 --timeout-seconds 4400

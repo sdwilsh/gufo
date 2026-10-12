@@ -18,7 +18,10 @@ the harness could not run (server did not start, bad arguments, crash).
 stdout carries exactly one JSON document (the summary with compact per-item
 rows) written at the end; progress goes to stderr, where per-item rows appear as
 `ROW {json}` lines so a pod log alone contains the evidence.  Full per-step
-data is kept under --work (default $HOME/compare).
+data is kept under --work (default $HOME/compare); every agent episode's full
+transcript (content, reasoning, raw tool-call arguments, tool results) goes to
+agent-transcripts[-<mode>].jsonl.gz there, referenced by sha256 from the
+summary, and with --agent-transcript-log also to the log (see transcripts.py).
 """
 import argparse
 import json
@@ -39,6 +42,7 @@ sys.path.insert(0, str(HERE))
 
 import agent  # noqa: E402
 import common  # noqa: E402
+import transcripts  # noqa: E402
 from common import log, mean_ci, wilson, summarize  # noqa: E402
 from models import MODELS, resolve  # noqa: E402
 
@@ -300,8 +304,10 @@ def _mean_by_source(done):
 
 # ------------------------------------------------------------------ agent
 def agent_seed(args, task_id, repeat):
-    """Seed of one episode: fixed per (task, repeat), so every serve mode and
-    every rerun draws the same request seeds; independent of --agent-tasks."""
+    """Seed of one episode, fixed per (task, repeat).
+
+    Every serve mode and every rerun uses the same seeds, whatever --agent-tasks
+    selects.  Seeds are distinct while there are fewer than 1000 tasks."""
     ids = [t["id"] for t in agent.load_tasks()]
     return args.seed_base + 1000 * repeat + ids.index(task_id)
 
@@ -310,6 +316,7 @@ def agent_phase(args, server, spec, work, label=None):
     tasks = agent.load_tasks(args.agent_tasks.split(",") if args.agent_tasks else None)
     client = agent.ChatClient(server.base_url, spec["served_name"])
     rows_path = work / "agent-episodes.jsonl"
+    transcript_path = work / (f"agent-transcripts-{label}.jsonl.gz" if label else "agent-transcripts.jsonl.gz")
     done = {(r["task"], r["seed"]): r for r in load_rows(rows_path)}
     deadline = time.monotonic() + args.agent_budget_hours * 3600 if args.agent_budget_hours else None
     episodes, skipped = [], 0
@@ -333,6 +340,11 @@ def agent_phase(args, server, spec, work, label=None):
                                     echo_reasoning=args.echo_reasoning, repeat=repeat)
         if label:
             episode["mode"] = label
+        key = transcripts.episode_key(label, task["id"], repeat, seed)
+        record = {"schema": transcripts.SCHEMA, "key": key, "mode": label, "task": task["id"], "seed": seed,
+                  "repeat": repeat, "passed": episode["passed"], "stop": episode["stop"],
+                  "steps": episode["steps"], "grade": episode["grade"], **episode.pop("transcript")}
+        episode["transcript"] = transcripts.append(transcript_path, record)
         jsonl_append(rows_path, episode)
         compact = {k: v for k, v in episode.items() if k not in ("step_log", "grade")}
         compact["grade"] = {k: v for k, v in episode["grade"].items() if k != "output_tail"}
@@ -350,6 +362,10 @@ def agent_phase(args, server, spec, work, label=None):
         row("agent", compact)
         log(f"{tag} {task['id']} seed {seed}: {'PASS' if episode['passed'] else 'FAIL'} "
             f"steps={episode['steps']} stop={episode['stop']} {episode['wall_seconds']}s")
+        ref = episode["transcript"]
+        log(f"{tag} transcript {ref['key']} sha256={ref['sha256']} json_bytes={ref['json_bytes']}")
+        if args.agent_transcript_log:
+            transcripts.emit(ref["key"], transcripts.canonical(record))
         return episode
 
     with ThreadPoolExecutor(max_workers=max(1, args.agent_parallel)) as pool:
@@ -363,8 +379,19 @@ def agent_phase(args, server, spec, work, label=None):
     summary["episodes_compact"] = [{k: e[k] for k in ("task", "seed", "passed", "stop", "steps",
                                                       "wall_seconds", "prompt_tokens",
                                                       "completion_tokens")}
-                                   | {"repeat": e.get("repeat"), "calls": e["calls"], "turns": e.get("turns")}
+                                   | {"repeat": e.get("repeat"), "calls": e["calls"], "turns": e.get("turns"),
+                                      "transcript": e.get("transcript")}
                                    for e in episodes]
+    summary["seeds_per_task"] = {t["id"]: [agent_seed(args, t["id"], k) for k in range(args.agent_repeats)]
+                                 for t in tasks}
+    if transcript_path.exists():
+        summary["transcripts"] = {**transcripts.file_info(transcript_path),
+                                  "episodes": sum(1 for e in episodes if e.get("transcript")),
+                                  "format": "one gzip member per episode holding one canonical JSON line; "
+                                            "episode sha256 = sha256 of that line without the newline; "
+                                            "check with transcripts.py verify FILE"}
+        t = summary["transcripts"]
+        log(f"{tag} transcripts file {t['path']} bytes={t['bytes']} sha256={t['sha256']} episodes={t['episodes']}")
     return summary
 
 
@@ -406,7 +433,35 @@ def compare_modes(summaries, modes):
     tasks = sorted({e["task"] for s in summaries.values() for e in s.get("episodes_compact") or []})
     out["per_task_passes"] = {t: {m: sum(1 for e in summaries[m].get("episodes_compact") or []
                                          if e["task"] == t and e["passed"]) for m in modes} for t in tasks}
+    out["per_task"] = {}
+    for t in tasks:
+        per_mode = {}
+        for m in modes:
+            eps = sorted((e for e in summaries[m].get("episodes_compact") or [] if e["task"] == t),
+                         key=lambda e: (e.get("repeat") is None, e.get("repeat") or 0))
+            per_mode[m] = {"passed": sum(1 for e in eps if e["passed"]), "episodes": len(eps),
+                           "seeds": [e["seed"] for e in eps], "passed_seeds": [e["seed"] for e in eps if e["passed"]]}
+        fisher = common.fisher_exact(per_mode[a]["passed"], per_mode[a]["episodes"],
+                                     per_mode[b]["passed"], per_mode[b]["episodes"])
+        out["per_task"][t] = {**per_mode, "fisher_p_two_sided": fisher["p_two_sided"],
+                              "fisher_p_a_less": fisher["p_a_less"]}
     return out
+
+
+def per_task_lines(comparison, modes):
+    """Lines like `t09_ini_comments mtp 2/8 off 7/8 fisher_p=0.041`, one per task.
+
+    Fisher's test compares the first two modes."""
+    lines = []
+    rows = list((comparison.get("per_task") or {}).items())
+    if comparison.get("fisher_exact"):
+        rows.append(("all", {**{m: comparison["modes"][m] for m in modes},
+                             "fisher_p_two_sided": comparison["fisher_exact"]["p_two_sided"]}))
+    for task, v in rows:
+        p = v.get("fisher_p_two_sided")
+        lines.append(f"{task} " + " ".join(f"{m} {v[m]['passed']}/{v[m]['episodes']}" for m in modes)
+                     + (f" fisher_p={p:.4g}" if p is not None else ""))
+    return lines
 
 
 def agent_modes_phase(args, spec, work):
@@ -437,6 +492,16 @@ def agent_modes_phase(args, spec, work):
             serve["upload_fallback_lines"] = [l for l in server.log_head(100000) if "span alloc failed" in l][:5]
     out["comparison"] = compare_modes(out["modes"], args.agent_speculative)
     row("agent_comparison", out["comparison"])
+    modes = args.agent_speculative
+    if len(modes) >= 2:
+        log(f"agent per-task passes ({modes[0]} vs {modes[1]}, Fisher exact two-sided):")
+        for line in per_task_lines(out["comparison"], modes):
+            log("  " + line)
+    for mode in modes:
+        t = (out["modes"].get(mode) or {}).get("transcripts")
+        if t:
+            log(f"agent transcripts {mode}: {t['path']} bytes={t['bytes']} sha256={t['sha256']} "
+                f"episodes={t['episodes']}")
     return out
 
 
@@ -468,7 +533,8 @@ def parse_args(argv=None):
     p.add_argument("--stage-to", type=Path,
                    help="copy all shards of the model to this local directory before loading and run from there")
     p.add_argument("--serve-arg", action="append", default=[], help="extra gufo serve llm argument")
-    p.add_argument("--seed-base", type=int, default=1000)
+    p.add_argument("--seed-base", type=int, default=1000,
+                   help="eval repeat k uses seed-base + k; agent seeds: see --agent-repeats")
     # bench
     p.add_argument("--bench-depths", default="0,16384,65536")
     p.add_argument("--bench-repetitions", type=int, default=3)
@@ -483,10 +549,17 @@ def parse_args(argv=None):
     p.add_argument("--eval-budget-hours", type=float)
     # agent
     p.add_argument("--agent-repeats", type=int, default=2,
-                   help="repeats of every task; the request seed is fixed per (task, repeat)")
+                   help="repeats of every task; every request of an episode carries the seed "
+                        "--seed-base + 1000 * repeat + task index (repeat 0..N-1, index in the full sorted "
+                        "task list), so each repeat has a distinct seed and every --agent-speculative mode "
+                        "gets the same seeds (paired A/B). Seeded sampling is replayable: the same seed "
+                        "gives a near-identical episode, so a rerun with the same --seed-base repeats "
+                        "earlier evidence instead of adding independent samples; change --seed-base for "
+                        "fresh draws")
     p.add_argument("--agent-speculative",
                    help="comma list of serve --speculative modes (e.g. mtp,off; 'default' adds no flag): "
-                        "the agent phase runs once per mode on its own server, then the modes are compared")
+                        "the agent phase runs once per mode on its own server (modes one after another, tasks "
+                        "interleaved within a repeat), then the modes are compared per task and pooled")
     p.add_argument("--agent-tasks", help="comma list of task ids/prefixes")
     p.add_argument("--agent-max-steps", type=int, default=20)
     p.add_argument("--agent-time-limit", type=float, default=900)
@@ -494,6 +567,12 @@ def parse_args(argv=None):
     p.add_argument("--agent-parallel", type=int, default=1)
     p.add_argument("--agent-budget-hours", type=float)
     p.add_argument("--echo-reasoning", action="store_true")
+    p.add_argument("--agent-transcript-log", action="store_true",
+                   help="also print every episode transcript to the log as `[transcript] <key> <i>/<n> ...` "
+                        "lines (gzip+base64 of the JSON record); reassemble and verify with "
+                        "`transcripts.py decode LOG` (/opt/gufo/compare/transcripts.py in the image). "
+                        "Transcripts are always written to "
+                        "<work>/<model>/[agent-<mode>/]agent-transcripts[-<mode>].jsonl.gz")
     args = p.parse_args(argv)
     if args.quick:
         args.eval_repeats, args.agent_repeats = 1, 1

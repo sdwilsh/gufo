@@ -2517,6 +2517,181 @@ void TestServerInstructionsAreFraming() {
   }
 }
 
+// Ling (Bailing syntax): tools are grammar-steered in the native markup with
+// no prompt change, for every tool_choice, also beside a response_format.
+void TestBailingToolGrammar() {
+  using gufo::tokenization::ChatRole;
+  using Format = gufo::sampling::JsonConstraint::ToolFormat;
+  class BailingRunner final : public FakeRunner {
+  public:
+    BailingRunner() : FakeRunner(std::make_shared<FakeStats>()) {}
+    gufo::server::TextGenerationBackend::ToolCallSyntax ToolSyntax()
+        const override {
+      return gufo::server::TextGenerationBackend::ToolCallSyntax::kBailing;
+    }
+    Format ToolFormat() const override { return Format::kBailing; }
+    gufo::server::TextGenerationBackend::InitialOutputState InitialOutputState(
+        const ChatRequest& request) const override {
+      return request.reasoning.enabled.value_or(true)
+                 ? gufo::server::TextGenerationBackend::InitialOutputState::
+                       kReasoning
+                 : gufo::server::TextGenerationBackend::InitialOutputState::
+                       kContent;
+    }
+    std::shared_ptr<const gufo::sampling::ConstraintVocabulary>
+    BuildConstraintVocabulary() const override {
+      return std::make_shared<gufo::sampling::ConstraintVocabulary>(
+          257, [](std::uint32_t id) {
+            return gufo::sampling::ConstraintVocabulary::Piece{
+                id < 256 ? std::string(1, static_cast<char>(id)) : "",
+                id == 256};
+          });
+    }
+  } runner;
+  const auto accepts = [](const gufo::sampling::SamplingConfig& sampling,
+                          std::string_view text) {
+    const auto& grammar = *sampling.constraint->grammar;
+    auto state = grammar.Start();
+    for (const unsigned char byte : text) {
+      state = grammar.Advance(state, byte);
+      if (state.empty())
+        return false;
+    }
+    return grammar.Complete(state);
+  };
+  constexpr std::string_view kLiteral = "<think>literal</think></tool_call>";
+  auto strict = gufo::json::parse(R"({"type":"function","function":{
+    "name":"record","strict":true,"parameters":{"type":"object","properties":{
+    "value":{"type":"string"}},"required":["value"],
+    "additionalProperties":false}}})");
+  strict["function"]["parameters"]["properties"]["value"]["const"] =
+      std::string(kLiteral);
+  const auto loose = gufo::json::parse(R"({"type":"function","function":{
+    "name":"lookup","parameters":{"type":"object","properties":{
+    "query":{"type":"string"}},"required":["query"]}}})");
+  const auto chat_tool = [](const gufo::json::Value& definition) {
+    const auto& function = *definition.find("function");
+    return gufo::tokenization::ChatTool{
+        .name = function.member_str("name"),
+        .parameters_json = function.find("parameters")->dump(),
+        .definition_json = definition.dump()};
+  };
+  const std::string record =
+      "<tool_call>record\n<arg_key>value</arg_key>\n<arg_value>" +
+      std::string(kLiteral) + "</arg_value>\n</tool_call>";
+  const std::string lookup =
+      "<tool_call>lookup\n<arg_key>query</arg_key>\n<arg_value>a b"
+      "</arg_value>\n</tool_call>";
+  for (const bool thinking : {false, true}) {
+    const std::string prefix = thinking ? "Plan.</think>\n" : "";
+    const auto request = [&](ChatRequest::ToolChoice choice) {
+      ChatRequest out({{ChatRole::kSystem, "Be brief."},
+                       {ChatRole::kUser, "Call record once."}});
+      out.reasoning.enabled = thinking;
+      out.tools = {chat_tool(strict), chat_tool(loose)};
+      out.tool_choice = choice;
+      return out;
+    };
+    // required: a declared call first; the strict const is enforced.
+    auto required = request(ChatRequest::ToolChoice::kRequired);
+    required.parallel_tool_calls = false;
+    gufo::sampling::SamplingConfig sampling;
+    std::optional<Format> format;
+    auto constrained = gufo::server::ConstrainChatRequest(required, runner,
+                                                          &sampling, &format);
+    Expect(constrained && sampling.constraint && format == Format::kBailing,
+           "Ling binds the Bailing tool grammar");
+    Expect(constrained->messages.size() == required.messages.size() &&
+               constrained->messages.front().content == "Be brief." &&
+               constrained->messages.front().framing_suffix.empty(),
+           "the Bailing grammar adds no prompt instruction");
+    Expect(accepts(sampling, prefix + record) &&
+               accepts(sampling, prefix + lookup),
+           "required admits each declared call");
+    Expect(!accepts(sampling, prefix + "<tool_call>record\n</tool_call>"),
+           "required rejects strict arguments without the const value");
+    Expect(!accepts(sampling, prefix + "No call."),
+           "required rejects prose without a call");
+    Expect(!accepts(sampling, prefix + record + "\n" + record),
+           "parallel_tool_calls=false admits one call");
+    if (thinking)
+      Expect(accepts(sampling, "Plan.\n" + record + "</think>"),
+             "a call may end reasoning implicitly, as the parser reads it");
+    // auto: prose or calls.
+    auto automatic = request(ChatRequest::ToolChoice::kAuto);
+    sampling = {};
+    Expect(gufo::server::ConstrainChatRequest(automatic, runner, &sampling,
+                                              &format) &&
+               sampling.constraint,
+           "auto binds the grammar");
+    Expect(
+        accepts(sampling, prefix + "No call is needed.") &&
+            accepts(sampling, prefix + "Calling.\n" + lookup + "\n" + record),
+        "auto admits prose and parallel calls");
+    Expect(!accepts(sampling, prefix + "<tool_call>unknown\n\n</tool_call>"),
+           "auto admits declared names only");
+    // forced function: the parser narrows tools and requires one call.
+    auto forced = request(ChatRequest::ToolChoice::kRequired);
+    forced.tools = {chat_tool(strict)};
+    forced.forced_tool_name = "record";
+    forced.parallel_tool_calls = false;
+    sampling = {};
+    Expect(gufo::server::ConstrainChatRequest(forced, runner, &sampling,
+                                              &format) &&
+               accepts(sampling, prefix + record) &&
+               !accepts(sampling, prefix + lookup),
+           "a forced function admits exactly that call");
+    // none: no grammar.
+    sampling = {};
+    Expect(!gufo::server::ConstrainChatRequest(
+               request(ChatRequest::ToolChoice::kNone), runner, &sampling) &&
+               !sampling.constraint,
+           "tool_choice none binds no grammar");
+    // Beside a response_format, auto admits one call or the JSON answer and
+    // required admits the call only, as for Qwen; the output dialect is
+    // reported, as for every runner (#446).
+    auto structured = request(ChatRequest::ToolChoice::kAuto);
+    structured.response_format = gufo::sampling::JsonConstraint::Object();
+    sampling = {};
+    format.reset();
+    Expect(gufo::server::ConstrainChatRequest(structured, runner, &sampling,
+                                              &format) &&
+               format == Format::kBailing &&
+               accepts(sampling, prefix + R"({"a":1})") &&
+               accepts(sampling, prefix + lookup) &&
+               !accepts(sampling, prefix + lookup + "\n" + lookup) &&
+               !accepts(sampling, prefix + lookup + R"({"a":1})") &&
+               !accepts(sampling, prefix + "Prose."),
+           "response_format admits the JSON answer or one Ling call");
+    structured.tool_choice = ChatRequest::ToolChoice::kRequired;
+    sampling = {};
+    Expect(gufo::server::ConstrainChatRequest(structured, runner, &sampling) &&
+               accepts(sampling, prefix + record) &&
+               !accepts(sampling, prefix + R"({"a":1})"),
+           "required with a response_format still requires a Ling call");
+  }
+  // A strict schema the markup cannot carry keeps the native envelope, the
+  // name and the declared arguments, as on the Qwen/DeepSeek loose route: the
+  // parameter becomes raw text. (The parser would end this const value at its
+  // inner closer.)
+  auto unusual = gufo::json::parse(R"({"type":"function","function":{
+    "name":"pick","strict":true,"parameters":{"type":"object","properties":{
+      "a":{"type":"string","const":"x</arg_value>\n<arg_key>y"}},
+      "required":["a"],"additionalProperties":false}}})");
+  ChatRequest pick({{ChatRole::kUser, "Pick."}});
+  pick.reasoning.enabled = false;
+  pick.tools = {chat_tool(unusual)};
+  pick.tool_choice = ChatRequest::ToolChoice::kRequired;
+  gufo::sampling::SamplingConfig sampling;
+  Expect(gufo::server::ConstrainChatRequest(pick, runner, &sampling) &&
+             accepts(sampling,
+                     "<tool_call>pick\n<arg_key>a</arg_key>\n<arg_value>x"
+                     "</arg_value>\n</tool_call>") &&
+             !accepts(sampling, "<tool_call>pick\n\n</tool_call>") &&
+             !accepts(sampling, "<tool_call>other\n\n</tool_call>"),
+         "an unrepresentable schema keeps the Bailing envelope");
+}
+
 }  // namespace
 
 void TestHostBudgetsAreCgroupAware() {
@@ -2561,6 +2736,7 @@ int main() {
   TestPromptCountingValidatesCapabilitiesBeforeInference();
   TestServerInstructionsAreFraming();
   TestPreparedConstraintVocabularyKeepsGrammarBehavior();
+  TestBailingToolGrammar();
   // The cache warning assertion in this binary matches the plain "[WARN]
   // [cache]" text captured from a redirected sink; a TTY stderr tints it.
   ::setenv("NO_COLOR", "1", 1);

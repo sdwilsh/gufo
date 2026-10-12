@@ -79,7 +79,8 @@ struct BailingScan {
 /// array in that priority) and fall back to JSON, then to text. Unlike vLLM,
 /// typing follows local `$ref`s (at the root and in properties) and `const`,
 /// as the Bailing grammar does, and a recursive or unresolvable reference
-/// reads JSON, then text. `accept_unterminated` says the model finished the
+/// reads JSON, then text. Keys are stripped unless spelled exactly as a
+/// declared property. `accept_unterminated` says the model finished the
 /// output (EOS) rather than a stop string or the token limit cutting it. Only
 /// then is a call with no closing tag accepted, when it ends right after a
 /// complete argument (its unfinished argument is dropped), and only then does

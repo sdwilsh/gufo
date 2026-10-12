@@ -1,0 +1,179 @@
+#!/usr/bin/python3
+"""Run gufo test binaries and print one JSON document on stdout.
+
+usage: run-suite [--list] [--timeout SEC] [--tail-bytes N] [--suite FILE] [NAME...]
+Test binaries live in $GUFO_TEST_DIR (default /opt/gufo/tests). A suite file has
+one test per line ('#' comments):
+
+    [@label=NAME] [@timeout=SEC] BINARY [ARG ...]
+
+The script shell-splits the ARGs and expands $VAR and ${VAR}, so $TMPDIR works.
+The label (default: the binary name) names the result, so one binary can run
+several times. Default suite: /opt/gufo/suites/default.txt.
+Status: PASS (exit 0), SKIP (exit 77), FAIL (other exit), TIMEOUT, MISSING.
+The script captures a test's stdout apart from stderr. When stdout is one JSON
+document, optionally behind a leading "[report-json] " marker, the result
+carries it as "json" (kept even for FAIL and TIMEOUT; "stdout_bytes" is its
+size). Stderr streams live to this process's stderr (pod logs). "tail" holds
+the last bytes of stderr, and of stdout when stdout is not JSON.
+Extra env (for example GUFO_MODEL_PATH) passes to tests.
+The exit code is 0 unless a test has FAIL, TIMEOUT, or MISSING status (then 1).
+"""
+import argparse, ctypes, glob, json, os, platform, shlex, signal, subprocess, sys, threading, time
+
+TEST_DIR = os.environ.get("GUFO_TEST_DIR", "/opt/gufo/tests")
+DEFAULT_SUITE = os.environ.get("GUFO_SUITE", "/opt/gufo/suites/default.txt")
+
+def read(p):
+    try:
+        return open(p).read().strip()
+    except OSError:
+        return None
+
+def parse_entry(line):
+    """Return (label, timeout or None, binary, args) for one suite line."""
+    toks = shlex.split(line, comments=True)
+    label = timeout = None
+    while toks and toks[0].startswith("@"):
+        k, _, v = toks.pop(0)[1:].partition("=")
+        if k == "label":
+            label = v
+        elif k == "timeout":
+            timeout = float(v)
+        else:
+            raise ValueError("unknown suite directive @" + k)
+    if not toks:
+        raise ValueError("suite line without a binary: " + line)
+    binary = toks[0]
+    args = [os.path.expandvars(t) for t in toks[1:]]
+    return (label or binary, timeout, binary, args)
+
+def read_suite(path):
+    entries = []
+    for line in open(path):
+        if line.split("#")[0].strip():
+            entries.append(parse_entry(line))
+    return entries
+
+def gpu_info():
+    info = {"name": None, "gfx": None, "gtt_total": None, "gtt_used": None}
+    for p in sorted(glob.glob("/sys/class/kfd/kfd/topology/nodes/*/properties")):
+        props = dict(l.split(None, 1) for l in (read(p) or "").splitlines() if len(l.split(None, 1)) == 2)
+        v = int(props.get("gfx_target_version", "0"))
+        if v:
+            info["gfx"] = "gfx%d%x%x" % (v // 10000, (v // 100) % 100, v % 100)
+            break
+    try:
+        hip = ctypes.CDLL("libamdhip64.so.7")
+        buf = ctypes.create_string_buffer(256)
+        if hip.hipDeviceGetName(buf, 256, 0) == 0:
+            info["name"] = buf.value.decode()
+    except Exception as e:  # noqa
+        info["name_error"] = str(e)
+    for d in sorted(glob.glob("/sys/class/drm/card*/device")):
+        t, u = read(d + "/mem_info_gtt_total"), read(d + "/mem_info_gtt_used")
+        if t is not None:
+            info["gtt_total"], info["gtt_used"] = int(t), int(u or 0)
+            break
+    return info
+
+def available():
+    return sorted(f for f in os.listdir(TEST_DIR) if os.access(os.path.join(TEST_DIR, f), os.X_OK)) if os.path.isdir(TEST_DIR) else []
+
+MAX_JSON = 8 << 20
+
+def run_one(entry, default_timeout, tail_bytes):
+    label, own_timeout, name, args = entry
+    timeout = own_timeout or default_timeout
+    path = os.path.join(TEST_DIR, name)
+    if not os.access(path, os.X_OK):
+        return {"name": label, "status": "MISSING", "exit_code": None, "seconds": 0.0, "tail": ""}
+    t0 = time.monotonic()
+    p = subprocess.Popen([path] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         start_new_session=True, cwd=os.environ.get("HOME", "/work"))
+    err_tail = bytearray()
+    out_chunks, out_size = [], [0]
+
+    def pump_err():
+        for chunk in iter(lambda: p.stderr.read1(65536), b""):
+            sys.stderr.buffer.write(chunk)
+            sys.stderr.buffer.flush()
+            err_tail.extend(chunk)
+            del err_tail[:-tail_bytes * 4]
+
+    def pump_out():
+        for chunk in iter(lambda: p.stdout.read1(1 << 20), b""):
+            if out_size[0] < MAX_JSON:
+                out_chunks.append(chunk)
+            out_size[0] += len(chunk)
+
+    threads = [threading.Thread(target=pump_err, daemon=True), threading.Thread(target=pump_out, daemon=True)]
+    for t in threads:
+        t.start()
+    timed_out = False
+    try:
+        code = p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        os.killpg(p.pid, signal.SIGKILL)
+        p.wait()
+        code = None
+    for t in threads:
+        t.join(timeout=10)
+    status = "TIMEOUT" if timed_out else "PASS" if code == 0 else "SKIP" if code == 77 else "FAIL"
+    secs = round(time.monotonic() - t0, 3)
+    out = b"".join(out_chunks)
+    # A tool may write its one report behind a marker. Pod logs merge stdout and
+    # stderr, so the marker makes the single copy easy to find.
+    marker = b"[report-json] "
+    if out.lstrip().startswith(marker):
+        out = out.lstrip()[len(marker):]
+    result = {"name": label, "status": status, "exit_code": code, "seconds": secs, "stdout_bytes": out_size[0]}
+    tail = bytes(err_tail[-tail_bytes:])
+    try:
+        doc = json.loads(out.decode("utf-8", "replace")) if out.lstrip().startswith(b"{") else None
+    except ValueError:
+        doc = None
+    if doc is not None:
+        result["json"] = doc
+    else:
+        tail += b"\n--- stdout ---\n" + out[-tail_bytes:]
+    result["tail"] = tail.decode("utf-8", "replace")
+    print("[run-suite] %-40s %-7s %.1fs" % (label, status, secs), file=sys.stderr, flush=True)
+    return result
+
+def prep_work():
+    for v in ("XDG_CACHE_HOME", "TMPDIR"):
+        try:
+            os.makedirs(os.environ.get(v, "/work/" + v.lower()), exist_ok=True)
+        except OSError as e:
+            print("[run-suite] cannot create %s: %s" % (v, e), file=sys.stderr)
+
+def main():
+    prep_work()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--timeout", type=float, default=float(os.environ.get("RUN_SUITE_TIMEOUT", 300)))
+    ap.add_argument("--tail-bytes", type=int, default=4000)
+    ap.add_argument("--suite")
+    ap.add_argument("names", nargs="*")
+    a = ap.parse_args()
+    suite = a.suite or (DEFAULT_SUITE if os.path.exists(DEFAULT_SUITE) else None)
+    if a.list:
+        print(json.dumps({"image": os.environ.get("GUFO_IMAGE"), "binaries": available(),
+                          "default_suite": [list(e[:1]) + [e[2]] + e[3] for e in read_suite(suite)] if suite else []}, indent=1))
+        return 0
+    entries = [(n, None, n, []) for n in a.names]
+    if a.suite:
+        entries += read_suite(a.suite)
+    if not entries and suite:
+        entries = read_suite(suite)
+    if not entries:
+        entries = [(n, None, n, []) for n in available()]
+    results = [run_one(e, a.timeout, a.tail_bytes) for e in entries]
+    # One line per result keeps the embedded tool reports (large JSON) compact.
+    head = json.dumps({"image": os.environ.get("GUFO_IMAGE"), "host": platform.node(), "gpu": gpu_info()})
+    print(head[:-1] + ',"results":[\n' + ",\n".join(json.dumps(r) for r in results) + "\n]}")
+    return 0 if all(r["status"] in ("PASS", "SKIP") for r in results) else 1
+
+sys.exit(main())

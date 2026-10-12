@@ -128,6 +128,10 @@ public:
   /// Retain ordinary CPU/GPU sampling while its mask makes no restriction.
   /// Also true while ForcedToken() is set, so GPU samplers defer to the host.
   [[nodiscard]] bool NeedsConstraintMask() const;
+  /// The grammar state after the accepted tokens (empty without a grammar).
+  [[nodiscard]] const JsonConstraint::State& constraint_state() const noexcept {
+    return constraint_state_;
+  }
   [[nodiscard]] std::span<const TokenId> history() const noexcept;
   /// The token every sampling path returns next, if any: an exhausted
   /// reasoning budget forces its end sequence.

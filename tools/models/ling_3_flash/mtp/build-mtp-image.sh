@@ -1,9 +1,10 @@
 #!/bin/sh
 # usage (from workspace root, after building build/gpu-test and build/release):
 #   tools/models/ling_3_flash/mtp/build-mtp-image.sh [tag] [oracle-dir] [novel-oracle-dir] [peak-binary]
-# Stages the gpu-test binaries (standard + MTP tests), build/release/gufo, the suite drivers,
-# the oracles and the real-text corpora into build/ling-mtp-image-ctx and builds the image
-# locally. Never pushes. PARENT_GUFO (default build/base-release/gufo) becomes
+# Stages the gpu-test binaries (standard and MTP tests), build/release/gufo, the
+# suite drivers, the oracles, and the real-text corpora into
+# build/ling-mtp-image-ctx, then builds the image locally. Never pushes.
+# PARENT_GUFO (default build/base-release/gufo) becomes
 # /opt/gufo/base/gufo-parent for ling-int-bench's mtp_head_ab stage.
 set -eu
 tag=${1:-localhost/gufo-ling-ws38}
@@ -19,6 +20,8 @@ for t in dense_ops_test kda_ops_test mla_ops_test moe_ops_test session_test snap
          mtp_ops_test mtp_distribution mtp_head_ab \
          mtp_policy_test mtp_sampled_chain_test mtp_constrained_chain_test reload_test; do cp "$B/ling_3_flash_$t" "$ctx/tests/"; done
 cp "$here/suites-mtp-tests.txt" "$ctx/suites/mtp-tests.txt"
+cp "$here/suites-mtp-long-tests.txt" "$ctx/suites/mtp-long-tests.txt"
+cp "$here/suites-mtp-binding.txt" "$ctx/suites/mtp-binding.txt"
 cp "$int/suites-int-tests.txt" "$ctx/suites/int-tests.txt"
 cp tests/models/ling_3_flash/floor-memorised.json tests/models/ling_3_flash/floor-novel.json "$ctx/floor/"
 cp tests/models/ling_3_flash/greedy_adjudicated.json "$ctx/adjudicated/"

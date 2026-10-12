@@ -264,6 +264,8 @@ def run_episode(task, client, work, seed, max_steps, time_limit, max_tokens, con
     messages = [{"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": task["prompt"]}]
     steps = []
+    # Full per-turn transcript.  compare.py writes it to a side file, not the row.
+    transcript = []
     counters = {"calls": 0, "invalid_json": 0, "unknown_tool": 0, "bad_args": 0, "tool_errors": 0,
                 "empty_turns": 0}
     started = time.monotonic()
@@ -277,10 +279,12 @@ def run_episode(task, client, work, seed, max_steps, time_limit, max_tokens, con
         row = {"step": step,
                "prompt_sha256": hashlib.sha256(json.dumps(messages, sort_keys=True,
                                                           separators=(",", ":")).encode()).hexdigest()}
+        turn = {"step": step, "prompt_sha256": row["prompt_sha256"]}
+        transcript.append(turn)
         try:
             reply = complete(messages, TOOLS, max_tokens, seed, remaining + 5, extra_request)
         except (OSError, http.client.HTTPException, ValueError, KeyError) as error:
-            row["transport_error"] = repr(error)
+            row["transport_error"] = turn["transport_error"] = repr(error)
             steps.append(row)
             stop = "transport_error"
             break
@@ -298,8 +302,11 @@ def run_episode(task, client, work, seed, max_steps, time_limit, max_tokens, con
         row["tool_result_sha256"] = []
         row["content_chars"] = len(reply.get("content") or "")
         row["reasoning_chars"] = len(reply.get("reasoning") or "")
+        turn.update({k: reply.get(k) for k in ("http_status", "seconds", "finish_reason", "usage",
+                                               "content", "reasoning")})
+        turn["tool_calls"] = []
         if reply.get("http_status") != 200:
-            row["error"] = reply.get("error")
+            row["error"] = turn["error"] = reply.get("error")
             steps.append(row)
             stop = "http_error"
             break
@@ -329,6 +336,9 @@ def run_episode(task, client, work, seed, max_steps, time_limit, max_tokens, con
             counters["calls"] += 1
             error, args = validate_call({"name": call["name"], "arguments": call["arguments"]})
             record = {"name": call["name"], "valid": error is None}
+            # the arguments exactly as the server sent them (normally a JSON string)
+            said = {"id": call.get("id"), "wire_id": wire["id"], "name": call["name"],
+                    "arguments": call["arguments"], "valid": error is None, "error": error}
             t0 = time.monotonic()
             if error:
                 key = ("unknown_tool" if error.startswith("unknown") else
@@ -341,7 +351,10 @@ def run_episode(task, client, work, seed, max_steps, time_limit, max_tokens, con
                 if exec_error:
                     counters["tool_errors"] += 1
                     record["tool_error"] = exec_error
+                said["tool_error"] = exec_error
             record["seconds"] = round(time.monotonic() - t0, 3)
+            said["result"] = result
+            turn["tool_calls"].append(said)
             row["calls"].append(record)
             messages.append({"role": "tool", "tool_call_id": wire["id"], "content": result})
             row["tool_result_sha256"].append(hashlib.sha256(result.encode()).hexdigest())
@@ -363,7 +376,9 @@ def run_episode(task, client, work, seed, max_steps, time_limit, max_tokens, con
                                             "cached_tokens", "prefill_tokens", "finish_reason",
                                             "completion_tokens", "draft_tokens", "draft_tokens_accepted",
                                             "content_chars", "reasoning_chars")} for s in steps],
-           "calls": counters, "grade": result, "step_log": steps}
+           "calls": counters, "grade": result, "step_log": steps,
+           "transcript": {"system": SYSTEM_PROMPT, "prompt": task["prompt"], "echo_reasoning": echo_reasoning,
+                          "turns": transcript}}
     return row
 
 
