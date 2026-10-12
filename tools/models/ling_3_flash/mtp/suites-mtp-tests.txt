@@ -5,6 +5,14 @@
 # whole model, then the digests of an MTP-enabled decode_digest run, which ling-mtp-suite
 # compares with the standard run (MTP on must not move a bit of the trunk).
 @label=mtp_policy @timeout=300 ling_3_flash_mtp_policy_test
+# Sampled MTP must keep the autoregressive distribution: whole sequences of the production
+# proposal/verification code on a synthetic model (host only), then on the real model 400
+# sampled 12-token continuations per prompt x {Ling preset, preset + penalties} x {ar, mtp,
+# mtp with 3 fixed drafts} (prompts: prose and a short chat answer that usually stops),
+# teacher-forced PIT/KS, stop and top-1 calibration, final logits == teacher forcing, two-sample
+# permutation tests against ar (tests/models/ling_3_flash/mtp_distribution.cpp). ~25-40 min.
+@label=mtp_sampled_chain @timeout=600 ling_3_flash_mtp_sampled_chain_test
+@label=mtp_distribution @timeout=5400 ling_3_flash_mtp_distribution --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --samples 400 --tokens 12 --prompts 2 --configs preset,penalties --max-context 1024 --timeout-seconds 5300
 @label=mtp_ops @timeout=1800 ling_3_flash_mtp_ops_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --golden /opt/gufo/fixtures/mtp_reference_golden.txt
 @label=mtp_session @timeout=3600 ling_3_flash_mtp_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --gen-tokens 64 --max-context 1024
 # A second Model::Load in one process (decode_digest --graph-compare) needs the first model's
