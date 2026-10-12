@@ -10,4 +10,17 @@ function(add_ling_3_flash_test name library labels)
   add_dependencies(ling_3_flash_tests ${target})
 endfunction()
 
+set(LING_FIXTURES "${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+
 add_ling_3_flash_test(config gufo_ling_3_flash "cpu")
+
+set(LING_FIXTURES "${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+add_ling_3_flash_test(tokenizer gufo_ling_3_flash "cpu")
+target_compile_definitions(ling_3_flash_tokenizer_test PRIVATE
+  GUFO_LING_VOCAB_GGUF="${LING_FIXTURES}/ling-vocab.gguf.fixture"
+  GUFO_LING_TOKENIZER_GOLDENS="${LING_FIXTURES}/tokenizer_goldens.json")
+add_ling_3_flash_test(chat_template gufo_ling_3_flash "cpu")
+target_compile_definitions(ling_3_flash_chat_template_test PRIVATE
+  GUFO_LING_VOCAB_GGUF="${LING_FIXTURES}/ling-vocab.gguf.fixture"
+  GUFO_LING_CHAT_TEMPLATE="${LING_FIXTURES}/chat_template.jinja"
+  GUFO_LING_CHAT_GOLDENS="${LING_FIXTURES}/chat_template_goldens.json")
