@@ -2106,6 +2106,347 @@ void TestLlamaCppToolGrammarGoldens() {
   assert(rows == 688 && differences < rows / 5);
 }
 
+// Ling-3.0-flash: <tool_call>NAME\n<arg_key>K</arg_key>\n<arg_value>V
+// </arg_value>\n</tool_call>, raw text for strings and JSON otherwise.
+void TestBailingTools() {
+  using Format = JsonConstraint::ToolFormat;
+  const auto argument = [](std::string_view key, std::string_view value,
+                           bool separator = true) {
+    return std::string(separator ? "\n" : "") + "<arg_key>" + std::string(key) +
+           "</arg_key>\n<arg_value>" + std::string(value) + "</arg_value>";
+  };
+  const auto call = [](std::string_view name, std::string_view arguments) {
+    return "<tool_call>" + std::string(name) + std::string(arguments) +
+           "\n</tool_call>";
+  };
+  // The const value holds the call closer and reasoning tags (#openai_sdk
+  // check_strict_tools). Without the grammar Ling answered `record {}`.
+  constexpr std::string_view kLiteral = "<think>literal</think></tool_call>";
+  auto record = parse(R"({"type":"object","properties":{"value":{
+    "type":"string"}},"required":["value"],"additionalProperties":false})");
+  record["properties"]["value"]["const"] = std::string(kLiteral);
+  const auto parameters =
+      JsonConstraint::ToolParameters(record, true, Format::kBailing);
+  assert(parameters);
+  const auto forced = JsonConstraint::WithTools(
+      nullptr, {{"record", parameters}}, true, false, Format::kBailing);
+  const auto good = call("record", argument("value", kLiteral));
+  assert(Accepts(*forced, good));
+  assert(Accepts(*forced, "\n" + good));
+  assert(Accepts(*forced, " \n\n\n" + good));
+  // A required call cannot be put off by unbounded whitespace.
+  assert(!Accepts(*forced, "\n\n\n\n\n" + good));
+  assert(Accepts(*forced, good + "\nDone."));
+  // History renders pairs without separators and `NAME\n\n</tool_call>` when
+  // there are no arguments; both spellings stay admissible.
+  assert(
+      Accepts(*forced, "<tool_call>record<arg_key>value</arg_key><arg_value>" +
+                           std::string(kLiteral) + "</arg_value></tool_call>"));
+  assert(!Accepts(*forced, "<tool_call>record\n</tool_call>"));
+  assert(!Accepts(*forced, "<tool_call>record\n\n</tool_call>"));
+  assert(!Accepts(*forced, call("record", argument("value", "literal"))));
+  assert(!Accepts(*forced, call("other", argument("value", kLiteral))));
+  assert(!Accepts(*forced, call("record", argument("value", kLiteral) +
+                                              argument("value", kLiteral))));
+  assert(!Accepts(*forced, call("record", argument("value", kLiteral) +
+                                              argument("extra", "x"))));
+  assert(!Accepts(*forced, "Sure." + good));
+  assert(!Accepts(*forced, good + good));
+  assert(!Accepts(*forced, "ordinary text"));
+  const auto thinking = JsonConstraint::WithReasoning(forced);
+  assert(Accepts(*thinking, "Plan the call.</think>\n" + good));
+  // The parser ends reasoning at an unquoted call opener too; the grammar
+  // follows it. Bailing has no fixed header after `<tool_call>`, so the
+  // declared name completes it.
+  assert(Accepts(*thinking, "Plan the call.\n" + good));
+  assert(Accepts(*thinking, "Plan the call.\n" + good + "</think>"));
+  assert(
+      !Accepts(*thinking, "Plan the call.\n<tool_call>record\n</tool_call>"));
+  assert(!Accepts(*thinking, "Only thinking."));
+  assert(!Accepts(*thinking, "Plan.</think>Prose."));
+  assert(thinking == JsonConstraint::WithReasoning(forced));
+  // Quoted and fenced examples stay reasoning, as the native parsers (and the
+  // Bailing parser's quote tracking) read them.
+  assert(Accepts(*thinking, "Example: `<tool_call>other`.</think>\n" + good));
+  assert(Accepts(*thinking,
+                 "Example:\n```xml\n<tool_call>other\n```\n"
+                 "Now call it.</think>" +
+                     good));
+  // (An example holding `</think>` would still end the reasoning: only the
+  // call opener is quote-aware, as in the parsers.)
+  const auto example = call("record", argument("value", "x"));
+  assert(Accepts(*thinking, "Example: ``" + example + "``.</think>" + good));
+  // The fast reasoning mask agrees with scalar grammar evaluation, including
+  // partial markers, quoted openers and tokens crossing into the call.
+  {
+    const std::vector<ConstraintVocabulary::Piece> pieces{
+        {"word"},
+        {"\n"},
+        {"`"},
+        {"~~~\n"},
+        {"<"},
+        {"</think>"},
+        {"tool_call>"},
+        {"<tool_call>record"},
+        {"<tool_call>other"},
+        {good},
+        {"</think>" + good},
+        {"``" + example + "``"},
+        {""},
+        {"", true}};
+    const ConstraintVocabulary vocabulary(pieces.size(),
+                                          [&](auto id) { return pieces[id]; });
+    for (const auto& prefix : std::vector<std::string>{
+             "", "Plan.\n", "Example: `literal ", "```xml\n", "<", "</",
+             "<tool_", "~~~\n", "``" + example, "</think>", "Plan.\n" + good}) {
+      auto checked = thinking->Start();
+      for (const unsigned char byte : prefix)
+        checked = thinking->Advance(checked, byte);
+      assert(!checked.empty());
+      const auto mask = vocabulary.Allowed(*thinking, checked);
+      for (std::uint32_t id = 0; id < pieces.size(); ++id)
+        assert(bool(mask[id]) == vocabulary.Allows(*thinking, checked, id));
+    }
+  }
+
+  // Types: strings raw, everything else JSON; unions per branch.
+  const auto typed = parse(R"({"type":"object","properties":{
+      "text":{"type":"string","minLength":1},
+      "n":{"type":"integer","minimum":1,"maximum":5},
+      "flag":{"type":"boolean"},
+      "tags":{"type":"array","items":{"type":"string"},"maxItems":2},
+      "note":{"type":["string","null"]},
+      "mode":{"anyOf":[{"type":"string","enum":["fast","slow"]},
+                       {"type":"integer"}]}},
+    "required":["text","n","flag","tags","note","mode"],
+    "additionalProperties":false})");
+  const auto typed_parameters =
+      JsonConstraint::ToolParameters(typed, true, Format::kBailing);
+  assert(typed_parameters);
+  const auto tools = JsonConstraint::WithTools(
+      nullptr, {{"f", typed_parameters}}, true, false, Format::kBailing);
+  const auto with = [&](std::string_view text, std::string_view n,
+                        std::string_view tags, std::string_view note,
+                        std::string_view mode, bool reverse = false) {
+    const auto a = argument("text", text) + argument("n", n) +
+                   argument("flag", "true") + argument("tags", tags);
+    const auto b = argument("note", note) + argument("mode", mode);
+    return call("f", reverse ? b + a : a + b);
+  };
+  const auto valid = with(" \"42\" \\ <think>x</think> π🦉\n</tool_call> ", "3",
+                          R"(["a", "b"])", "null", "fast");
+  assert(Accepts(*tools, valid));
+  assert(Accepts(*tools, with("x", "5", "[]", "free text", "12", true)));
+  assert(!Accepts(*tools, with("", "3", "[]", "null", "fast")));
+  assert(!Accepts(*tools, with("x", "6", "[]", "null", "fast")));
+  assert(!Accepts(*tools, with("x", "\"3\"", "[]", "null", "fast")));
+  assert(!Accepts(*tools, with("x", "3", R"(["a","b","c"])", "null", "fast")));
+  assert(!Accepts(*tools, with("x", "3", "[1]", "null", "fast")));
+  assert(!Accepts(*tools, with("x", "3", "[]", "null", "medium")));
+  // A free value ends at the first argument closer, as FindValueClose reads it.
+  assert(!Accepts(*tools, with("a</arg_value>b", "3", "[]", "null", "fast")));
+  // Mask and byte matching agree across markup and multibyte boundaries.
+  std::vector<std::string> pieces{
+      "<tool_call>", "</tool_call>", "<arg_key>", "</arg_value>",
+      "🦉",          "\n",           ""};
+  for (unsigned byte = 0; byte < 256; ++byte)
+    pieces.emplace_back(1, static_cast<char>(byte));
+  const ConstraintVocabulary vocabulary(pieces.size(), [&](std::uint32_t i) {
+    return ConstraintVocabulary::Piece{pieces[i], i == 6};
+  });
+  auto state = tools->Start();
+  for (const unsigned char byte : valid) {
+    const auto mask = vocabulary.Allowed(*tools, state);
+    for (std::uint32_t token = 0; token < pieces.size(); ++token)
+      assert(vocabulary.Allows(*tools, state, token) == bool(mask[token]));
+    state = tools->Advance(state, byte);
+  }
+  assert(tools->Complete(state) && vocabulary.Allowed(*tools, state)[6]);
+
+  // A literal that would end its value early in the parser has no faithful
+  // pair. As for Qwen and DeepSeek, the tool keeps its native syntax on the
+  // loose route: the parameter becomes raw text, which cannot contain the
+  // closer, instead of a JSON envelope.
+  auto unsafe = record;
+  unsafe["properties"]["value"]["const"] = "a</arg_value>\n<arg_key>b";
+  {
+    const auto loose_unsafe =
+        JsonConstraint::ToolParameters(unsafe, true, Format::kBailing);
+    assert(loose_unsafe);
+    const auto grammar = JsonConstraint::WithTools(
+        nullptr, {{"record", loose_unsafe}}, true, false, Format::kBailing);
+    assert(Accepts(*grammar, call("record", argument("value", "a"))));
+    assert(!Accepts(*grammar, call("record", "")));
+    assert(!Accepts(*grammar, "{\"name\":\"record\",\"arguments\":{}}"));
+  }
+  unsafe["properties"]["value"]["const"] = "a</arg_value>b</arg_value>";
+  assert(JsonConstraint::ToolParameters(unsafe, true, Format::kBailing));
+  // The parser keeps a declared key's exact spelling, so a name with
+  // surrounding spaces is an ordinary, enforced argument.
+  for (const std::string name : {" text", "text ", " value "}) {
+    auto spaced = parse(R"({"type":"object","additionalProperties":false,
+      "properties":{"kept":{"type":"integer"}}})");
+    spaced["properties"][name]["type"] = "string";
+    spaced["required"] = gufo::json::Value::array();
+    spaced["required"].push_back(name);
+    spaced["required"].push_back("kept");
+    for (const bool strict : {true, false}) {
+      const auto parameters =
+          JsonConstraint::ToolParameters(spaced, strict, Format::kBailing);
+      assert(parameters);
+      const auto grammar = JsonConstraint::WithTools(
+          nullptr, {{"f", parameters}}, true, false, Format::kBailing);
+      assert(Accepts(*grammar,
+                     call("f", argument(name, "x") + argument("kept", "3"))));
+      assert(!Accepts(*grammar, call("f", argument("kept", "3"))));
+      assert(!Accepts(
+          *grammar, call("f", argument("text", "x") + argument("kept", "3"))));
+    }
+  }
+  // Keys the parser would cut cannot be read back: the loose route drops
+  // them (and their requirement) and keeps the remaining arguments.
+  {
+    auto unusual = parse(R"({"type":"object","additionalProperties":false,
+      "properties":{"kept":{"type":"integer"},"a<b":{"type":"string"}},
+      "required":["a<b","kept"]})");
+    const auto parameters =
+        JsonConstraint::ToolParameters(unusual, true, Format::kBailing);
+    assert(parameters);
+    const auto grammar = JsonConstraint::WithTools(
+        nullptr, {{"f", parameters}}, true, false, Format::kBailing);
+    assert(Accepts(*grammar, call("f", argument("kept", "3"))));
+    assert(!Accepts(*grammar, call("f", argument("kept", "three"))));
+    assert(!Accepts(*grammar, call("f", "")));
+  }
+  // As for Qwen, undeclared names would read back as text, so an open or
+  // pattern-typed object generates its declared names only (#438), and a
+  // root union declares none.
+  for (const auto* extra :
+       {R"("additionalProperties":true)", R"("patternProperties":{"^x_":{}})",
+        R"("patternProperties":{"^x_":{"type":"string"}})"}) {
+    const auto open = parse(std::string(R"({"type":"object","properties":{
+      "value":{"type":"string"}},"required":["value"],)") +
+                            extra + "}");
+    const auto grammar = JsonConstraint::WithTools(
+        nullptr,
+        {{"record",
+          JsonConstraint::ToolParameters(open, false, Format::kBailing)}},
+        true, false, Format::kBailing);
+    assert(Accepts(*grammar, call("record", argument("value", "alpha"))));
+    assert(!Accepts(*grammar, call("record", argument("value", "alpha") +
+                                                 argument("x_n", "1"))));
+  }
+  {
+    const auto grammar = JsonConstraint::WithTools(
+        nullptr,
+        {{"lookup", JsonConstraint::ToolParameters(
+                        parse(R"({"type":"object","oneOf":[{"properties":{
+                "key":{"type":"string"}},"required":["key"]}]})"),
+                        false, Format::kBailing)}},
+        true, false, Format::kBailing);
+    assert(Accepts(*grammar, "<tool_call>lookup\n\n</tool_call>"));
+    assert(!Accepts(*grammar, call("lookup", argument("key", "alpha"))));
+  }
+  // A parameter whose only keyword makes it a non-empty string (the loose
+  // route's probe compiles that raw value as the whole grammar) keeps its
+  // constraint instead of crashing the compiler.
+  for (const auto* keyword :
+       {R"("minLength":1)", R"("pattern":"^[0-9]+$")", R"("maxLength":2)"}) {
+    const auto grammar = JsonConstraint::WithTools(
+        nullptr,
+        {{"record", JsonConstraint::ToolParameters(
+                        parse(std::string(R"({"type":"object","properties":{
+                "v":{)") + keyword +
+                              R"(}},"required":["v"],
+                "additionalProperties":false})"),
+                        false, Format::kBailing)}},
+        true, false, Format::kBailing);
+    assert(Accepts(*grammar, call("record", argument("v", "42"))));
+  }
+  // An untyped enum mixing strings and numbers admits every member: each
+  // value kind has its own cached check.
+  for (const auto* members : {R"(["42",17])", R"([17,"42"])"}) {
+    const auto grammar = JsonConstraint::WithTools(
+        nullptr,
+        {{"record", JsonConstraint::ToolParameters(
+                        parse(std::string(R"({"type":"object","properties":{
+                "v":{"enum":)") +
+                              members + R"(}},"required":["v"],
+                "additionalProperties":false})"),
+                        false, Format::kBailing)}},
+        true, false, Format::kBailing);
+    assert(Accepts(*grammar, call("record", argument("v", "17"))));
+    assert(Accepts(*grammar, call("record", argument("v", "42"))));
+    assert(!Accepts(*grammar, call("record", argument("v", "18"))));
+  }
+  // A parameter referring back to the tool's own schema is recursive: as on
+  // the Qwen route, any JSON value is admitted there, not only an object.
+  {
+    const auto grammar = JsonConstraint::WithTools(
+        nullptr,
+        {{"record",
+          JsonConstraint::ToolParameters(
+              parse(R"({"type":"object","properties":{"value":{"$ref":"#"}},
+                "required":["value"]})"),
+              false, Format::kBailing)}},
+        true, false, Format::kBailing);
+    assert(Accepts(*grammar, call("record", argument("value", "5"))));
+    assert(Accepts(*grammar,
+                   call("record", argument("value", R"({"value": 5})"))));
+  }
+  // A non-object root declares no arguments, as in llama.cpp.
+  {
+    const auto parameters = JsonConstraint::ToolParameters(
+        parse(R"({"anyOf":[{"type":"object"},{"type":"string"}]})"), false,
+        Format::kBailing);
+    assert(parameters);
+    const auto grammar = JsonConstraint::WithTools(
+        nullptr, {{"f", parameters}}, true, false, Format::kBailing);
+    assert(Accepts(*grammar, "<tool_call>f\n\n</tool_call>"));
+  }
+
+  // Non-strict: optional arguments, open objects and untyped tools.
+  const auto loose = parse(R"({"type":"object","properties":{
+      "path":{"type":"string"},"limit":{"type":"integer"},
+      "edits":{"type":"array","items":{"type":"object","properties":{
+        "oldText":{"type":"string"}},"required":["oldText"]}}},
+    "required":["path"]})");
+  const auto automatic = JsonConstraint::WithTools(
+      nullptr,
+      {{"read", JsonConstraint::ToolParameters(loose, false, Format::kBailing)},
+       {"anything", JsonConstraint::OpenToolParameters(Format::kBailing)}},
+      false, true, Format::kBailing);
+  const auto read = call("read", argument("path", "/tmp/a b"));
+  assert(Accepts(*automatic, "No call needed."));
+  assert(Accepts(*automatic, "Reading.\n" + read));
+  assert(Accepts(*automatic, read + "\n" + read + "\nDone."));
+  assert(Accepts(
+      *automatic,
+      call("read", argument("path", "x") + argument("limit", "4") +
+                       argument("edits", R"([{"oldText":"a","extra":1}])"))));
+  assert(Accepts(*automatic, "<tool_call>anything\n\n</tool_call>"));
+  assert(Accepts(
+      *automatic,
+      call("anything", argument("k", "v") + argument("other key", "</"))));
+  assert(!Accepts(*automatic, call("anything", argument(" k", "v"))));
+  assert(!Accepts(*automatic, call("read", argument("limit", "4"))));
+  assert(!Accepts(*automatic, call("read", argument("path", "x") +
+                                               argument("limit", "four"))));
+  assert(!Accepts(*automatic, call("missing", "")));
+  const auto single = JsonConstraint::WithTools(
+      nullptr,
+      {{"read",
+        JsonConstraint::ToolParameters(loose, false, Format::kBailing)}},
+      false, false, Format::kBailing);
+  assert(Accepts(*single, "Reading.\n" + read + "\nDone."));
+  assert(!Accepts(*single, read + "\n" + read));
+  const auto auto_thinking = JsonConstraint::WithReasoning(automatic);
+  assert(Accepts(*auto_thinking, "Nothing to call."));
+  assert(Accepts(*auto_thinking, "Hmm.</think>Answer."));
+  assert(Accepts(*auto_thinking, "Hmm.\n" + read + "</think>\nDone."));
+  assert(!Accepts(*auto_thinking, "Hmm.\n" + call("read", "")));
+}
+
 int main(int argc, char** argv) {
   // Batch probes for the independent Python JSON Schema validator. This
   // exercises the production byte matcher without requiring model weights.
@@ -2159,6 +2500,7 @@ int main(int argc, char** argv) {
   TestUntypedNonStrictTools();
   TestMixedBestEffortToolRoutes();
   TestToolSchemaSafety();
+  TestBailingTools();
   TestNativeToolSchemaMatrix();
   TestLlamaCppToolGrammarGoldens();
   std::cout << "JSON constraints: language, schema, Unicode and sampler checks "

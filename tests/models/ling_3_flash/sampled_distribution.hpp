@@ -286,6 +286,116 @@ struct TwoSample {
   return out;
 }
 
+/// Two-sided permutation test of a per-sequence statistic (difference of the
+/// group means): long-output summaries such as the mean log-probability of
+/// the committed tokens or the repeated n-gram rate.
+[[nodiscard]] inline PermutationTest::Result MeanDifferenceTest(
+    const std::vector<double>& a, const std::vector<double>& b,
+    std::size_t permutations, std::uint64_t seed) {
+  std::vector<double> all(a);
+  all.insert(all.end(), b.begin(), b.end());
+  const auto statistic = [&](std::span<const std::uint32_t> order) {
+    double sa = 0.0;
+    double sb = 0.0;
+    for (std::size_t i = 0; i < order.size(); ++i) {
+      (i < a.size() ? sa : sb) += all[order[i]];
+    }
+    return std::fabs(
+        sa / static_cast<double>(std::max<std::size_t>(1, a.size())) -
+        sb / static_cast<double>(std::max<std::size_t>(1, b.size())));
+  };
+  std::vector<std::uint32_t> order(all.size());
+  for (std::uint32_t i = 0; i < order.size(); ++i) {
+    order[i] = i;
+  }
+  PermutationTest::Result out;
+  out.permutations = permutations;
+  out.statistic = statistic(order);
+  std::mt19937_64 rng(seed);
+  std::size_t at_least = 0;
+  for (std::size_t k = 0; k < permutations; ++k) {
+    std::ranges::shuffle(order, rng);
+    at_least += statistic(order) >= out.statistic - 1e-12 ? 1 : 0;
+  }
+  out.p =
+      static_cast<double>(at_least + 1) / static_cast<double>(permutations + 1);
+  return out;
+}
+
+/// Permutation test of the pooled token frequencies (total variation between
+/// the groups' unigram distributions; whole sequences are permuted).
+[[nodiscard]] inline PermutationTest::Result UnigramTest(
+    const std::vector<Sequence>& a, const std::vector<Sequence>& b,
+    std::size_t permutations, std::uint64_t seed) {
+  std::map<std::int64_t, std::uint32_t> ids;
+  std::vector<std::vector<std::uint32_t>> items;
+  for (const auto* group : {&a, &b}) {
+    for (const auto& s : *group) {
+      std::vector<std::uint32_t> row;
+      for (const auto token : s.tokens) {
+        row.push_back(
+            ids.try_emplace(token, static_cast<std::uint32_t>(ids.size()))
+                .first->second);
+      }
+      items.push_back(std::move(row));
+    }
+  }
+  std::vector<double> ca(ids.size());
+  std::vector<double> cb(ids.size());
+  const auto statistic = [&](std::span<const std::uint32_t> order) {
+    std::ranges::fill(ca, 0.0);
+    std::ranges::fill(cb, 0.0);
+    double na = 0.0;
+    double nb = 0.0;
+    for (std::size_t i = 0; i < order.size(); ++i) {
+      auto& counts = i < a.size() ? ca : cb;
+      for (const auto id : items[order[i]]) {
+        counts[id] += 1.0;
+      }
+      (i < a.size() ? na : nb) += static_cast<double>(items[order[i]].size());
+    }
+    double tv = 0.0;
+    for (std::size_t k = 0; k < ca.size(); ++k) {
+      tv += std::fabs(ca[k] / std::max(na, 1.0) - cb[k] / std::max(nb, 1.0));
+    }
+    return 0.5 * tv;
+  };
+  std::vector<std::uint32_t> order(items.size());
+  for (std::uint32_t i = 0; i < order.size(); ++i) {
+    order[i] = i;
+  }
+  PermutationTest::Result out;
+  out.permutations = permutations;
+  out.statistic = statistic(order);
+  std::mt19937_64 rng(seed);
+  std::size_t at_least = 0;
+  for (std::size_t k = 0; k < permutations; ++k) {
+    std::ranges::shuffle(order, rng);
+    at_least += statistic(order) >= out.statistic - 1e-12 ? 1 : 0;
+  }
+  out.p =
+      static_cast<double>(at_least + 1) / static_cast<double>(permutations + 1);
+  return out;
+}
+
+/// Fraction of positions whose n-gram (ending there) already occurred earlier
+/// in the same sequence: degenerate repetition over long outputs.
+[[nodiscard]] inline double RepeatedNgramRate(const Sequence& s,
+                                              std::size_t n = 4) {
+  if (s.tokens.size() <= n) {
+    return 0.0;
+  }
+  std::map<std::vector<std::int64_t>, int> seen;
+  std::size_t repeated = 0;
+  for (std::size_t i = n - 1; i < s.tokens.size(); ++i) {
+    std::vector<std::int64_t> gram(s.tokens.begin() + (i + 1 - n),
+                                   s.tokens.begin() + (i + 1));
+    repeated += seen[gram]++ > 0 ? 1 : 0;
+  }
+  return static_cast<double>(repeated) /
+         static_cast<double>(s.tokens.size() + 1 - n);
+}
+
 }  // namespace gufo::tests::ling
 
 #endif  // GUFO_TESTS_MODELS_LING_3_FLASH_SAMPLED_DISTRIBUTION_HPP_

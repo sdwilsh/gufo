@@ -22,7 +22,10 @@ namespace gufo::sampling {
 // verification.
 class JsonConstraint {
 public:
-  enum class ToolFormat { kJson, kQwen, kDeepSeek };
+  // kBailing is Ling-3.0-flash's `<tool_call>NAME<arg_key>K</arg_key>
+  // <arg_value>V</arg_value></tool_call>` markup (src/models/ling_3_flash/
+  // tool_calls.hpp): string values are raw text, others JSON.
+  enum class ToolFormat { kJson, kQwen, kDeepSeek, kBailing };
   struct Stack {
     std::vector<std::uint32_t> symbols;
     std::string lexeme;
@@ -53,6 +56,10 @@ public:
   // types. It preserves the model's native string/DSML typed-value semantics.
   static std::shared_ptr<const JsonConstraint> OpenToolParameters(
       ToolFormat format);
+  // Reasoning ends at `</think>`. With native tools an unquoted call header
+  // also ends it and starts the call (Qwen `<tool_call>\n<function=`, DSML
+  // `<｜DSML｜tool_calls>\n<｜DSML｜invoke name="`, Bailing `<tool_call>`
+  // followed by a declared name), as the native parsers read it.
   static std::shared_ptr<const JsonConstraint> WithReasoning(
       std::shared_ptr<const JsonConstraint> answer);
   using Tool = std::pair<std::string, std::shared_ptr<const JsonConstraint>>;
@@ -81,6 +88,8 @@ private:
   std::string prompt_;
   bool stop_only_when_complete_{true};
   bool automatic_tools_{false};
+  // Native reasoning may end at an unquoted call header instead of
+  // `</think>`: the header's fixed prefix, and the rule that follows it.
   std::string reasoning_tool_prefix_;
   std::uint32_t reasoning_tool_root_{0};
 };

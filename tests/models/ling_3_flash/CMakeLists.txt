@@ -20,6 +20,13 @@ target_compile_definitions(ling_3_flash_tokenizer_test PRIVATE
 add_ling_3_flash_test(snapshot_format gufo_ling_3_flash "cpu")
 add_ling_3_flash_test(mtp_policy gufo_ling_3_flash "cpu")
 add_ling_3_flash_test(mtp_sampled_chain gufo_ling_3_flash "cpu")
+# Sampled MTP under the server's Bailing tool grammar; parses complete calls
+# with the server's Bailing parser.
+add_ling_3_flash_test(mtp_constrained_chain gufo_ling_3_flash "cpu")
+target_sources(ling_3_flash_mtp_constrained_chain_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/models/ling_3_flash/tool_calls.cpp)
+target_link_libraries(ling_3_flash_mtp_constrained_chain_test PRIVATE gufo_core)
+set_tests_properties(ling_3_flash.mtp_constrained_chain PROPERTIES TIMEOUT 1800)
 add_ling_3_flash_test(chat_template gufo_ling_3_flash "cpu")
 target_compile_definitions(ling_3_flash_chat_template_test PRIVATE
   GUFO_LING_VOCAB_GGUF="${LING_FIXTURES}/ling-vocab.gguf.fixture"
@@ -59,9 +66,10 @@ if (ENGINE_ENABLE_HIP)
     if (name STREQUAL "mtp_test" OR name STREQUAL "batch_test")
       # serving_strict_tool_* (mtp_test), serving_* (batch_test): the
       # InferenceBackend path (scheduler, runner pool, Ling runner; grammar
-      # binding, MTP decode), compiled in as for the
+      # binding, MTP decode, Bailing parser), compiled in as for the
       # Flash-Next session test.
       target_sources(${target} PRIVATE
+        ${PROJECT_SOURCE_DIR}/src/models/ling_3_flash/tool_calls.cpp
         ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_cache.cpp
         ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_disk_store.cpp
         ${PROJECT_SOURCE_DIR}/src/cli/serve/component_text_cache.cpp
@@ -70,6 +78,11 @@ if (ENGINE_ENABLE_HIP)
         ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp)
       target_link_libraries(${target} PRIVATE gufo_logging
         gufo_qwen38_flash_next gufo_deepseek_v4_flash gufo_cache_hip)
+    endif()
+    if (name STREQUAL "mtp_distribution")
+      # Tool-call arguments are read back with the server's Bailing parser.
+      target_sources(${target} PRIVATE
+        ${PROJECT_SOURCE_DIR}/src/models/ling_3_flash/tool_calls.cpp)
     endif()
     if (GUFO_LING_MODEL)
       add_test(NAME ling_3_flash.model_${name}
