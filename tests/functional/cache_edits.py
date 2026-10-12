@@ -1,10 +1,30 @@
 """Regression checks for prefix reuse after editing conversation history."""
 
 from copy import deepcopy
+import re
 import sys
 
+from cache_growth import log_offset
+from check_report import check_line
 
-def check_cache_edits(client, model, checks, chat_result):
+
+def refused_checkpoints(server_log, start):
+    """Prompt lengths of checkpoints the RAM budget refused since `start`."""
+    if server_log is None:
+        return []
+    with server_log.open("rb") as log:
+        log.seek(start)
+        window = log.read().decode(errors="replace")
+    return [int(tokens) for tokens in re.findall(
+        r"event=snapshot action=skipped reason=(?:byte|entry)_capacity "
+        r"bytes=\d+ tokens=(\d+) ", window)]
+
+
+def check_cache_edits(client, model, checks, chat_result, checkpoint_tail=0, server_log=None):
+    """`checkpoint_tail`: prompt tokens an exact replay may prefill again
+    (CHECKPOINT_TAIL_TOKENS). A failed edit names the checkpoints the RAM
+    budget refused meanwhile: under memory pressure earlier checkpoints are
+    best-effort (docs/KV-CACHE.md), which the report must show, not hide."""
     # Start each shape with a complete synthetic history, so no earlier request
     # has already supplied a convenient checkpoint before the edit. Distinct
     # prompt heads keep the histories independent even with --sessions 1.
@@ -68,12 +88,15 @@ def check_cache_edits(client, model, checks, chat_result):
 
         initial_request = deepcopy(request)
         initial_request["extra_body"]["cache_prompt"] = False
+        before_initial = log_offset(server_log)
         cold = chat("initial", initial_request)
         total, reused, prefilled = work(cold)
         assert total >= 2048 and reused == 0 and prefilled == total, cold
         warm = chat("unchanged", request)
         warm_total, reused, prefilled = work(warm)
         assert warm_total == total, (total, warm)
+        assert reused >= total - checkpoint_tail and prefilled <= checkpoint_tail, (
+            checkpoint_tail, warm)
         assert signature(warm) == signature(cold), (warm, cold)
 
         edited_request = deepcopy(request)
@@ -100,7 +123,8 @@ def check_cache_edits(client, model, checks, chat_result):
                     "prefill_tokens": prefilled,
                     **{key: detail.get(key) for key in (
                         "cache_hit", "cache_miss_reason", "cache_common_prefix_tokens",
-                        "cache_checkpoint_tokens", "prefill_ms", "cache_restore_ms")}}
+                        "cache_checkpoint_tokens", "prefill_ms", "cache_restore_ms")},
+                    "refused_checkpoint_tokens": refused_checkpoints(server_log, before_initial)}
         # Miss diagnostics exist only on misses. Check that a full re-prefill
         # really is the reported late-divergence failure, not an evicted entry
         # or a fixture that accidentally rewrote the prompt head.

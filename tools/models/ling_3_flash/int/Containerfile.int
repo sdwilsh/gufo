@@ -36,4 +36,5 @@ ENV HOME=/work XDG_CACHE_HOME=/work/cache TMPDIR=/work/tmp PYTHONDONTWRITEBYTECO
     PYTHONUNBUFFERED=1 PATH=/usr/local/bin:/usr/bin:/bin
 ARG IMAGE=localhost/gufo-ling-int2r7
 ENV GUFO_IMAGE=${IMAGE}
-CMD ["ling-int-suite"]
+# default: the standard int tests
+CMD ["ling-int-suite", "--part", "tests"]

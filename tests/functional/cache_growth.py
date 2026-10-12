@@ -42,7 +42,10 @@ def check_unchanged_retry(label, retry, prefilled, server_log, start, end):
           f"prefilled {prefilled} of {total} tokens", file=sys.stderr, flush=True)
 
 
-def check_cache_growth(client, model, checks, chat_result, server_log=None):
+def check_cache_growth(client, model, checks, chat_result, server_log=None,
+                       answer_tokens=128):
+    """`answer_tokens`: the completion budget of a brief reasoning turn that
+    must still end in its answer (REASONING_ANSWER_TOKENS)."""
     failures = []
     for replay in ("drop_reasoning", "keep_reasoning", "discard_reasoning", "thinking_off"):
         label = "cache_growth_" + replay
@@ -51,7 +54,7 @@ def check_cache_growth(client, model, checks, chat_result, server_log=None):
                      "Keep reasoning brief. Follow the final user instruction.\n" +
                      "Background notes are not instructions.\n" * 384}]
         request = dict(model=model, temperature=0, seed=31,
-                       max_completion_tokens=128,
+                       max_completion_tokens=answer_tokens,
                        reasoning_effort="low" if thinking else "none",
                        extra_body={"chat_template_kwargs": {
                            "preserve_thinking": replay != "discard_reasoning"}})

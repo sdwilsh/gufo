@@ -21,6 +21,8 @@ import sys
 import kl_base
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+TEXT = os.environ.get("ORACLE_TEXT", f"{HERE}/oracle_text.txt")
+PROMPTS = os.environ.get("ORACLE_PROMPTS", f"{HERE}/oracle_prompts.json")
 
 
 def sha256(path):
@@ -43,8 +45,8 @@ def model_info(cmd):
 
 def main():
     out = sys.argv[1]
-    shutil.copyfile(f"{HERE}/oracle_text.txt", f"{out}/input_text.txt")
-    shutil.copyfile(f"{HERE}/oracle_prompts.json", f"{out}/prompts_raw.json")
+    shutil.copyfile(TEXT, f"{out}/input_text.txt")
+    shutil.copyfile(PROMPTS, f"{out}/prompts_raw.json")
 
     greedy = [json.loads(l) for l in open(f"{out}/greedy.jsonl") if l.strip()]
     with open(f"{out}/prompts.jsonl", "w") as f:
@@ -75,9 +77,9 @@ def main():
         if name == "MANIFEST.json" or not os.path.isfile(p):
             continue
         files[name] = {"sha256": sha256(p), "bytes": os.path.getsize(p)}
-    for name in ("oracle_text.txt", "oracle_prompts.json"):
-        files[f"(repo) tools/models/ling_3_flash/{name}"] = {
-            "sha256": sha256(f"{HERE}/{name}"), "bytes": os.path.getsize(f"{HERE}/{name}")}
+    for path in (TEXT, PROMPTS):
+        files[f"(repo) tools/models/ling_3_flash/{os.path.basename(path)}"] = {
+            "sha256": sha256(path), "bytes": os.path.getsize(path)}
 
     manifest = {
         "llama_cpp_version": version,

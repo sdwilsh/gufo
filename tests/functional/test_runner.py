@@ -306,6 +306,34 @@ class FunctionalRunnerTest(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(AssertionError):
                 assert_edit({**result, **change})
 
+    def test_tool_reasoning_records_an_unexercised_marker_when_allowed(self):
+        result = {"text": "", "reasoning": "The suffix is corrupt.",
+                  "finish": "tool_calls", "tools": [{"function": {
+                      "name": "edit", "arguments": json.dumps(ARGUMENTS)}}]}
+        self.assertFalse(assert_edit(result, require_marker=False))
+        self.assertTrue(assert_edit({**result, "reasoning": "Quoted <tool_call>."}, False))
+        for change in ({"text": "leaked reasoning"}, {"tools": []},
+                       {"tools": [{"function": {"name": "edit", "arguments": "{}"}}]}):
+            with self.subTest(change=change), self.assertRaises(AssertionError):
+                assert_edit({**result, **change}, require_marker=False)
+
+    def test_cache_edits_names_checkpoints_the_ram_budget_refused(self):
+        from cache_edits import refused_checkpoints
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "server.log"
+            log.write_text(
+                "[WARN] [cache] event=snapshot action=skipped reason=byte_capacity "
+                "bytes=98081728 tokens=2048 retained_bytes=1\n")
+            start = log.stat().st_size
+            with log.open("a") as out:
+                out.write("[WARN] [cache] event=snapshot action=skipped reason=entry_capacity "
+                          "bytes=5 tokens=3253 retained_bytes=1\n"
+                          "[WARN] [cache] event=snapshot action=skipped reason=capture_failure "
+                          "bytes=5 tokens=7 retained_bytes=1\n")
+            self.assertEqual(refused_checkpoints(log, 0), [2048, 3253])
+            self.assertEqual(refused_checkpoints(log, start), [3253])
+            self.assertEqual(refused_checkpoints(None, 0), [])
+
     def test_envelope_workflow_rejects_missing_calls_and_damaged_arguments(self):
         command = "printf '%s' '</invoke>'"
         call = {"function": {"name": "terminal", "arguments": json.dumps({"command": command})}}

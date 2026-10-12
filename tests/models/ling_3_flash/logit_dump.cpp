@@ -2,7 +2,9 @@
 //
 //   logit_dump --model FIRST_SHARD.gguf
 //       [--kl-base kl_base.bin]  [--kl-chunks N]
+//       [--floor floor.json]
 //       [--greedy greedy.jsonl]  [--greedy-tokens 64]
+//       [--adjudicated greedy_adjudicated.json --text memorised|novel]
 //       [--tokens-file ids.txt --positions all|last|3,5,9 [--dump-dir DIR]]
 //       [--max-batch N] [--max-context N] [--layers N]
 //       [--timeout-seconds S] [--hold-seconds S]
@@ -14,6 +16,13 @@
 //   second half of the chunk is scored. Per position the KL against the base
 //   distribution (llama.cpp definition: sum over base log-prob > -16 of
 //   p_base * (log p_base - log p_gufo)), top-1 ids and log-probs are emitted.
+// * --floor: JSON {"kl_mean", "top1_agreement"} of llama.cpp Vulkan against the
+//   same base. The KL gate becomes relative to it: kl_mean <= floor.kl_mean and
+//   top1 >= floor.top1_agreement (instead of the absolute 0.01 / 0.98).
+// * --adjudicated: divergences the F64 CPU reference confirmed (entries
+//   {text, prompt, position, token, reference_gap, source}); a greedy
+//   divergence whose gufo token equals the entry for --text/prompt/position
+//   passes.
 // * --greedy: greedy.jsonl of the oracle (3 prompts x 64 tokens with top-5
 //   log-probs). Free-running greedy decode plus a teacher-forced pass.
 // * --tokens-file: writes full-vocab F32 logits of the requested positions to
@@ -37,6 +46,32 @@ constexpr double kKlMeanGate = 0.01;
 constexpr double kTop1Gate = 0.98;
 constexpr double kNearTieNats = 0.05;
 constexpr std::uint32_t kGreedyIdentical = 32;
+
+/// Gate limits: the absolute defaults, or the llama.cpp Vulkan floor of the
+/// text.
+struct KlGate {
+  double kl_mean = kKlMeanGate;
+  double top1 = kTop1Gate;
+  bool floor = false;
+};
+
+KlGate ReadGate(const Args& args, std::string* error) {
+  KlGate g;
+  if (!args.Has("--floor")) {
+    return g;
+  }
+  const std::string path = args.Str("--floor");
+  const std::string text = ReadText(path);
+  if (text.empty()) {
+    *error = "cannot read --floor " + path;
+    return g;
+  }
+  const json::Value v = json::parse(text);
+  g.kl_mean = v.member_double("kl_mean");
+  g.top1 = v.member_double("top1_agreement");
+  g.floor = true;
+  return g;
+}
 
 // ---- llama.cpp KL base reader ---------------------------------------------
 
@@ -234,7 +269,7 @@ std::pair<double, double> MeanAndUncertainty(double sum, double sum2,
 }
 
 json::Value KlSummary(const std::vector<KlRow>& rows, std::int32_t chunks_done,
-                      const KlBase& base) {
+                      const KlBase& base, const KlGate& gate = {}) {
   auto s = json::Value::object();
   std::vector<double> kl;
   double sum = 0.0, sum2 = 0.0, nll_t = 0.0, nll_b = 0.0, nn = 0.0, nbnb = 0.0,
@@ -291,10 +326,11 @@ json::Value KlSummary(const std::vector<KlRow>& rows, std::int32_t chunks_done,
   s["top1_agreement"] = Round(static_cast<double>(same) / n, 5);
   s["nll_base_mean"] = Round(nll_b / n, 5);
   s["nll_test_mean"] = Round(nll_t / n, 5);
-  s["gate_kl_mean_le"] = kKlMeanGate;
-  s["gate_top1_ge"] = kTop1Gate;
-  s["gate_pass"] = !rows.empty() && mean <= kKlMeanGate &&
-                   static_cast<double>(same) / n >= kTop1Gate &&
+  s["gate_kl_mean_le"] = gate.kl_mean;
+  s["gate_top1_ge"] = gate.top1;
+  s["gate_relative_to_llama_floor"] = gate.floor;
+  s["gate_pass"] = !rows.empty() && mean <= gate.kl_mean &&
+                   static_cast<double>(same) / n >= gate.top1 &&
                    chunks_done == base.n_chunk;
   // Worst positions by KL.
   std::vector<std::size_t> order(rows.size());
@@ -321,6 +357,11 @@ json::Value KlSummary(const std::vector<KlRow>& rows, std::int32_t chunks_done,
 
 bool RunKl(const Args& args, Report& report, l3::Model& model, KlBase& base) {
   std::string error;
+  const KlGate gate = ReadGate(args, &error);
+  if (!error.empty()) {
+    report.Set("kl_error", error);
+    return false;
+  }
   auto session = model.CreateSession(model.MaxContext(), &error);
   if (!session) {
     report.Set("kl_error", error);
@@ -344,7 +385,7 @@ bool RunKl(const Args& args, Report& report, l3::Model& model, KlBase& base) {
                        &error)) {
       std::fprintf(stderr, "kl chunk %d failed: %s\n", c, error.c_str());
       report.Set("kl_error", "chunk " + std::to_string(c) + ": " + error);
-      report.Set("kl", KlSummary(rows, c, base));
+      report.Set("kl", KlSummary(rows, c, base, gate));
       return false;
     }
     const double t_fwd = Now() - t0;
@@ -355,7 +396,7 @@ bool RunKl(const Args& args, Report& report, l3::Model& model, KlBase& base) {
         report.Set("kl_error", "non-finite logits at chunk " +
                                    std::to_string(c) + " row " +
                                    std::to_string(i));
-        report.Set("kl", KlSummary(rows, c, base));
+        report.Set("kl", KlSummary(rows, c, base, gate));
         return false;
       }
       if (!base.Row(c, i, &lp_base)) {
@@ -382,9 +423,9 @@ bool RunKl(const Args& args, Report& report, l3::Model& model, KlBase& base) {
                  "mean %.5f over %zu positions\n",
                  c + 1, chunks, t_fwd, Now() - t0,
                  sum / static_cast<double>(rows.size()), rows.size());
-    report.Set("kl", KlSummary(rows, c + 1, base));
+    report.Set("kl", KlSummary(rows, c + 1, base, gate));
   }
-  auto summary = KlSummary(rows, chunks, base);
+  auto summary = KlSummary(rows, chunks, base, gate);
   // Per-position rows: [chunk, pos, top1_gufo, top1_oracle, kl,
   // gufo_logprob_of_oracle_top1, nll_gufo, nll_oracle].
   auto table = json::Value::array();
@@ -412,8 +453,8 @@ bool RunKl(const Args& args, Report& report, l3::Model& model, KlBase& base) {
     kl_sum += r.kl;
     same += r.top1_test == r.top1_base ? 1 : 0;
   }
-  return chunks != base.n_chunk || (kl_sum / n <= kKlMeanGate &&
-                                    static_cast<double>(same) / n >= kTop1Gate);
+  return chunks != base.n_chunk || (kl_sum / n <= gate.kl_mean &&
+                                    static_cast<double>(same) / n >= gate.top1);
 }
 
 // ---- greedy ----------------------------------------------------------------
@@ -449,8 +490,38 @@ json::Value IntArray(const std::vector<std::int32_t>& v) {
   return a;
 }
 
+/// The adjudication entry matching (text, prompt, position, gufo token), or
+/// null.
+const json::Value* FindAdjudication(const json::Value& list,
+                                    const std::string& text,
+                                    const std::string& prompt,
+                                    std::int32_t position, std::int32_t token) {
+  const json::Value* entries = list.find("entries");
+  if (entries == nullptr) {
+    return nullptr;
+  }
+  for (const auto& e : entries->items()) {
+    if (e.member_str("text") == text && e.member_str("prompt") == prompt &&
+        static_cast<std::int32_t>(e.member_double("position")) == position &&
+        static_cast<std::int32_t>(e.member_double("token")) == token) {
+      return &e;
+    }
+  }
+  return nullptr;
+}
+
 bool RunGreedy(const Args& args, Report& report, l3::Model& model) {
   std::string error;
+  json::Value adjudicated = json::Value::object();
+  if (args.Has("--adjudicated")) {
+    const std::string text = ReadText(args.Str("--adjudicated"));
+    if (text.empty()) {
+      report.Set("greedy_error", "cannot read --adjudicated");
+      return false;
+    }
+    adjudicated = json::parse(text);
+  }
+  const std::string text_kind = args.Str("--text");
   const std::string path = args.Str("--greedy");
   const auto n_tokens =
       static_cast<std::size_t>(args.Num("--greedy-tokens", 64));
@@ -557,11 +628,28 @@ bool RunGreedy(const Args& args, Report& report, l3::Model& model) {
     const bool near_tie =
         divergence >= 0 && (to_oracle < kNearTieNats ||
                             (oracle_gap >= 0.0 && oracle_gap < kNearTieNats));
+    // A divergence the F64 CPU reference confirmed (greedy_adjudicated.json).
+    const json::Value* adj =
+        divergence >= 0
+            ? FindAdjudication(adjudicated, text_kind, name, divergence,
+                               mine[static_cast<std::size_t>(divergence)])
+            : nullptr;
     const bool free_pass =
         divergence < 0 ||
-        static_cast<std::uint32_t>(divergence) >= kGreedyIdentical || near_tie;
+        static_cast<std::uint32_t>(divergence) >= kGreedyIdentical ||
+        near_tie || adj != nullptr;
     out["free_run_pass"] = free_pass;
     out["near_tie_divergence"] = near_tie;
+    out["adjudicated"] = adj != nullptr;
+    if (adj != nullptr) {
+      out["adjudication"] = *adj;
+      std::fprintf(stderr,
+                   "[greedy] %s: divergence %d adjudicated by the F64 "
+                   "reference (token %d, gap %.4f)\n",
+                   name.c_str(), divergence,
+                   mine[static_cast<std::size_t>(divergence)],
+                   adj->member_double("reference_gap"));
+    }
 
     // ---- teacher-forced: oracle tokens in, compare argmax at each step ----
     session->Reset();
