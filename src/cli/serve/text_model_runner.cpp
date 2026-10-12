@@ -88,66 +88,7 @@ std::optional<ChatRequest> ConstrainChatRequest(
   return constrained;
 }
 
-std::optional<std::uint64_t> MeminfoAvailableBytes(std::string_view meminfo) {
-  std::optional<std::uint64_t> available_kib;
-  std::uint64_t cma_free_kib = 0;
-  std::istringstream lines{std::string(meminfo)};
-  for (std::string line; std::getline(lines, line);) {
-    std::istringstream fields(line);
-    std::string key;
-    std::uint64_t kib = 0;
-    if (!(fields >> key >> kib))
-      continue;
-    if (key == "MemAvailable:")
-      available_kib = kib;
-    else if (key == "CmaFree:")
-      cma_free_kib = kib;
-  }
-  if (!available_kib)
-    return std::nullopt;
-  return (*available_kib > cma_free_kib ? *available_kib - cma_free_kib : 0) *
-         1024;
-}
-
 namespace {
-
-/// Host RAM still available, after cgroup limits. Unified-memory device
-/// allocations draw from the same RAM, so HIP's device capacity is not used.
-std::uint64_t HostAvailableBytes() {
-  const long pages = sysconf(_SC_AVPHYS_PAGES);
-  const long page_size = sysconf(_SC_PAGESIZE);
-  if (pages <= 0 || page_size <= 0)
-    return 0;
-  std::uint64_t available = std::uint64_t(pages) * page_size;
-  std::ifstream meminfo("/proc/meminfo");
-  std::ostringstream meminfo_text;
-  meminfo_text << meminfo.rdbuf();
-  if (const auto parsed = MeminfoAvailableBytes(meminfo_text.str()))
-    available = *parsed;
-  // A cgroup limit can be much smaller than the host's available memory.
-  // Walk parents too: a child may say "max" beneath a limited ancestor.
-  std::ifstream membership("/proc/self/cgroup");
-  for (std::string line; std::getline(membership, line);) {
-    if (!line.starts_with("0::/"))
-      continue;
-    const auto relative = std::filesystem::path(line.substr(4));
-    if (std::ranges::any_of(relative,
-                            [](const auto& part) { return part == ".."; }))
-      continue;
-    const std::filesystem::path root("/sys/fs/cgroup");
-    for (auto path = root / relative;; path = path.parent_path()) {
-      std::ifstream limit_file(path / "memory.max");
-      std::ifstream used_file(path / "memory.current");
-      std::uint64_t limit = 0, used = 0;
-      if ((limit_file >> limit) && (used_file >> used))
-        available = std::min(available, limit > used ? limit - used : 0);
-      if (path == root)
-        break;
-    }
-    break;
-  }
-  return available;
-}
 
 std::size_t ClampToSize(std::uint64_t bytes) {
   return static_cast<std::size_t>(
@@ -157,11 +98,11 @@ std::size_t ClampToSize(std::uint64_t bytes) {
 }  // namespace
 
 std::size_t HostSnapshotBudgetBytes() {
-  return ClampToSize(HostAvailableBytes() / 2);
+  return ClampToSize(EffectiveHostAvailableBytes() / 2);
 }
 
 std::size_t HostSnapshotCeilingBytes() {
-  const auto available = HostAvailableBytes();
+  const auto available = EffectiveHostAvailableBytes();
   return ClampToSize(available > kHostSnapshotHeadroomBytes
                          ? available - kHostSnapshotHeadroomBytes
                          : 0);

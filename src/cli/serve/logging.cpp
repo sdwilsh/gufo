@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -75,6 +76,65 @@ std::size_t ReadMemoryKiB(const char* path, std::string_view field) {
 }
 
 }  // namespace
+
+std::optional<std::uint64_t> MeminfoAvailableBytes(std::string_view meminfo) {
+  std::optional<std::uint64_t> available_kib;
+  std::uint64_t cma_free_kib = 0;
+  std::istringstream lines{std::string(meminfo)};
+  for (std::string line; std::getline(lines, line);) {
+    std::istringstream fields(line);
+    std::string key;
+    std::uint64_t kib = 0;
+    if (!(fields >> key >> kib))
+      continue;
+    if (key == "MemAvailable:")
+      available_kib = kib;
+    else if (key == "CmaFree:")
+      cma_free_kib = kib;
+  }
+  if (!available_kib)
+    return std::nullopt;
+  return (*available_kib > cma_free_kib ? *available_kib - cma_free_kib : 0) *
+         1024;
+}
+
+// Unified-memory device allocations draw from the same RAM, so HIP's device
+// capacity is not used.
+std::uint64_t EffectiveHostAvailableBytes() {
+  const long pages = sysconf(_SC_AVPHYS_PAGES);
+  const long page_size = sysconf(_SC_PAGESIZE);
+  if (pages <= 0 || page_size <= 0)
+    return 0;
+  std::uint64_t available = std::uint64_t(pages) * page_size;
+  std::ifstream meminfo("/proc/meminfo");
+  std::ostringstream meminfo_text;
+  meminfo_text << meminfo.rdbuf();
+  if (const auto parsed = MeminfoAvailableBytes(meminfo_text.str()))
+    available = *parsed;
+  // A cgroup limit can be much smaller than the host's available memory.
+  // Walk parents too: a child may say "max" beneath a limited ancestor.
+  std::ifstream membership("/proc/self/cgroup");
+  for (std::string line; std::getline(membership, line);) {
+    if (!line.starts_with("0::/"))
+      continue;
+    const auto relative = std::filesystem::path(line.substr(4));
+    if (std::ranges::any_of(relative,
+                            [](const auto& part) { return part == ".."; }))
+      continue;
+    const std::filesystem::path root("/sys/fs/cgroup");
+    for (auto path = root / relative;; path = path.parent_path()) {
+      std::ifstream limit_file(path / "memory.max");
+      std::ifstream used_file(path / "memory.current");
+      std::uint64_t limit = 0, used = 0;
+      if ((limit_file >> limit) && (used_file >> used))
+        available = std::min(available, limit > used ? limit - used : 0);
+      if (path == root)
+        break;
+    }
+    break;
+  }
+  return available;
+}
 
 std::optional<LogLevel> LogLevelFromName(std::string_view name) {
   if (name == "debug")
@@ -166,7 +226,9 @@ std::string Logger::MemoryStatus() {
   std::ostringstream output;
   output << "rss_mib=" << ReadMemoryKiB("/proc/self/status", "VmRSS:") / 1024
          << " host_available_mib="
-         << ReadMemoryKiB("/proc/meminfo", "MemAvailable:") / 1024;
+         << ReadMemoryKiB("/proc/meminfo", "MemAvailable:") / 1024
+         << " effective_available_mib="
+         << EffectiveHostAvailableBytes() / (1024 * 1024);
   return output.str();
 }
 
@@ -180,8 +242,8 @@ void Logger::LogRequest(std::string_view id, std::string_view method,
       status_code >= 500 || outcome == "stream_error"   ? LogLevel::kError
       : status_code >= 400 || outcome == "disconnected" ? LogLevel::kWarn
                                                         : success_level;
-  // A filtered line must not pay for MemoryStatus(): two /proc reads per
-  // request add up on every quiet poll the tier suppresses.
+  // A filtered line must not pay for MemoryStatus(): its /proc reads and
+  // cgroup walk add up on every quiet poll the tier suppresses.
   if (!Enabled(level)) {
     return;
   }

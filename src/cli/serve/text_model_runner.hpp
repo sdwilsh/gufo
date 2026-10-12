@@ -71,12 +71,6 @@ struct TextRunnerDiskCacheOptions {
   std::size_t min_checkpoint_step_tokens{2048};
 };
 
-/// MemAvailable from /proc/meminfo text minus CmaFree, in bytes. Free CMA
-/// pages count as available but only hold movable pages, not GPU
-/// allocations; the kernel's KHO scratch area can make that several GiB.
-/// Nullopt when MemAvailable is missing.
-[[nodiscard]] std::optional<std::uint64_t> MeminfoAvailableBytes(
-    std::string_view meminfo);
 /// Automatic snapshot budget: half the host RAM available after loading
 /// (excluding free CMA pages), after cgroup limits.
 [[nodiscard]] std::size_t HostSnapshotBudgetBytes();

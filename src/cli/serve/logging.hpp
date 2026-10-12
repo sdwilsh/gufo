@@ -8,6 +8,20 @@
 
 namespace gufo::server {
 
+/// MemAvailable from /proc/meminfo text minus CmaFree, in bytes. Free CMA
+/// pages count as available but only hold movable pages, not GPU
+/// allocations; the kernel's KHO scratch area can make that several GiB.
+/// Nullopt when MemAvailable is missing.
+[[nodiscard]] std::optional<std::uint64_t> MeminfoAvailableBytes(
+    std::string_view meminfo);
+
+/// Host RAM still available to this process: the node's MemAvailable minus
+/// free CMA pages (MeminfoAvailableBytes), capped by the remaining room under
+/// the cgroup memory limit of the process and of every ancestor. Every
+/// host-memory-derived budget (RAM prompt cache) and the
+/// `effective_available_mib` log field use it.
+std::uint64_t EffectiveHostAvailableBytes();
+
 /// Log verbosity, ordered from chattiest to quietest so a threshold test is a
 /// single comparison. `kDebug` must stay below `kInfo`: the process-wide filter
 /// emits a line when `level >= Level()`.
