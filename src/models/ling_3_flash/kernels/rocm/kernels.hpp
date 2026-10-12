@@ -90,6 +90,13 @@ void GemmF16(const __half* w, const float* x, float* y, std::uint32_t n_tokens,
              std::uint32_t k, std::uint32_t rows, void* scratch,
              hipStream_t stream);
 
+/// Re-encodes `rows` x `k` F16 weights as Q8_0 (k % 32 == 0) into `out`
+/// (rows * k / 32 * 34 bytes; ggml's quantize_row_q8_0 reference: d = absmax /
+/// 127 stored as F16, q = round(x / d)). One-time load work (the MTP draft
+/// head); asynchronous on `stream`.
+void QuantizeF16ToQ8_0(const __half* w, void* out, std::uint64_t rows,
+                       std::uint32_t k, hipStream_t stream);
+
 /// Quantised activations as the Q8_0 GEMV consumes them: two int8 planes
 /// (value, residual) of `n_tokens` x k and one F32 scale per 32 values, in one
 /// buffer of QuantActBytes(n_tokens, k) bytes (layout depends on n_tokens, k).

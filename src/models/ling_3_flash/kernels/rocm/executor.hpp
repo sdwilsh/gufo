@@ -288,6 +288,12 @@ public:
                                   std::vector<std::uint16_t>* out,
                                   std::string* error_msg = nullptr);
 
+  /// Selects the head of the MTP draft step: the Q8_0 copy built at load
+  /// (default) or the trunk's F16 head (the A/B reference of the acceptance
+  /// measurements; the verify path is unaffected). Not thread-safe against a
+  /// running draft.
+  void SetMtpDraftHeadQ8(bool q8) noexcept { draft_head_q8_ = q8; }
+  [[nodiscard]] bool MtpDraftHeadQ8() const noexcept { return draft_head_q8_; }
   /// Runs the MTP draft block for one position (see DraftRequest) and returns
   /// the index of the largest draft logit. The session must be mtp_valid().
   /// Writes MTP cache row `position` (rows past the committed frontier are
@@ -418,6 +424,7 @@ private:
 
   const DeviceModel& model_;
   Options options_;
+  bool draft_head_q8_{true};
   hipStream_t stream_{nullptr};
   /// Snapshot transfers: one private stream and one pinned staging buffer per
   /// executor (state_io.cpp), serialized by `transfer_mutex_`. No streams or

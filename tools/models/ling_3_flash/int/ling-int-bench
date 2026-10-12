@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """Ling-3.0-Flash integration measurement suite. Prints one JSON object per line on stdout.
 
-usage: ling-int-bench [--stages env,peak,bench,small,maxbatch] [--model PATH]
+usage: ling-int-bench [--stages env,peak,bench,small,maxbatch,mtp_head_ab] [--model PATH]
                       [--depths 0,4096,16384,65536] [--repetitions 3]
                       [--hold SECONDS] [--bench-timeout SEC]
                       [--fit-stores B,B,...] [--fit-repetitions N]
@@ -45,6 +45,16 @@ Stages (each prints one JSON line {"stage": NAME, ...} when it finishes):
             and draft steps against the measured DRAM read peak (gfx1151_peak),
             and, when rocprofv3 is installed (/opt/rocm-7.1.1), a prof.py kernel
             trace of a 32-token MTP generation at each depth. ~25 min.
+  mtp_head_ab  the MTP draft head, F16 (the trunk's output head) against the Q8_0 copy
+            the draft step owns, in one candidate build. (1) ling_3_flash_mtp_head_ab on
+            the prose and code corpora (4 evenly spaced 1024-token windows each, 192
+            greedy tokens, 3 drafts per cycle, both heads on the same windows): draft
+            acceptance, tokens per cycle, draft device/wall ms per head, and a check
+            that the emitted tokens are identical; (2) the mtp_profile measurement
+            (gufo bench --speculative mtp --op-profile -d 0,65536) with the parent
+            build (/opt/gufo/base/gufo-parent, F16 draft head) and this build: draft
+            step launch timing, the draft.head_logits_gemv op (ms, MB, GB/s) and the
+            fixed-width cycle tokens/s. ~25 min.
   long      (separate image) gufo bench -p 2048 -n 128 -d 131072,194432,259968 -r 1
             --max-batch 512 with the default 12 GiB expanded-K/V budget; the device
             memory peak (GTT/VRAM sampled every 2 s) is in "device_memory"
@@ -439,6 +449,69 @@ def shutil_which(name):
     return shutil.which(name)
 
 
+HEAD_AB_TOOL = "/opt/gufo/tests/ling_3_flash_mtp_head_ab"
+
+
+def _jsonl(text):
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                out.append({"record": "unparsed", "text": line[:300]})
+    return out
+
+
+def stage_mtp_head_ab(a):
+    for v in ("XDG_CACHE_HOME", "TMPDIR"):
+        os.makedirs(os.environ.get(v, os.path.join(WORK, v.lower())), exist_ok=True)
+    corpus_dir = "/opt/gufo/corpus"
+    body = {}
+    cmd = [HEAD_AB_TOOL, "--model", a.model, "--windows", "4", "--prompt-tokens", "1024",
+           "--generate", "192", "--drafts", "3"]
+    for label in ("prose", "code"):
+        cmd += ["--corpus", "%s=%s/%s.txt" % (label, corpus_dir, label)]
+    code, out, err, secs = run(cmd, a.bench_timeout)
+    body["acceptance"] = {"command": cmd, "exit": code, "seconds": secs, "records": _jsonl(out),
+                          "stderr_tail": err[-2500:]}
+    corpus = fit_corpus()
+    profiles = {}
+    saved = globals()["GUFO"]
+    try:
+        for label, binary in (("parent_f16_head", PARENT_GUFO), ("candidate_q8_head", saved)):
+            if not os.path.exists(binary) and binary != "gufo":
+                profiles[label] = {"error": "missing " + binary}
+                continue
+            pcmd = [binary, "bench", "-m", a.model, "-n", "64", "-d", "0,65536", "-r", "2",
+                    "--speculative", "mtp", "--op-profile", "--text-file", corpus, "-o", "jsonl"]
+            pcode, pout, perr, psecs = run(pcmd, a.bench_timeout)
+            records = _jsonl(pout)
+            entry = {"command": pcmd, "exit": pcode, "seconds": psecs, "draft": [], "cycles": []}
+            for r in records:
+                if r.get("record") != "mtp_profile":
+                    continue
+                if r["part"] == "draft":
+                    head_op = [o for o in r.get("ops", []) if o["name"] == "draft.head_logits_gemv"]
+                    entry["draft"].append({"n_depth": r["n_depth"], "launch": r["launch"],
+                                           "ms_per_step": r["ms_per_step"],
+                                           "head_op": head_op[0] if head_op else None})
+                elif r["part"] == "cycle":
+                    entry["cycles"].append({k: r.get(k) for k in (
+                        "n_depth", "width", "tokens_per_cycle", "cycle_ms", "tokens_per_s",
+                        "draft_device_ms")})
+            entry["acceptance"] = [r for r in records if r.get("record") == "mtp"]
+            entry["stderr_tail"] = perr[-1500:]
+            profiles[label] = entry
+    finally:
+        globals()["GUFO"] = saved
+    body["profile"] = profiles
+    summary = [r for r in body["acceptance"]["records"] if r.get("record") == "summary"]
+    body["exit"] = 0 if code == 0 and summary and summary[-1].get("pass") else 1
+    return body
+
+
 def stage_maxbatch(a):
     return bench_stage(a, ["--max-batch", "2048", "-p", "2048", "-n", "128", "-d", "0,16384"])
 
@@ -652,7 +725,8 @@ def stage_fit(a):
 STAGES = {"env": stage_env, "peak": stage_peak, "bench": stage_bench, "small": stage_small,
           "maxbatch": stage_maxbatch, "long": stage_long, "long24": stage_long24,
           "profile": stage_profile, "fit": stage_fit, "small_ab": stage_small_ab,
-          "kernels_ab": stage_kernels_ab, "mtp_profile": stage_mtp_profile}
+          "kernels_ab": stage_kernels_ab, "mtp_profile": stage_mtp_profile,
+          "mtp_head_ab": stage_mtp_head_ab}
 
 
 def main():

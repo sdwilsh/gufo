@@ -59,6 +59,11 @@ struct DeviceMtp {
   DeviceTensor eh_proj;            ///< Q8_0 [5120 -> 2560]
   DeviceTensor enorm, hnorm;       ///< F32 [2560]
   DeviceTensor layer_output_norm;  ///< F32 [2560], the shared-head norm
+  /// Q8_0 [2560 -> 157184] copy of the trunk's F16 output head, built at load
+  /// from the resident F16 weights (+0.4 GB). Only the draft step reads it:
+  /// draft numerics change acceptance, never the emitted tokens (the verify
+  /// step scores with the F16 head). See mtp.hpp.
+  DeviceTensor draft_head;
 };
 
 struct UploadStats {
@@ -74,11 +79,12 @@ public:
   DeviceModel(const DeviceModel&) = delete;
   DeviceModel& operator=(const DeviceModel&) = delete;
 
-  /// Streams tensors disk to device with core::hip::WeightUpload; the mapped
-  /// GGUF payloads are never read. `layer_first` and `layer_limit` (0 = to the
-  /// end) upload only blocks [first, first + limit): a debug aid for GPUs too
-  /// small for the full artifact. `with_mtp` also uploads the MTP block
-  /// (block 42; an error when the artifact has none). Progress goes to stderr.
+  /// Streams tensors from disk to device with core::hip::WeightUpload. It
+  /// never reads the mapped GGUF payloads. `layer_first` and `layer_limit`
+  /// (0 = to the end) upload only blocks [first, first + limit), a debug aid
+  /// for GPUs too small for the full artifact. `with_mtp` also uploads the MTP
+  /// block (block 42; an error when the artifact has none). Progress goes to
+  /// stderr.
   [[nodiscard]] static std::unique_ptr<DeviceModel> Upload(
       const ModelWeights& weights, const core::GgufReader& reader,
       std::uint32_t layer_first, std::uint32_t layer_limit,
@@ -108,6 +114,9 @@ public:
 
 private:
   DeviceModel() = default;
+  /// Builds mtp_.draft_head from the resident output head.
+  [[nodiscard]] static bool BuildDraftHead(DeviceModel& m,
+                                           std::string* error_msg);
 
   Config config_;
   DeviceTensor token_embd_, output_norm_, output_;

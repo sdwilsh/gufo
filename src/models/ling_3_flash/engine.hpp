@@ -138,6 +138,12 @@ public:
   [[nodiscard]] static std::size_t SessionBytes(std::uint32_t context,
                                                 bool mtp = false) noexcept;
   [[nodiscard]] bool HasMtp() const noexcept { return options_.mtp; }
+  /// Head of the MTP draft step: true (default) scores drafts with the Q8_0
+  /// copy of the output head built at load, false with the trunk's F16 head.
+  /// Only draft acceptance differs; the verify path and every emitted token
+  /// are independent of it. For A/B measurements and tests, between requests.
+  void SetMtpDraftHeadQ8(bool q8) noexcept;
+  [[nodiscard]] bool MtpDraftHeadQ8() const noexcept;
   [[nodiscard]] double LoadSeconds() const noexcept { return load_seconds_; }
   [[nodiscard]] double UploadSeconds() const noexcept;
   /// HIP-graph decode replays so far (tests and the bench check the path ran).

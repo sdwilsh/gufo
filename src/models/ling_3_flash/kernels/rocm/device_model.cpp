@@ -154,6 +154,45 @@ struct Uploader {
 
 }  // namespace
 
+bool DeviceModel::BuildDraftHead(DeviceModel& m, std::string* error_msg) {
+  const DeviceTensor& head = m.output_;
+  if (head.type != WeightType::kF16 || head.cols % 32 != 0 ||
+      head.cols % 64 != 0 || head.depth != 1) {
+    if (error_msg != nullptr) {
+      *error_msg =
+          "the output head is not an F16 matrix the draft head can "
+          "re-encode";
+    }
+    return false;
+  }
+  const std::size_t bytes = std::size_t{head.rows} * (head.cols / 32) * 34;
+  void* q8 = nullptr;
+  if (const auto status = hipMalloc(&q8, bytes); status != hipSuccess) {
+    if (error_msg != nullptr) {
+      *error_msg = "hipMalloc of the MTP draft head failed: " +
+                   std::string(hipGetErrorString(status));
+    }
+    return false;
+  }
+  m.allocations_.push_back(q8);
+  m.stats_.bytes += bytes;
+  ++m.stats_.tensors;
+  dense::QuantizeF16ToQ8_0(head.f16(), q8, head.rows, head.cols, nullptr);
+  if (const auto status = hipDeviceSynchronize(); status != hipSuccess) {
+    if (error_msg != nullptr) {
+      *error_msg = "MTP draft head build failed: " +
+                   std::string(hipGetErrorString(status));
+    }
+    return false;
+  }
+  m.mtp_.draft_head = {.data = q8,
+                       .type = WeightType::kQ8_0,
+                       .cols = head.cols,
+                       .rows = head.rows,
+                       .depth = 1};
+  return true;
+}
+
 DeviceModel::~DeviceModel() {
   for (void* p : allocations_) {
     (void)hipFree(p);
@@ -217,6 +256,9 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& w,
     return nullptr;
   }
   if (!stager->Finish(error_msg)) {
+    return nullptr;
+  }
+  if (with_mtp && !BuildDraftHead(*m, error_msg)) {
     return nullptr;
   }
   // F16 expansion weights for non-absorbed MLA prefill (dequantised once).

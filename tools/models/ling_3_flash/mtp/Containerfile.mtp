@@ -23,6 +23,7 @@ RUN for p in rocprofiler-sdk rocprofiler-sdk-rocpd rocprofiler-sdk-roctx; do \
   && rm -rf /opt/rocm-7.1.1/include /opt/rocm-7.1.1/lib/cmake /opt/rocm-7.1.1/lib/*.a
 COPY prof.py /usr/local/lib/gufo/prof.py
 COPY run-suite /usr/local/bin/run-suite
+COPY base/ /opt/gufo/base/
 COPY tests/ /opt/gufo/tests/
 COPY suites/ /opt/gufo/suites/
 COPY oracle/ /opt/gufo/oracle/
@@ -42,7 +43,7 @@ USER 1000:1000
 WORKDIR /work
 ENV HOME=/work XDG_CACHE_HOME=/work/cache TMPDIR=/work/tmp PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 PATH=/usr/local/bin:/usr/bin:/bin
-ARG IMAGE=localhost/gufo-ling-ws22
+ARG IMAGE=localhost/gufo-ling-ws38
 ENV GUFO_IMAGE=${IMAGE}
 # Default: the MTP tests, then the standard integration tests (no regressions).
 CMD ["ling-mtp-suite", "--part", "tests"]
