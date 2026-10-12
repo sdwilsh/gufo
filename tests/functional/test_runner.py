@@ -688,7 +688,7 @@ class FunctionalRunnerTest(unittest.TestCase):
                                      replay in ("keep_reasoning", "discard_reasoning"))
 
     def test_cache_growth_rejects_a_frozen_checkpoint(self):
-        with self.assertRaisesRegex(AssertionError, "cache did not advance"):
+        with self.assertRaisesRegex(AssertionError, "check=.*_turn_\\d+ expected=cached >= \\d+ and > previous cached"):
             self.run_cache_growth(pinned=True)
 
     def test_cache_growth_requires_actual_reasoning(self):
@@ -773,7 +773,7 @@ class FunctionalRunnerTest(unittest.TestCase):
             self.run_cache_concurrency(regress="prefill")
 
     def test_cache_concurrency_rejects_waiting_without_a_shared_prefix(self):
-        with self.assertRaisesRegex(AssertionError, "waited without a shared prefix"):
+        with self.assertRaisesRegex(AssertionError, "check=short_shared_wait expected=no request waits .*actual=requests \\[.*\\] waited"):
             self.run_cache_concurrency(regress="wait")
 
     def run_cache_shared_prefix(self, regress=False):
@@ -819,7 +819,7 @@ class FunctionalRunnerTest(unittest.TestCase):
         self.assertEqual(len(warm), 8)
 
     def test_cache_shared_prefix_rejects_grid_only_reuse(self):
-        with self.assertRaisesRegex(AssertionError, "of the shared system prompt"):
+        with self.assertRaisesRegex(AssertionError, "check=long_tasks_2_reuse expected=cached_tokens >= \\d+ \\(shared system prompt\\)"):
             self.run_cache_shared_prefix(regress=True)
 
     def run_cache_compaction(self, regression=None):
@@ -1718,6 +1718,39 @@ p.with_suffix(".requests.json").write_text(json.dumps({{
                 self.assertEqual(report["status"], expected)
                 self.assertEqual(status, 0 if expected == "passed" else 1)
 
+    def test_loaded_mode_mismatch_after_passing_suites_is_printed(self):
+        # A model whose default is a draft mode, served without --speculative:
+        # every suite passes, yet the run fails on the loaded-mode check. The
+        # reason must reach stdout, not only report.json.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "openai_sdk.py").write_text(
+                'import json,sys; from pathlib import Path; '
+                'p=Path(sys.argv[sys.argv.index("--output")+1]); '
+                'p.write_text(json.dumps({"status":"passed"})); '
+                'p.with_suffix(".requests.json").write_text(json.dumps({"version":1,'
+                '"requests":[{"status":"complete","wall_ms":1,"endpoint":"/v1/models",'
+                '"request_sha256":"fixture"}]}))')
+            args = ["run.py", "--record-baseline", "--output", str(root / "report"),
+                    "--sampling-preset", "ling3", "--suite", "stream-start", "--",
+                    sys.executable, "serve", "llm", "--model", "fixture.gguf"]
+            out = io.StringIO()
+            mismatch = ValueError("server.log: requested off, loaded modes ['mtp']")
+            with patch.object(sys, "argv", args), patch.object(functional, "TESTS", root), \
+                 patch.object(functional, "server", return_value=contextlib.nullcontext()), \
+                 patch.object(functional, "provenance", return_value={}), \
+                 patch.object(functional, "join_server_timings"), \
+                 patch.object(functional, "execution_coverage", side_effect=mismatch), \
+                 contextlib.redirect_stdout(out):
+                status = functional.main()
+            report = json.loads((root / "report/report.json").read_text())
+            self.assertEqual(status, 1)
+            self.assertEqual(report["suites"]["stream-start"]["status"], "passed")
+            self.assertIn("loaded modes", report["measurements_error"])
+            self.assertIn("check=execution expected=loaded mode and per-request "
+                          "measurements are valid actual=server.log: requested off, "
+                          "loaded modes ['mtp']", out.getvalue())
+
     def test_disk_cache_is_removed_after_restart_checks(self):
         for exit_code, continuation_report, spacing_exact, expected in (
             (0, {"status": "passed", "exact": True}, True, "passed"),
@@ -1817,6 +1850,52 @@ class PiWatchdogTest(unittest.TestCase):
         self.assertEqual(repeated_actions(history([
             "missing module", "case 1 fails", "case 2 fails", "ok"])), 1)
 
+
+class FailureReportTest(unittest.TestCase):
+    def test_assertion_names_condition_and_observation(self):
+        from check_report import failure_lines
+        result = {"text": "ALPHA.699", "finish": "stop"}
+        try:
+            assert result["text"] == "ALPHA", result
+        except AssertionError as error:
+            (line,) = failure_lines(error, "long_tasks_0")
+        self.assertRegex(line, r"^check=long_tasks_0@\S+:\d+ expected=result\['text'\] == 'ALPHA' "
+                               r"actual=false; \{.*ALPHA\.699")
+        self.assertNotIn("\n", line)
+
+    def test_check_lines_pass_through_and_exceptions_name_the_root_cause(self):
+        from check_report import check_line, describe, failure_lines
+        own = [check_line("a", "x", "y"), check_line("b", "p", "q")]
+        self.assertEqual(failure_lines(AssertionError("\n".join(own))), own)
+        try:
+            try:
+                raise ModuleNotFoundError("No module named 'jsonschema'")
+            except ImportError as cause:
+                raise ConnectionError("Connection error.") from cause
+        except ConnectionError as error:
+            self.assertIn("root cause: ModuleNotFoundError", describe(error))
+            (line,) = failure_lines(error, "long_schema_cold")
+        self.assertTrue(line.startswith("check=long_schema_cold expected=the request completes "))
+        self.assertIn("jsonschema", line)
+
+    def test_suite_failure_prints_checks_and_server_tail_on_connection_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "long-context.log").write_text(
+                "CHECK x\ncheck=long_schema_cold expected=a actual=b\n")
+            (root / "server.log").write_text("".join(f"line {n}\n" for n in range(100)))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                functional.report_failure("long-context", root, "exit 1; see long-context.log")
+                self.assertNotIn("server.log tail", out.getvalue())
+                (root / "long-context.log").write_text(
+                    "check=long_schema_cold expected=a actual=Connection error.\n")
+                functional.report_failure("long-context", root, "exit 1; see long-context.log")
+            text = out.getvalue()
+            self.assertIn("check=long_schema_cold expected=a actual=b", text)
+            self.assertIn("server.log tail (long-context)", text)
+            self.assertIn("line 99", text)
+            self.assertNotIn("line 39\n", text)
 
 
 class ClaudeCodeAgentTest(unittest.TestCase):

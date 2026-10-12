@@ -24,7 +24,12 @@ CASES = {
     "idle-pending-arrival": ("timeout", "/v1/completions", False),
     "loss-after-token-chat": ("loss", "/v1/chat/completions", True),
     "blocked-writer-watchdog": ("loss", "/v1/completions", True),
+    # Two requests decode in one batched forward when the fault hits. Run by
+    # default only for `--speculative off` or `mtp` servers with --sessions >= 2.
+    "batched-recoverable": ("usable", "/v1/completions", True),
+    "batched-loss": ("loss", "/v1/completions", True),
 }
+BATCHED_CASES = ("batched-recoverable", "batched-loss")
 
 
 def require(condition, message):
@@ -58,6 +63,44 @@ def await_condition(process, predicate, timeout, message):
         if time.monotonic() >= deadline:
             raise TimeoutError(message)
         time.sleep(0.02)
+
+
+def open_stream(port, path, body):
+    """Starts a streamed request and reads it up to its first generated text;
+    returns the connection, the response and the lines read so far."""
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+    connection.request("POST", path, json.dumps(body), {"Content-Type": "application/json"})
+    response = connection.getresponse()
+    require(response.status == 200, "stream did not begin normally")
+    pieces = []
+    while True:
+        line = response.readline().decode()
+        require(line, "stream ended before content")
+        pieces.append(line)
+        if line.startswith("data: {"):
+            choice = (json.loads(line[6:]).get("choices") or [{}])[0]
+            delta = choice.get("delta", {})
+            if choice.get("text") or delta.get("content") or delta.get("reasoning_content"):
+                return connection, response, pieces
+
+
+def batched_pair(port, model):
+    """Two overlapping streamed chats to completion; returns their plans
+    (usage.gufo.execution_plan). The second starts once the first decodes."""
+    body = {"model": model, "temperature": 0, "stream": True, "max_tokens": 128,
+            "stream_options": {"include_usage": True}, "cache_prompt": False,
+            "messages": [{"role": "user", "content":
+                          "Write a long poem about the sea, the mountains, and the stars."}]}
+    streams = [open_stream(port, "/v1/chat/completions", body) for _ in range(2)]
+    plans = []
+    for connection, response, pieces in streams:
+        pieces.append(response.read().decode())
+        connection.close()
+        usage = [json.loads(line[6:]).get("usage") for line in "".join(pieces).splitlines()
+                 if line.startswith("data: {")]
+        usage = [u for u in usage if u]
+        plans.append(usage[-1].get("gufo", {}).get("execution_plan") if usage else None)
+    return plans
 
 
 def generation(path, stream, model):
@@ -172,6 +215,49 @@ def run_case(args, name):
                 require('"code":"device_lost"' in record["failure"]["body"],
                         "started stream did not emit terminal loss")
                 record["exit_code"] = process.wait(timeout=13)
+            elif name in BATCHED_CASES:
+                # The server batches two decoding requests at all ...
+                record["batched_plans"] = batched_pair(port, model)
+                require(all(plan and plan.startswith("batched-w")
+                            for plan in record["batched_plans"]),
+                        f"concurrent requests did not decode batched: {record['batched_plans']}")
+                # ... and two are decoding together when the fault is armed:
+                # the next upload is their batched step's.
+                stream_timer = threading.Timer(args.request_timeout, kill_on_timeout,
+                                               [f"streams exceeded {args.request_timeout}s"])
+                stream_timer.daemon = True
+                stream_timer.start()
+                body = dict(body, max_tokens=512)
+                streams = [open_stream(port, path, body) for _ in range(2)]
+                started = time.monotonic()
+                (output / "armed").touch()
+                record["failures"] = []
+                for connection, response, pieces in streams:
+                    pieces.append(response.read().decode())
+                    connection.close()
+                    record["failures"].append("".join(pieces))
+                stream_timer.cancel()
+                for text in record["failures"]:
+                    require('"error"' in text and "data: [DONE]" in text,
+                            "a batched member did not end with a terminal error event")
+                    if mode == "loss":
+                        require('"code":"device_lost"' in text,
+                                "a batched member did not report the device loss")
+                if mode == "loss":
+                    record["exit_code"] = process.wait(
+                        timeout=max(0.1, 13 - (time.monotonic() - started)))
+                    record["exit_after_arm_s"] = time.monotonic() - started
+                else:
+                    for health in ("/health", "/ready"):
+                        record[health] = request(port, "GET", health)
+                        require(record[health]["status"] == 200, "usable device became unhealthy")
+                    (output / "armed").unlink()
+                    record["recovery"] = batched_pair(port, model)
+                    require(all(plan and plan.startswith("batched-w")
+                                for plan in record["recovery"]),
+                            f"batched decoding did not recover: {record['recovery']}")
+                    process.terminate()
+                    record["exit_code"] = process.wait(timeout=13)
             elif name == "blocked-writer-watchdog":
                 (output / "block_writer").touch()
                 peer = socket.create_connection(("127.0.0.1", port), timeout=15)
@@ -258,6 +344,16 @@ def run_case(args, name):
     return record
 
 
+def default_cases(server):
+    """Every case; the batched ones only where two requests can decode
+    together in one forward (an AR or MTP server with at least two sessions)."""
+    def option(name, default):
+        return server[server.index(name) + 1] if name in server else default
+    batched = (option("--speculative", "off") in ("off", "mtp")
+               and int(option("--sessions", "1")) >= 2)
+    return [name for name in CASES if batched or name not in BATCHED_CASES]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fault-library", type=Path, required=True)
@@ -285,7 +381,7 @@ def main():
         "server_version": subprocess.check_output([args.server[0], "--version"], text=True).strip(),
         "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "fault_library_sha256": hashlib.sha256(args.fault_library.read_bytes()).hexdigest(),
-        "cases": [run_case(args, name) for name in (args.case or CASES)],
+        "cases": [run_case(args, name) for name in (args.case or default_cases(args.server))],
     }
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     return 0 if all(case["status"] == "pass" for case in report["cases"]) else 1

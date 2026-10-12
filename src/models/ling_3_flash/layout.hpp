@@ -215,6 +215,9 @@ inline constexpr std::size_t kKdaProjRowFloats = kKdaProjRows;
 inline constexpr std::size_t kMlaQAbsorbedRowFloats =
     std::size_t{kHeads} * kMlaCacheWidth;
 
+/// Largest chunk of tokens of the small-batch numeric family (engine.hpp).
+inline constexpr std::size_t kSmallBatchMaxTokens = 8;
+
 }  // namespace gufo::models::ling_3_flash
 
 #endif  // GUFO_MODELS_LING_3_FLASH_LAYOUT_HPP_

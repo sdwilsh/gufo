@@ -157,7 +157,11 @@ while an idle probe stays pending, cleanup avoidance and exit status 75.
 Buffered failures return JSON 503. Streams commit HTTP 200 at admission, so a
 failure during prefill or after the first token emits a terminal SSE error. A
 blocked SSE writer must still trigger the ten-second forced-exit watchdog,
-without a health request or peer disconnect. Repeat `--case` for focused checks.
+without a health request or peer disconnect. With `--speculative off` or
+`mtp` and `--sessions 2` or more, the `batched-*` cases also inject the error
+while two streamed requests decode in one batched step: both must fail, and a
+recoverable error must leave batched decoding working. Repeat `--case` for
+focused checks.
 Reports retain commands, loaded mode, actual warm-generation drafts, raw
 responses and logs, including failures. These tests inject errors only inside
 the child process; they do not establish behavior after a physical GPU reset.
@@ -333,6 +337,20 @@ commands in disposable fixtures using isolated Pi configuration. Use `--passes 1
 for a focused check; the default five passes matches the reported debug workload.
 `--conversation --context-file FILE` additionally tests retained long history.
 
+`cache_hermes.py` replays a Hermes-Agent-style tool loop against a running
+server (it does not start one): reasoning dropped from history, assistant text
+stripped, tool-call arguments re-serialised with sorted keys, a review fork
+concurrent with the next step, and a compacted history, in strip and echo
+(`reasoning_echo`) variants. Each step must reuse the previous prompt and
+prefill only the previous assistant turn, the new tool result and the
+generation prompt, and answer like an uncached control; it reports reused and
+prefilled tokens per step. Use `--context` equal to the server's. Ling-3.0-flash
+is validated with `tools/models/ling_3_flash/cache/ling-cache-suite` (packaged
+by `build-cache-image.sh` next to it), which runs it, a restart disk-restore
+check and the cache suites inside one pod. The replay requires at least one
+real parsed tool call per variant; `--allow-synthetic` accepts the scripted
+fallback for builds without the Ling tool-call parser.
+
 For Claude Code sessions over `/v1/messages`, run `claude_code_agent.py` with
 `--base-url`, `--model`, `--claude /path/to/claude`, `--server-log` and a fresh
 `--output` directory outside any project that has a `CLAUDE.md` (the CLI would
@@ -421,6 +439,14 @@ Background requests fill the budget first; a larger budget fails as unqualified.
 requests sharing a long prefix must wait for one prefill and then prefill only
 their own tail; groups sharing little or nothing must not wait. With
 `--sessions 1` no request may wait.
+
+Every failed check prints one line, `check=<name> expected=<condition>
+actual=<observed>`, on stderr and in `<suite>.log` and the suite's
+`failed_checks` in its report; the runner repeats them when a suite fails. A
+failure that looks like a lost connection (`Connection error`, a reset, a
+timeout, `server exited`) also prints the last 60 lines of the server log. The
+openai SDK reports an exception raised while it closes a response, such as a
+missing `jsonschema`, as `Connection error`; the report names the root cause.
 
 `cache-compaction` measures a small tool result to size a larger append for the
 loaded tokenizer. The measured history must reach 75–95% of the configured

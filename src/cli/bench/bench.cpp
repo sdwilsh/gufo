@@ -1,12 +1,17 @@
 #include "src/cli/bench/bench.hpp"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <ctime>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -32,6 +37,8 @@
 
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
+#include "src/models/ling_3_flash/engine.hpp"
+#include "src/models/ling_3_flash/weights.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
@@ -150,6 +157,40 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
         return true;
       });
 
+  parser.AddCustomOption(
+      "-o", "--output", "FORMAT",
+      "Result format: md (default) or jsonl (Ling-3.0-flash only; "
+      "llama-bench compatible records with per-repetition samples)",
+      "Workload",
+      [&opt](std::string_view, std::string_view value,
+             std::string* error) -> bool {
+        if (value != "md" && value != "jsonl") {
+          if (error != nullptr)
+            *error = "--output must be md or jsonl";
+          return false;
+        }
+        opt.output_format = value;
+        return true;
+      });
+
+  parser.AddOption(
+      "", "--text-file", "PATH",
+      "Ling-3.0-flash: take the context tokens from this text file (tokenized, "
+      "never repeated; it must cover the deepest depth plus the workload) "
+      "instead of pseudo-random tokens. Needed for MTP acceptance that "
+      "reflects real text: greedy continuation of pseudo-random tokens "
+      "over-states it",
+      "Workload", &opt.text_file);
+  parser.AddOption("", "--max-batch", "N",
+                   "Ling-3.0-flash prompt tokens per forward pass (default: "
+                   "512, the CLI/server prefill chunk; llama.cpp's n_ubatch)",
+                   "Workload", &opt.max_batch);
+  parser.AddOption("", "--expanded-kv-bytes", "N",
+                   "Ling-3.0-flash device budget for persistent expanded K/V "
+                   "rows of the MLA layers (112 KiB per cached token; "
+                   "default: 12 GiB, 0 disables)",
+                   "Workload", &opt.expanded_kv_bytes);
+
   parser.AddOption(
       "-r", "--repetitions", "N",
       "Repetitions per test point for variance reduction (default: 1)",
@@ -202,7 +243,9 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
                    "DeepSeek V4 Flash DSpark support GGUF", "Speculative",
                    &opt.dspark_model_path);
   parser.AddOption("", "--mtp-model", "PATH",
-                   "Path to quantized Qwen MTP draft head GGUF file",
+                   "Path to quantized Qwen MTP draft head GGUF file (Ling-3.0-"
+                   "flash carries its MTP block in the main GGUF: "
+                   "--speculative mtp alone enables it)",
                    "Speculative", &opt.mtp_model_path);
   parser.AddCustomOption(
       "", "--draft-tokens", "N",
@@ -243,6 +286,13 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
         return true;
       });
   RegisterSamplingOptions(parser, &opt.sampling, "Sampling", false);
+  parser.AddFlag("", "--op-profile",
+                 "Ling-3.0-flash (-o jsonl): also emit op_profile records, "
+                 "the per-operation device time of one eager decode run and "
+                 "of one prefill chunk per point (serialised, so slower than "
+                 "the timed runs; the MLA prefill attention is broken down as "
+                 "mla.attention/...)",
+                 "Workload", &opt.op_profile);
   parser.AddFlag("-v", "--verbose",
                  "Print detailed timing, latency breakdown, and tok/s metrics",
                  "General", &opt.verbose);
@@ -1141,6 +1191,945 @@ int RunQwen38FlashNextBenchmark(
   return 0;
 }
 
+bool IsLing3Flash(const core::GgufReader& reader) {
+  return reader.GetMetadataString("general.architecture") == "bailingmoe3";
+}
+
+std::string JsonString(std::string_view text) {
+  std::string out = "\"";
+  for (const char c : text) {
+    switch (c) {
+      case '"':
+        out += "\\\"";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char escaped[8];
+          std::snprintf(escaped, sizeof(escaped), "\\u%04x",
+                        static_cast<unsigned>(static_cast<unsigned char>(c)));
+          out += escaped;
+        } else {
+          out += c;
+        }
+    }
+  }
+  return out + '"';
+}
+
+std::string UtcNow() {
+  const std::time_t now = std::time(nullptr);
+  std::tm utc{};
+  gmtime_r(&now, &utc);
+  char buffer[32];
+  std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &utc);
+  return buffer;
+}
+
+// Deterministic pseudo-random text tokens: like llama-bench, no repeated
+// pattern, so MoE routing sees realistic expert diversity.
+std::vector<std::int32_t> LingBenchTokens(
+    const models::ling_3_flash::Model& model, std::size_t count) {
+  std::vector<std::int32_t> tokens(count);
+  std::uint64_t state = 0x9E3779B97F4A7C15ULL;
+  const std::uint32_t range =
+      std::min<std::uint32_t>(model.VocabSize(), 150000);
+  for (auto& token : tokens) {
+    do {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      token = static_cast<std::int32_t>((state >> 11) % range);
+    } while (model.tokenizer().IsSpecialToken(
+        static_cast<models::ling_3_flash::TokenId>(token)));
+  }
+  return tokens;
+}
+
+// Context tokens a Ling MTP generation starts from at depth 0.
+constexpr std::size_t kLingMtpSeedTokens = 16;
+
+// JSON array of op_profile entries divided by `per` (steps), with the
+// effective bandwidth of each (bytes it must read / its device time).
+std::string LingOpList(const std::vector<models::ling_3_flash::OpTiming>& ops,
+                       double per) {
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(4) << "[";
+  for (std::size_t i = 0; i < ops.size(); ++i) {
+    const auto& op = ops[i];
+    out << (i ? ", " : "") << "{\"name\": " << JsonString(op.name)
+        << ", \"count\": " << op.count / per << ", \"ms\": " << op.ms / per
+        << ", \"mbytes\": " << op.bytes / per / 1e6
+        << ", \"gbps\": " << (op.ms > 0 ? op.bytes / (op.ms * 1e6) : 0.0)
+        << "}";
+  }
+  out << "]";
+  return out.str();
+}
+
+double LingOpTotal(const std::vector<models::ling_3_flash::OpTiming>& ops) {
+  double total = 0.0;
+  for (const auto& op : ops) {
+    // "name/part" entries break an operation down; they are inside it.
+    if (op.name.find('/') == std::string::npos)
+      total += op.ms;
+  }
+  return total;
+}
+
+// Host issue / wall time and device span of a series of steps.
+struct LingLaunchSeries {
+  std::vector<double> issue, wall, device, host_wall;
+  void Add(const models::ling_3_flash::LaunchTiming& t, double host_ms) {
+    issue.push_back(t.issue_ms);
+    wall.push_back(t.wall_ms);
+    device.push_back(t.device_ms);
+    host_wall.push_back(host_ms);
+  }
+  static double Median(std::vector<double> v) {
+    if (v.empty())
+      return 0.0;
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+  }
+  static double Mean(const std::vector<double>& v) {
+    return v.empty() ? 0.0
+                     : std::accumulate(v.begin(), v.end(), 0.0) /
+                           static_cast<double>(v.size());
+  }
+  // issue: entry until the last launch was issued; wall: entry until done
+  // (inside the engine); call: the caller's clock around the whole call.
+  std::string Json() const {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(4) << "{\"steps\": " << wall.size()
+        << ", \"issue_ms\": " << Median(issue)
+        << ", \"wall_ms\": " << Median(wall)
+        << ", \"device_ms\": " << Median(device)
+        << ", \"call_ms\": " << Median(host_wall)
+        << ", \"mean_issue_ms\": " << Mean(issue)
+        << ", \"mean_device_ms\": " << Mean(device)
+        << ", \"mean_call_ms\": " << Mean(host_wall) << "}";
+    return out.str();
+  }
+};
+
+int RunLingBenchmark(const BenchOptions& options,
+                     const std::shared_ptr<const core::GgufReader>& reader,
+                     std::chrono::steady_clock::time_point model_load_start) {
+  namespace ling = models::ling_3_flash;
+  const bool jsonl = options.output_format == "jsonl";
+  // Ling's default is MTP when the GGUF carries the block-42 weights and the
+  // run is a greedy, single-floor one; `--speculative off` keeps AR.
+  const bool default_mtp = !options.speculative_explicit &&
+                           options.mtp_model_path.empty() &&
+                           options.min_draft_tokens == 1 &&
+                           options.sampling.can_use_unmodified_argmax() &&
+                           models::ling_3_flash::HasMtpBlock(*reader);
+  if (!options.speculative_explicit && !default_mtp) {
+    std::cerr << "[ling] speculative=off: "
+              << (models::ling_3_flash::HasMtpBlock(*reader)
+                      ? "run is not greedy MTP-compatible\n"
+                      : "GGUF has no MTP block\n");
+  }
+  const bool mtp = default_mtp || options.speculative_backend == "mtp";
+  if (!options.speculative_backend.empty() &&
+      options.speculative_backend != "mtp") {
+    std::cerr << "Error: Ling-3.0-flash supports --speculative mtp only\n";
+    return 1;
+  }
+  if (mtp && !options.mtp_model_path.empty()) {
+    std::cerr << "Error: Ling-3.0-flash carries its MTP block in the main "
+                 "GGUF; drop --mtp-model\n";
+    return 1;
+  }
+  if (mtp && options.min_draft_tokens != 1) {
+    std::cerr << "Error: Ling-3.0-flash MTP requires --min-draft-tokens 1; "
+                 "bound blocks with --draft-tokens\n";
+    return 1;
+  }
+  if (mtp && !options.sampling.can_use_unmodified_argmax()) {
+    std::cerr << "Error: Ling-3.0-flash MTP bench measures greedy decoding\n";
+    return 1;
+  }
+  if (options.concurrency != std::vector<std::size_t>{1}) {
+    std::cerr << "Error: Ling-3.0-flash bench supports C1 only\n";
+    return 1;
+  }
+  if (options.validate_prefill_tokens != 0) {
+    std::cerr << "Error: --validate-prefill is not available for "
+                 "Ling-3.0-flash\n";
+    return 1;
+  }
+  int device_count = 0;
+  if (hipGetDeviceCount(&device_count) != hipSuccess || device_count == 0) {
+    std::cerr << "Error: no HIP GPU is available for Ling-3.0-flash\n";
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+  hipDeviceProp_t prop{};
+  HIP_CHECK(hipGetDeviceProperties(&prop, 0));
+
+  std::vector<std::size_t> depths = options.n_depths;
+  std::sort(depths.begin(), depths.end());
+  depths.erase(std::unique(depths.begin(), depths.end()), depths.end());
+  const auto max_or_zero = [](const std::vector<std::size_t>& values) {
+    return values.empty() ? std::size_t{0}
+                          : *std::max_element(values.begin(), values.end());
+  };
+  const std::size_t max_depth = max_or_zero(depths);
+  const std::size_t workload =
+      std::max(max_or_zero(options.n_prompts), max_or_zero(options.n_gens));
+  const std::size_t required_context = max_depth + workload + 1;
+  if (required_context > std::numeric_limits<std::uint32_t>::max()) {
+    std::cerr << "Error: benchmark workload exceeds the context range\n";
+    return 1;
+  }
+
+  std::string error;
+  auto model = ling::Model::Load(
+      options.model_path,
+      ling::ModelOptions{
+          .max_context = static_cast<std::uint32_t>(
+              std::max<std::size_t>(required_context, 4096)),
+          .max_batch = options.max_batch != 0
+                           ? static_cast<std::uint32_t>(options.max_batch)
+                           : ling::kCliPrefillBatch,
+          .expanded_kv_bytes = options.expanded_kv_bytes,
+          .mtp = mtp},
+      &error);
+  if (model == nullptr) {
+    std::cerr << "Error creating Ling-3.0-flash model: " << error << '\n';
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+  PrintModelLoadTime(model_load_start);
+  auto session = model->CreateSession(
+      static_cast<std::uint32_t>(required_context), &error);
+  if (!session) {
+    std::cerr << "Error creating Ling-3.0-flash session: " << error << '\n';
+    return 1;
+  }
+  session->Reset();
+
+  const std::size_t chunk = model->PrefillCapacity();
+  const std::string model_type = "bailingmoe3 (Ling-3.0-flash)";
+  const std::string gpu_info =
+      std::string(prop.name) + " (" + prop.gcnArchName + ", ROCm/HIP)";
+#ifdef GUFO_REVISION
+  const std::string revision = GUFO_REVISION;
+#else
+  const std::string revision = "unknown";
+#endif
+  // Fields that the llama-bench baseline sets and gufo cannot or does not
+  // match. Printed once so a comparison states them.
+  const std::vector<std::pair<std::string, std::string>> unmatched{
+      {"type_k/type_v",
+       "gufo caches the MLA latent in F16 (llama.cpp baseline: q8_0, about "
+       "half the cache bytes); KDA state is F32"},
+      {"flash_attn",
+       "no flag: gufo's own MLA and KDA kernels (baseline: flash_attn=1)"},
+      {"n_batch",
+       "gufo prefill chunk equals n_ubatch (512 unless --max-batch); "
+       "baseline n_batch=2048, n_ubatch=512"},
+      {"n_threads/cpu_mask/poll", "not applicable: device-only execution"},
+      {"split_mode/tensor_split/n_cpu_moe/devices",
+       "not applicable: one GPU, all layers resident"},
+      {"graph/sampling",
+       "decode feeds fixed pseudo-random tokens like llama-bench; gufo "
+       "copies the last-row logits to the host each step; decode steps "
+       "replay per-session HIP graphs (stage_ms_per_rep comes from one extra "
+       "eager repetition)"},
+      {"depth_build",
+       "depth is built by real prefill of d tokens in 512-token chunks, "
+       "once per run and ascending; each repetition restores an exact copy "
+       "of the recurrent state and truncates the latent cache to d"},
+      {"warmup", "one untimed repetition per test point"},
+      {"speculative",
+       mtp ? "mtp: tg generates greedily with Ling's MTP block (up to "
+             "--draft-tokens drafts per verified step, adaptive); depth 0 "
+             "starts from a 16-token seed; see the mtp records for acceptance"
+           : "off"},
+      {"context_tokens",
+       options.text_file.empty()
+           ? "pseudo-random tokens (MTP acceptance on them is not "
+             "representative)"
+           : "tokenized --text-file"}};
+  if (jsonl) {
+    std::cout << "{\"record\": \"header\", \"build_commit\": "
+              << JsonString(revision)
+              << ", \"gpu_info\": " << JsonString(gpu_info)
+              << ", \"backends\": \"ROCm (HIP)\", \"model_filename\": "
+              << JsonString(options.model_path)
+              << ", \"model_type\": " << JsonString(model_type)
+              << ", \"model_size\": " << reader->GetSize()
+              << ", \"n_batch\": " << chunk << ", \"n_ubatch\": " << chunk
+              << ", \"type_k\": \"f16\", \"type_v\": \"f16\", "
+                 "\"kv_cache\": \"MLA latent F16 (7 layers x 576)\", "
+                 "\"kda_state\": \"f32\", \"n_gpu_layers\": \"all\", "
+                 "\"flash_attn\": \"n/a (gufo kernels)\", \"repetitions\": "
+              << options.repetitions
+              << ", \"warmup\": 1, \"max_context\": " << required_context
+              << ", \"weights_gib\": "
+              << static_cast<double>(model->ResidentBytes()) /
+                     (1024.0 * 1024.0 * 1024.0)
+              << ", \"unmatched\": {";
+    for (std::size_t i = 0; i < unmatched.size(); ++i) {
+      std::cout << (i ? ", " : "") << JsonString(unmatched[i].first) << ": "
+                << JsonString(unmatched[i].second);
+    }
+    std::cout << "}}\n" << std::flush;
+  } else {
+    std::cout << "# gufo bench: " << model_type << ", " << gpu_info
+              << ", build " << revision << '\n'
+              << "# KV cache: MLA latent F16, KDA state F32; own kernels, "
+                 "all layers on GPU; n_batch=n_ubatch="
+              << chunk << ", repetitions=" << options.repetitions
+              << ", warmup=1\n";
+    for (const auto& [key, text] : unmatched)
+      std::cout << "# unmatched " << key << ": " << text << '\n';
+    std::cout << "| test | t/s | samples t/s |\n| --- | ---: | --- |\n"
+              << std::flush;
+  }
+
+  std::vector<std::int32_t> tokens;
+  if (options.text_file.empty()) {
+    tokens = LingBenchTokens(*model, required_context);
+  } else {
+    std::ifstream in(options.text_file, std::ios::binary);
+    if (!in) {
+      std::cerr << "Error: cannot read --text-file " << options.text_file
+                << '\n';
+      return 1;
+    }
+    const std::string text((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    tokens = model->Tokenize(text);
+    if (tokens.size() < required_context) {
+      std::cerr << "Error: --text-file has " << tokens.size()
+                << " tokens, the workload needs " << required_context << '\n';
+      return 1;
+    }
+    tokens.resize(required_context);
+  }
+  // Device-event time per stage, summed over the chunks (pp) or steps (tg) of
+  // one repetition and averaged over the timed repetitions.
+  struct StageMs {
+    double total{0}, head{0}, kda{0}, mla{0}, dense{0}, host{0};
+    std::size_t forwards{0};
+    std::size_t reps{0};  ///< repetitions behind the sums (0: the timed ones)
+    double graph_forwards{0};  ///< graph replays per timed repetition
+    void Add(const std::vector<ling::StepTiming>& timings) {
+      for (const auto& t : timings) {
+        total += t.total_ms;
+        head += t.head_ms;
+        kda += t.kda_ms;
+        mla += t.mla_ms;
+        dense += t.dense_ms;
+        host += t.host_ms;
+        ++forwards;
+      }
+    }
+  };
+  const auto emit = [&](std::size_t n_prompt, std::size_t n_gen,
+                        std::size_t depth, const std::vector<double>& ns,
+                        const StageMs& stages) {
+    std::vector<double> ts;
+    const double count = static_cast<double>(n_prompt + n_gen);
+    for (const double value : ns)
+      ts.push_back(count * 1e9 / value);
+    const auto ns_stats = ComputeStats(ns);
+    const auto ts_stats = ComputeStats(ts);
+    if (jsonl) {
+      const auto list = [](const std::vector<double>& values, int precision) {
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(precision) << "[";
+        for (std::size_t i = 0; i < values.size(); ++i)
+          out << (i ? ", " : " ") << values[i];
+        out << " ]";
+        return out.str();
+      };
+      std::cout << "{\"record\": \"result\", \"n_prompt\": " << n_prompt
+                << ", \"n_gen\": " << n_gen << ", \"n_depth\": " << depth
+                << ", \"test_time\": \"" << UtcNow() << "\", \"avg_ns\": "
+                << static_cast<std::uint64_t>(ns_stats.mean)
+                << ", \"stddev_ns\": "
+                << static_cast<std::uint64_t>(ns_stats.stddev)
+                << ", \"avg_ts\": " << std::fixed << std::setprecision(6)
+                << ts_stats.mean << ", \"stddev_ts\": " << ts_stats.stddev
+                << ", \"samples_ns\": " << list(ns, 0)
+                << ", \"samples_ts\": " << list(ts, 3);
+      const double reps =
+          static_cast<double>(stages.reps != 0 ? stages.reps : ns.size());
+      std::cout << ", \"stage_ms_per_rep\": {\"forwards\": "
+                << stages.forwards / static_cast<std::size_t>(reps)
+                << ", \"graph_forwards\": " << stages.graph_forwards
+                << ", \"device_total\": " << stages.total / reps
+                << ", \"mla_blocks_5_11_17_23_29_35_41\": " << stages.mla / reps
+                << ", \"kda_blocks_2_to_41\": " << stages.kda / reps
+                << ", \"blocks_0_1\": " << stages.dense / reps
+                << ", \"output_head\": " << stages.head / reps
+                << ", \"host_wall\": " << stages.host / reps << "}}\n"
+                << std::flush;
+    } else {
+      std::ostringstream samples;
+      samples << std::fixed << std::setprecision(2);
+      for (std::size_t i = 0; i < ts.size(); ++i)
+        samples << (i ? ", " : "") << ts[i];
+      std::cout << "| "
+                << MakeTestName(n_prompt != 0 ? "pp" : "tg",
+                                n_prompt != 0 ? n_prompt : n_gen, depth)
+                << " | " << std::fixed << std::setprecision(2) << ts_stats.mean
+                << " ± " << ts_stats.stddev << " | " << samples.str() << " |\n"
+                << std::flush;
+    }
+  };
+
+  const auto seconds_since = [](std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                         start)
+        .count();
+  };
+  // MTP decode-cycle profile at one depth (--op-profile, jsonl, MTP): one
+  // "mtp_profile" record per part. Each part starts from the depth's state
+  // (plus the 16-token seed at depth 0) and stays within the n_gen tokens the
+  // context holds past the depth.
+  //   ar      one-token steps replayed as graphs vs eager (Feed with timings),
+  //           host issue / wall time and device span, and the per-op device
+  //           times of eager steps (the decode bandwidth reference);
+  //   draft   one MTP draft step (block 42 + head, chained like DecodeStep),
+  //           launch timing and per-op device times;
+  //   verify  the verify forward at widths 2..8 (always eager: rollback
+  //           points), launch timing, Rollback(1) wall and per-op times;
+  //   cycle   fixed-width greedy cycles (anchor argmax, width - 1 drafts,
+  //           verify, acceptance, rollback) split into their host phases with
+  //           the device spans of the drafts and the verify.
+  const auto profile_mtp = [&](std::size_t depth, std::size_t room,
+                               const auto& restore) {
+    constexpr int kSteps = 16;
+    const auto prepare = [&]() {
+      if (!restore())
+        return false;
+      if (depth == 0 &&
+          !session->Feed(std::span(tokens).first(kLingMtpSeedTokens), {},
+                         &error)) {
+        std::cerr << "Error seeding the MTP profile: " << error << '\n';
+        return false;
+      }
+      return true;
+    };
+    const auto now = [] { return std::chrono::steady_clock::now(); };
+    const auto ms_since = [](std::chrono::steady_clock::time_point t) {
+      return std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - t)
+          .count();
+    };
+    // Next context token for a forced step at the current position.
+    const auto next_token = [&]() {
+      return tokens[std::min<std::size_t>(session->Position(),
+                                          tokens.size() - 1)];
+    };
+    const auto fail = [&](const char* what) {
+      std::cerr << "Error in the MTP profile (" << what << "): " << error
+                << '\n';
+      return false;
+    };
+    const auto head = [&](const char* part) {
+      std::ostringstream out;
+      out << "{\"record\": \"mtp_profile\", \"part\": \"" << part
+          << "\", \"n_depth\": " << depth;
+      return out.str();
+    };
+    const std::size_t steps =
+        std::min<std::size_t>(kSteps, room > 8 ? (room - 8) / 3 : 1);
+
+    // ar: graph replay vs eager one-token steps.
+    {
+      if (!prepare())
+        return false;
+      LingLaunchSeries graph, eager;
+      // The first occurrence of a step shape runs eagerly, the second
+      // captures; replays follow.
+      for (std::size_t i = 0; i < steps + 2; ++i) {
+        const std::int32_t token = next_token();
+        const auto t = now();
+        if (!session->Feed(std::span(&token, 1), {}, &error))
+          return fail("ar graph step");
+        if (i >= 2)
+          graph.Add(session->LastLaunchTiming(), ms_since(t));
+      }
+      for (std::size_t i = 0; i < steps; ++i) {
+        const std::int32_t token = next_token();
+        std::vector<ling::StepTiming> timing;
+        const auto t = now();
+        if (!session->Feed(std::span(&token, 1), {.timings = &timing}, &error))
+          return fail("ar eager step");
+        eager.Add(session->LastLaunchTiming(), ms_since(t));
+      }
+      std::vector<ling::OpTiming> ops;
+      constexpr int kOpSteps = 4;
+      for (int i = 0; i < kOpSteps; ++i) {
+        const std::int32_t token = next_token();
+        if (!session->Feed(std::span(&token, 1), {.op_profile = &ops}, &error))
+          return fail("ar op profile");
+      }
+      std::cout << head("ar") << ", \"graph\": " << graph.Json()
+                << ", \"eager\": " << eager.Json()
+                << ", \"ms_per_step\": " << std::fixed << std::setprecision(4)
+                << LingOpTotal(ops) / kOpSteps
+                << ", \"ops\": " << LingOpList(ops, kOpSteps) << "}\n"
+                << std::flush;
+    }
+    // draft: chained draft steps from the committed position.
+    {
+      if (!prepare())
+        return false;
+      LingLaunchSeries series;
+      std::vector<ling::OpTiming> ops;
+      int profiled = 0;
+      const std::int32_t anchor = session->Argmax();
+      for (int round = 0; round < 4; ++round) {
+        std::int32_t token = anchor;
+        for (std::uint32_t j = 0; j + 1 < ling::kMaxVerifyTokens; ++j) {
+          std::int32_t index = -1;
+          const bool profile = round == 3;
+          const auto t = now();
+          if (!session->Draft(token, j > 0, {}, &index, &error,
+                              profile ? &ops : nullptr))
+            return fail("draft");
+          if (round > 0 && !profile)
+            series.Add(session->LastLaunchTiming(), ms_since(t));
+          profiled += profile ? 1 : 0;
+          token = index;
+        }
+      }
+      std::cout << head("draft") << ", \"launch\": " << series.Json()
+                << ", \"ms_per_step\": " << std::fixed << std::setprecision(4)
+                << LingOpTotal(ops) / profiled
+                << ", \"ops\": " << LingOpList(ops, profiled) << "}\n"
+                << std::flush;
+    }
+    // verify: every width, then Rollback(1).
+    for (std::uint32_t width = 2; width <= ling::kMaxVerifyTokens; ++width) {
+      if (!prepare())
+        return false;
+      LingLaunchSeries series;
+      std::vector<double> rollback_ms;
+      std::vector<ling::OpTiming> ops;
+      const std::size_t reps = std::max<std::size_t>(2, steps / 2);
+      for (std::size_t rep = 0; rep < reps + 2; ++rep) {
+        std::vector<std::int32_t> chunk{session->Argmax()};
+        for (std::uint32_t j = 1; j < width; ++j)
+          chunk.push_back(tokens[std::min<std::size_t>(session->Position() + j,
+                                                       tokens.size() - 1)]);
+        std::array<std::int32_t, ling::kMaxVerifyTokens> argmax{};
+        const bool profile = rep == reps + 1;
+        const auto t = now();
+        if (!session->Verify(chunk, argmax, nullptr, &error,
+                             profile ? &ops : nullptr))
+          return fail("verify");
+        const double call = ms_since(t);
+        if (rep > 0 && !profile)
+          series.Add(session->LastLaunchTiming(), call);
+        const auto r = now();
+        if (!session->Rollback(1, &error))
+          return fail("rollback");
+        if (rep > 0 && !profile)
+          rollback_ms.push_back(ms_since(r));
+      }
+      std::cout << head("verify") << ", \"width\": " << width
+                << ", \"launch\": " << series.Json()
+                << ", \"rollback_ms\": " << std::fixed << std::setprecision(4)
+                << LingLaunchSeries::Median(rollback_ms)
+                << ", \"ms_per_step\": " << LingOpTotal(ops)
+                << ", \"ops\": " << LingOpList(ops, 1) << "}\n"
+                << std::flush;
+    }
+    // cycle: fixed-width greedy cycles.
+    for (std::uint32_t width = 2; width <= ling::kMaxVerifyTokens; ++width) {
+      if (!prepare())
+        return false;
+      double sample = 0, draft = 0, verify = 0, accept = 0, rollback = 0;
+      double draft_device = 0, draft_issue = 0, verify_device = 0;
+      double verify_issue = 0;
+      std::vector<double> cycle;
+      std::size_t committed = 0;
+      std::size_t used = 0;
+      for (std::size_t c = 0; c < steps + 1; ++c) {
+        if (used + width + 1 > room)
+          break;
+        const auto t0 = now();
+        const std::int32_t anchor = session->Argmax();
+        const double t_sample = ms_since(t0);
+        const auto t1 = now();
+        std::vector<std::int32_t> chain{anchor};
+        double d_device = 0, d_issue = 0;
+        for (std::uint32_t j = 0; j + 1 < width; ++j) {
+          std::int32_t index = -1;
+          if (!session->Draft(chain.back(), j > 0, {}, &index, &error))
+            return fail("cycle draft");
+          d_device += session->LastLaunchTiming().device_ms;
+          d_issue += session->LastLaunchTiming().issue_ms;
+          chain.push_back(index);
+        }
+        const double t_draft = ms_since(t1);
+        const auto t2 = now();
+        std::array<std::int32_t, ling::kMaxVerifyTokens> argmax{};
+        if (!session->Verify(chain, argmax, nullptr, &error))
+          return fail("cycle verify");
+        const auto verify_launch = session->LastLaunchTiming();
+        const double t_verify = ms_since(t2);
+        const auto t3 = now();
+        std::uint32_t keep = 1;
+        while (keep < width && argmax[keep - 1] == chain[keep])
+          ++keep;
+        const double t_accept = ms_since(t3);
+        const auto t4 = now();
+        if (!session->Rollback(keep, &error))
+          return fail("cycle rollback");
+        const double t_rollback = ms_since(t4);
+        const double total = ms_since(t0);
+        used += keep;
+        if (c == 0)
+          continue;  // warm-up cycle
+        sample += t_sample;
+        draft += t_draft;
+        verify += t_verify;
+        accept += t_accept;
+        rollback += t_rollback;
+        draft_device += d_device;
+        draft_issue += d_issue;
+        verify_device += verify_launch.device_ms;
+        verify_issue += verify_launch.issue_ms;
+        cycle.push_back(total);
+        committed += keep;
+      }
+      const double cycles = static_cast<double>(cycle.size());
+      const double sum = std::accumulate(cycle.begin(), cycle.end(), 0.0);
+      const double per = cycles > 0 ? 1.0 / cycles : 0.0;
+      std::cout << head("cycle") << ", \"width\": " << width
+                << ", \"cycles\": " << cycle.size() << std::fixed
+                << std::setprecision(4) << ", \"tokens_per_cycle\": "
+                << static_cast<double>(committed) * per
+                << ", \"cycle_ms\": " << sum * per
+                << ", \"median_cycle_ms\": " << LingLaunchSeries::Median(cycle)
+                << ", \"tokens_per_s\": "
+                << (sum > 0 ? static_cast<double>(committed) * 1e3 / sum : 0.0)
+                << ", \"phase_ms\": {\"sample\": " << sample * per
+                << ", \"draft\": " << draft * per
+                << ", \"verify\": " << verify * per
+                << ", \"accept\": " << accept * per
+                << ", \"rollback\": " << rollback * per
+                << "}, \"draft_device_ms\": " << draft_device * per
+                << ", \"draft_issue_ms\": " << draft_issue * per
+                << ", \"verify_device_ms\": " << verify_device * per
+                << ", \"verify_issue_ms\": " << verify_issue * per
+                << ", \"host_overhead_ms\": "
+                << (sum - draft_device - verify_device) * per << "}\n"
+                << std::flush;
+    }
+    return true;
+  };
+  std::unique_ptr<ling::SessionSnapshot> snapshot;
+  std::size_t built = 0;
+  for (const std::size_t depth : depths) {
+    // Real prefill of the missing tokens, continuing the chunk grid of the
+    // previous depth (multiples of 512 keep the layout identical to a
+    // direct prefill of d tokens).
+    if (depth > built) {
+      if (built % chunk != 0 && built != 0) {
+        std::cerr << "Warning: depth " << built
+                  << " is not a multiple of the prefill chunk; the chunk "
+                     "layout of deeper depths differs from a direct prefill\n";
+      }
+      // Earlier tests left their tokens in the session; return to the
+      // previous depth first (fresh state at depth 0).
+      if (built == 0) {
+        session->Reset();  // an empty session has no snapshot
+      } else if (!session->RestoreSnapshot(*snapshot, &error)) {
+        std::cerr << "Error restoring depth " << built << ": " << error << '\n';
+        return 1;
+      }
+      if (session->Position() != built) {
+        std::cerr << "Error: session is at " << session->Position()
+                  << ", expected depth " << built << '\n';
+        return 1;
+      }
+      const auto start = std::chrono::steady_clock::now();
+      if (!session->Feed(std::span(tokens).subspan(built, depth - built), {},
+                         &error)) {
+        std::cerr << "Error building depth " << depth << ": " << error << '\n';
+        return 1;
+      }
+      const double seconds = seconds_since(start);
+      std::cerr << "[depth " << depth << "] prefilled " << depth - built
+                << " tokens in " << seconds << " s ("
+                << static_cast<double>(depth - built) / seconds
+                << " tok/s, from depth " << built << ")\n";
+      if (jsonl) {
+        std::cout << "{\"record\": \"depth_fill\", \"n_from\": " << built
+                  << ", \"n_to\": " << depth << ", \"seconds\": " << seconds
+                  << ", \"ts\": "
+                  << static_cast<double>(depth - built) / seconds << "}\n"
+                  << std::flush;
+      }
+      built = depth;
+    }
+    // Depth 0 is the empty session: restoring it is a reset (a snapshot needs
+    // at least one token).
+    if (depth > 0) {
+      snapshot = session->SaveSnapshot(&error);
+      if (!snapshot) {
+        std::cerr << "Error saving depth " << depth << ": " << error << '\n';
+        return 1;
+      }
+    }
+    const auto restore = [&]() {
+      if (depth == 0) {
+        session->Reset();
+        return true;
+      }
+      if (!session->RestoreSnapshot(*snapshot, &error)) {
+        std::cerr << "Error restoring depth " << depth << ": " << error << '\n';
+        return false;
+      }
+      return true;
+    };
+
+    for (const std::size_t prompt_length : options.n_prompts) {
+      if (depth + prompt_length >= required_context) {
+        std::cerr << "Error: prompt benchmark exceeds context\n";
+        return 1;
+      }
+      std::vector<double> ns;
+      StageMs stages;
+      for (std::size_t repetition = 0; repetition <= options.repetitions;
+           ++repetition) {
+        if (!restore())
+          return 1;
+        std::vector<ling::StepTiming> timings;
+        const auto start = std::chrono::steady_clock::now();
+        if (!session->Feed(std::span(tokens).subspan(depth, prompt_length),
+                           {.timings = &timings}, &error)) {
+          std::cerr << "Error running prefill: " << error << '\n';
+          return 1;
+        }
+        if (repetition > 0) {
+          ns.push_back(seconds_since(start) * 1e9);
+          stages.Add(timings);
+        }
+      }
+      emit(prompt_length, 0, depth, ns, stages);
+      if (options.op_profile && jsonl) {
+        if (!restore())
+          return 1;
+        std::vector<ling::OpTiming> ops;
+        if (!session->Feed(std::span(tokens).subspan(depth, prompt_length),
+                           {.op_profile = &ops}, &error)) {
+          std::cerr << "Error running prefill profile: " << error << '\n';
+          return 1;
+        }
+        double total_ms = 0.0;
+        for (const auto& op : ops) {
+          // "name/part" entries break an operation down; they are inside it.
+          if (op.name.find('/') == std::string::npos)
+            total_ms += op.ms;
+        }
+        std::cout << "{\"record\": \"op_profile\", \"n_prompt\": "
+                  << prompt_length << ", \"n_depth\": " << depth
+                  << ", \"ms\": " << std::fixed << std::setprecision(4)
+                  << total_ms << ", \"ops\": [";
+        for (std::size_t i = 0; i < ops.size(); ++i) {
+          const auto& op = ops[i];
+          std::cout << (i ? ", " : "") << "{\"name\": \"" << op.name
+                    << "\", \"count\": " << op.count << ", \"ms\": " << op.ms
+                    << ", \"mbytes\": " << op.bytes / 1e6 << "}";
+        }
+        std::cout << "]}\n" << std::flush;
+      }
+    }
+    for (const std::size_t generation_length : options.n_gens) {
+      if (depth + generation_length >= required_context) {
+        std::cerr << "Error: generation benchmark exceeds context\n";
+        return 1;
+      }
+      if (mtp) {
+        // Greedy speculative generation from the depth: tokens are generated
+        // (not fed), so acceptance reflects the context. Depth 0 starts from a
+        // 16-token seed (a speculative session needs a prompt).
+        std::vector<double> ns;
+        ling::Session::DraftStats timed{};
+        std::size_t emitted = 0;
+        for (std::size_t repetition = 0; repetition <= options.repetitions;
+             ++repetition) {
+          if (!restore())
+            return 1;
+          if (depth == 0 &&
+              !session->Feed(std::span(tokens).first(kLingMtpSeedTokens), {},
+                             &error)) {
+            std::cerr << "Error seeding the MTP session: " << error << '\n';
+            return 1;
+          }
+          session->ResetDraftPolicy();
+          session->SetMaxDrafts(options.draft_tokens);
+          sampling::SamplerState sampler(options.sampling);
+          const auto before = session->Statistics();
+          const auto start = std::chrono::steady_clock::now();
+          std::size_t generated = 0;
+          while (generated < generation_length) {
+            ling::Session::DecodeResult step;
+            if (!session->DecodeStep(
+                    std::min<std::size_t>(ling::kMaxVerifyTokens,
+                                          generation_length - generated),
+                    sampler, &step, &error)) {
+              std::cerr << "Error running speculative decode: " << error
+                        << '\n';
+              return 1;
+            }
+            // DecodeStep already accepted every returned token.
+            generated += step.tokens.size();
+            if (step.stop) {
+              std::cerr << "Error: the model emitted a stop token after "
+                        << generated << " of " << generation_length
+                        << " tokens; use a longer or different --text-file\n";
+              return 1;
+            }
+          }
+          if (repetition > 0) {
+            ns.push_back(seconds_since(start) * 1e9);
+            const auto after = session->Statistics();
+            timed.cycles += after.cycles - before.cycles;
+            timed.drafted += after.drafted - before.drafted;
+            timed.accepted += after.accepted - before.accepted;
+            emitted += generated;
+          }
+        }
+        emit(0, generation_length, depth, ns, StageMs{});
+        const double acceptance = timed.drafted != 0
+                                      ? static_cast<double>(timed.accepted) /
+                                            static_cast<double>(timed.drafted)
+                                      : 0.0;
+        const double per_cycle =
+            timed.cycles != 0
+                ? static_cast<double>(timed.accepted + timed.cycles) /
+                      static_cast<double>(timed.cycles)
+                : 0.0;
+        if (jsonl) {
+          std::cout << "{\"record\": \"mtp\", \"n_gen\": " << generation_length
+                    << ", \"n_depth\": " << depth
+                    << ", \"max_drafts\": " << options.draft_tokens
+                    << ", \"verified_cycles\": " << timed.cycles
+                    << ", \"drafted\": " << timed.drafted
+                    << ", \"accepted\": " << timed.accepted
+                    << ", \"acceptance\": " << std::fixed
+                    << std::setprecision(4) << acceptance
+                    << ", \"tokens_per_verified_cycle\": " << per_cycle
+                    << ", \"generated_tokens\": " << emitted << "}\n"
+                    << std::flush;
+        } else {
+          std::cout << "# mtp tg" << generation_length << " @ d" << depth
+                    << ": verified cycles " << timed.cycles << ", drafted "
+                    << timed.drafted << ", accepted " << timed.accepted << " ("
+                    << std::fixed << std::setprecision(1) << 100.0 * acceptance
+                    << "%), " << std::setprecision(2) << per_cycle
+                    << " tokens per verified cycle\n"
+                    << std::flush;
+        }
+        if (jsonl && options.op_profile &&
+            !profile_mtp(depth, generation_length, restore)) {
+          return 1;
+        }
+        continue;
+      }
+      std::vector<double> ns;
+      StageMs stages;
+      for (std::size_t repetition = 0; repetition <= options.repetitions;
+           ++repetition) {
+        if (!restore())
+          return 1;
+        const std::uint64_t replays_before = model->GraphReplays();
+        const auto start = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < generation_length; ++i) {
+          // Same path as Session::Evaluate; decode steps replay HIP graphs.
+          if (!session->Feed(std::span(tokens).subspan(depth + i, 1), {},
+                             &error)) {
+            std::cerr << "Error running decode: " << error << '\n';
+            return 1;
+          }
+        }
+        if (repetition > 0) {
+          ns.push_back(seconds_since(start) * 1e9);
+          stages.graph_forwards +=
+              static_cast<double>(model->GraphReplays() - replays_before) /
+              static_cast<double>(options.repetitions);
+        }
+      }
+      // One more repetition, eager, for the per-block device split (a
+      // replayed graph is only measured as a whole); not part of the speed.
+      if (!restore())
+        return 1;
+      {
+        std::vector<ling::StepTiming> timings;
+        timings.reserve(generation_length);
+        for (std::size_t i = 0; i < generation_length; ++i) {
+          if (!session->Feed(std::span(tokens).subspan(depth + i, 1),
+                             {.timings = &timings}, &error)) {
+            std::cerr << "Error running decode: " << error << '\n';
+            return 1;
+          }
+        }
+        stages.Add(timings);
+        stages.reps = 1;
+      }
+      emit(0, generation_length, depth, ns, stages);
+      if (jsonl && options.op_profile) {
+        // Per-operation device time of one more eager decode run (rocprofv3
+        // is not available in every pod): which launches the step spends its
+        // time in, and the bandwidth each reaches on the bytes it must read.
+        if (!restore())
+          return 1;
+        std::vector<ling::OpTiming> ops;
+        for (std::size_t i = 0; i < generation_length; ++i) {
+          if (!session->Feed(std::span(tokens).subspan(depth + i, 1),
+                             {.op_profile = &ops}, &error)) {
+            std::cerr << "Error running decode profile: " << error << '\n';
+            return 1;
+          }
+        }
+        double total_ms = 0.0;
+        for (const auto& op : ops) {
+          // "name/part" entries break an operation down; they are inside it.
+          if (op.name.find('/') == std::string::npos)
+            total_ms += op.ms;
+        }
+        const double steps = static_cast<double>(generation_length);
+        std::cout << "{\"record\": \"op_profile\", \"n_gen\": "
+                  << generation_length << ", \"n_depth\": " << depth
+                  << ", \"ms_per_step\": " << std::fixed << std::setprecision(4)
+                  << total_ms / steps << ", \"ops\": [";
+        for (std::size_t i = 0; i < ops.size(); ++i) {
+          const auto& op = ops[i];
+          std::cout << (i ? ", " : "") << "{\"name\": \"" << op.name
+                    << "\", \"count\": " << op.count / generation_length
+                    << ", \"ms\": " << op.ms / steps
+                    << ", \"mbytes\": " << op.bytes / steps / 1e6
+                    << ", \"gbps\": "
+                    << (op.ms > 0 ? op.bytes / (op.ms * 1e6) : 0.0) << "}";
+        }
+        std::cout << "]}\n" << std::flush;
+      }
+    }
+  }
+  return 0;
+}
+
 #endif
 
 }  // namespace
@@ -1193,6 +2182,7 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
     return std::nullopt;
   }
 
+  opt.speculative_explicit = speculative_explicit;
   if (!speculative_explicit && !opt.dspark_model_path.empty()) {
     opt.speculative_backend = "dspark";
   }
@@ -1264,11 +2254,18 @@ int RunBench(std::span<const char* const> args) {
       std::move(reader_owner));
 
 #if defined(ENGINE_ENABLE_HIP)
+  if (opt.output_format == "jsonl" && !IsLing3Flash(*reader)) {
+    std::cerr << "Error: --output jsonl is available for Ling-3.0-flash only\n";
+    return 2;
+  }
   if (IsDeepSeekV4Flash(*reader)) {
     return RunDeepSeekBenchmark(opt, reader, model_load_start);
   }
   if (IsQwen38FlashNext(*reader)) {
     return RunQwen38FlashNextBenchmark(opt, reader, model_load_start);
+  }
+  if (IsLing3Flash(*reader)) {
+    return RunLingBenchmark(opt, reader, model_load_start);
   }
 
   if (opt.concurrency != std::vector<std::size_t>{1}) {

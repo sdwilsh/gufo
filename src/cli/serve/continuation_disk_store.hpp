@@ -2,6 +2,7 @@
 #define GUFO_SERVER_CONTINUATION_DISK_STORE_HPP_
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -21,6 +22,9 @@ enum class ContinuationDiskEventAction : std::uint8_t {
   kMiss,
   kRemoved,
   kSkipped,
+  /// Shutdown finished writing accepted checkpoints (reason kSaved) or gave up
+  /// on the rest at the drain timeout (reason kTimeout).
+  kDrained,
 };
 
 enum class ContinuationDiskEventReason : std::uint8_t {
@@ -41,6 +45,7 @@ enum class ContinuationDiskEventReason : std::uint8_t {
   kSerializationFailure,
   kRestoreFailure,
   kBusy,
+  kTimeout,
 };
 
 /// Sanitized disk-cache event. Prompt contents, token values, paths, model
@@ -66,6 +71,9 @@ struct ContinuationDiskStoreOptions {
   /// Minimum token advance over the longest stored prefix that is still a
   /// prefix of the checkpoint before writing it. Zero disables the gate.
   std::size_t min_checkpoint_step_tokens{0};
+  /// Longest shutdown waits for accepted writes. A write already in progress
+  /// always finishes; queued ones past the deadline are discarded and logged.
+  std::chrono::milliseconds shutdown_drain_timeout{20000};
 };
 
 /// Restart-safe, provider-neutral exact-prefix snapshot store.
@@ -150,7 +158,8 @@ public:
       std::unique_ptr<CaptureReservation> reservation = {},
       bool shared_prefix = false);
 
-  /// Drains accepted writes. Shutdown also drains automatically.
+  /// Drains accepted writes. Destruction (graceful shutdown) drains them too,
+  /// bounded by ContinuationDiskStoreOptions::shutdown_drain_timeout.
   void Flush();
 
   /// Restores the longest exact saved prefix of prompt into state. When a

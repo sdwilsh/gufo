@@ -4,6 +4,8 @@ from copy import deepcopy
 import re
 import sys
 
+from check_report import check_line
+
 # The assistant opening after a stable boundary, such as Qwen's
 # `<|im_start|>assistant\n<think>\n`, is a few tokens long.
 ASSISTANT_OPENING_TOKENS = 16
@@ -108,10 +110,10 @@ def check_cache_growth(client, model, checks, chat_result, server_log=None):
                 # The previous prompt's assistant opening can change on replay.
                 # Only that small suffix may be lost, not older user turns.
                 if reused < previous_total - 16 or reused <= previous_reused:
-                    failures.append(
-                        f"{label}_turn_{turn}: cache did not advance to the previous turn: "
-                        f"cached={reused}, previous_prompt={previous_total}, "
-                        f"previous_cached={previous_reused}, prefilled={prefilled}")
+                    failures.append(check_line(
+                        f"{label}_turn_{turn}",
+                        f"cached >= {previous_total - 16} and > previous cached {previous_reused}",
+                        f"cached={reused} prefilled={prefilled}"))
             history.append((deepcopy(body), result))
             previous_total, previous_reused = total, reused
             assistant = {"role": "assistant", "content": result["text"]}
@@ -208,10 +210,10 @@ def check_messages_growth(client, model, checks, chat_result, failures, server_l
                 # so reuse must reach past the previous prompt into that turn.
                 floor = previous_total + (previous_completion // 2 if thinking else -16)
                 if reused < floor:
-                    failures.append(
-                        f"{label}_turn_{turn}: cache did not cover the replayed turn: "
-                        f"cached={reused}, previous_prompt={previous_total}, "
-                        f"previous_completion={previous_completion}, prefilled={prefilled}")
+                    failures.append(check_line(
+                        f"{label}_turn_{turn}", f"cached >= {floor} (covers the replayed turn)",
+                        f"cached={reused} previous_prompt={previous_total} "
+                        f"previous_completion={previous_completion} prefilled={prefilled}"))
             history.append((deepcopy(body), result))
             previous_total = total
             previous_completion = result["usage"]["completion_tokens"]

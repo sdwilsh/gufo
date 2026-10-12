@@ -589,13 +589,28 @@ struct ContinuationDiskStore::Impl {
   Impl& operator=(Impl&&) = delete;
 
   ~Impl() {
+    const auto started = std::chrono::steady_clock::now();
+    std::size_t waiting_jobs = 0;
+    std::size_t waiting_bytes = 0;
     {
       std::lock_guard lock(queue_mutex);
       stopping = true;
+      drain_deadline = started + options.shutdown_drain_timeout;
+      waiting_jobs = pending.size() + (writing ? 1 : 0);
+      waiting_bytes = queued_bytes;
     }
     queue_changed.notify_all();
     if (writer.joinable())
       writer.join();
+    // Always say what shutdown did, so a checkpoint missing after a restart
+    // can be told apart from one that was never accepted (min_step, capacity).
+    Emit(ContinuationDiskEventAction::kDrained,
+         dropped_jobs == 0 ? ContinuationDiskEventReason::kSaved
+                           : ContinuationDiskEventReason::kTimeout,
+         waiting_bytes, 0, dropped_jobs == 0 ? waiting_jobs : dropped_jobs,
+         std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - started)
+             .count());
     if (directory_fd >= 0) {
       ::close(directory_fd);
     }
@@ -610,8 +625,18 @@ struct ContinuationDiskStore::Impl {
                            [this] { return stopping || !pending.empty(); });
         if (pending.empty())
           return;
+        if (stopping && std::chrono::steady_clock::now() >= drain_deadline) {
+          // Bounded shutdown: the remaining checkpoints are only a cache.
+          dropped_jobs += pending.size();
+          for (const auto& dropped : pending)
+            queued_bytes -= dropped.retained_bytes;
+          pending.clear();
+          queue_changed.notify_all();
+          return;
+        }
         job = std::move(pending.front());
         pending.pop_front();
+        writing = true;
       }
       try {
         (void)Save(*job.runner, job.tokens, *job.snapshot, job.identity,
@@ -626,6 +651,7 @@ struct ContinuationDiskStore::Impl {
       {
         std::lock_guard lock(queue_mutex);
         queued_bytes -= released;
+        writing = false;
       }
       queue_changed.notify_all();
     }
@@ -1482,6 +1508,10 @@ struct ContinuationDiskStore::Impl {
   std::shared_ptr<std::atomic<std::size_t>> capture_bytes =
       std::make_shared<std::atomic<std::size_t>>(0);
   bool stopping{false};
+  bool writing{false};
+  std::chrono::steady_clock::time_point drain_deadline{
+      std::chrono::steady_clock::time_point::max()};
+  std::size_t dropped_jobs{0};
   std::thread writer;
 };
 
