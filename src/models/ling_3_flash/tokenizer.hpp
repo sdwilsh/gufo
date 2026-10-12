@@ -62,8 +62,15 @@ public:
 
   /// Encodes UTF-8 text. No BOS/EOS is added (the GGUF has add_bos=false and
   /// add_eos=false); the chat template carries every delimiter.
-  [[nodiscard]] std::vector<TokenId> Encode(std::string_view text,
-                                            bool parse_special = true) const;
+  ///
+  /// `literal_ranges` (byte offsets into `text`) are conversation data: no
+  /// special or user-defined token may match any byte inside them, so message
+  /// bodies cannot forge turn markers. Elsewhere, and across the range edges,
+  /// tokenization is that of the whole text.
+  using LiteralRange = std::pair<std::size_t, std::size_t>;
+  [[nodiscard]] std::vector<TokenId> Encode(
+      std::string_view text, bool parse_special = true,
+      std::span<const LiteralRange> literal_ranges = {}) const;
 
   /// Concatenated bytes of the tokens. Control tokens render as their text
   /// when `render_special`, otherwise as nothing. The result may end in a

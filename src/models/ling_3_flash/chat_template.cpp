@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "src/core/crypto/sha256.hpp"
+#include "src/models/ling_3_flash/tool_calls.hpp"
 
 namespace gufo::models::ling_3_flash {
 namespace {
@@ -353,6 +354,14 @@ std::string RenderChat(std::span<const ChatMessage> messages,
   }
 
   std::string out;
+  // Conversation data is recorded so the tokenizer never turns text inside it
+  // into control tokens (`<|role_end|>` in a tool result must stay text).
+  const auto data = [&](std::string_view text) {
+    if (options.literal_spans != nullptr && !text.empty()) {
+      options.literal_spans->emplace_back(out.size(), out.size() + text.size());
+    }
+    out += text;
+  };
   out += "<role>SYSTEM</role>";
   const bool first_is_system = messages[0].role == "system";
   const std::string_view first_content = messages[0].content;
@@ -361,13 +370,13 @@ std::string RenderChat(std::span<const ChatMessage> messages,
                           Contains(first_content, "detailed thinking off"));
   if (!tools.empty()) {
     if (first_is_system) {
-      out += first_content;
+      data(first_content);
       out += '\n';
     }
     out += kToolsPreamble;
     for (const auto& tool : tools) {
       out += '\n';
-      out += PythonJsonDumps(tool.definition_json);
+      data(PythonJsonDumps(tool.definition_json));
     }
     out += kToolsEpilogue;
     if (marker) {
@@ -378,10 +387,10 @@ std::string RenderChat(std::span<const ChatMessage> messages,
     }
   } else if (first_is_system) {
     if (marker) {
-      out += first_content;
+      data(first_content);
       out += kRoleEnd;
     } else {
-      out += first_content;
+      data(first_content);
       out += '\n';
       out += "detailed thinking " + thinking;
       out += kRoleEnd;
@@ -395,12 +404,12 @@ std::string RenderChat(std::span<const ChatMessage> messages,
     const ChatMessage& m = messages[i];
     if (m.role == "user") {
       out += "<role>HUMAN</role>";
-      out += m.content;
+      data(m.content);
       out += kRoleEnd;
     } else if (m.role == "system") {
       if (i != 0) {  // the leading system message is folded into the header
         out += "<role>SYSTEM</role>";
-        out += m.content;
+        data(m.content);
         out += kRoleEnd;
       }
     } else if (m.role == "assistant") {
@@ -426,29 +435,32 @@ std::string RenderChat(std::span<const ChatMessage> messages,
       // preserved_thinking is hard-wired true in the template.
       if (!reasoning.empty()) {
         out += "<role>ASSISTANT</role>\n<think>";
-        out += LStripNl(RStripNl(reasoning));
+        data(LStripNl(RStripNl(reasoning)));
         out += "</think>";
-        out += LStripNl(content);
+        data(LStripNl(content));
       } else {
         out += "<role>ASSISTANT</role>\n<think></think>";
-        out += content;
+        data(content);
       }
       for (std::size_t k = 0; k < m.tool_calls.size(); ++k) {
         const auto& call = m.tool_calls[k];
         if ((k == 0 && !content.empty()) || k != 0) {
           out += '\n';
         }
-        out += "<tool_call>";
-        out += call.name;
+        out += BailingToolSyntax::kCallOpen;
+        data(call.name);
         out += '\n';
         for (const auto& arg : call.arguments) {
-          out += "<arg_key>";
-          out += arg.name;
-          out += "</arg_key>\n<arg_value>";
-          out += arg.is_string ? arg.value : PythonJsonDumps(arg.value);
-          out += "</arg_value>";
+          out += BailingToolSyntax::kKeyOpen;
+          data(arg.name);
+          out += BailingToolSyntax::kKeyClose;
+          out += '\n';
+          out += BailingToolSyntax::kValueOpen;
+          data(arg.is_string ? arg.value : PythonJsonDumps(arg.value));
+          out += BailingToolSyntax::kValueClose;
         }
-        out += "\n</tool_call>";
+        out += '\n';
+        out += BailingToolSyntax::kCallClose;
       }
       out += kRoleEnd;
     } else {  // tool
@@ -456,7 +468,7 @@ std::string RenderChat(std::span<const ChatMessage> messages,
         out += "<role>OBSERVATION</role>";
       }
       out += "\n<tool_response>\n";
-      out += m.content;
+      data(m.content);
       out += "\n</tool_response>";
       if (i + 1 == messages.size() || messages[i + 1].role != "tool") {
         out += kRoleEnd;

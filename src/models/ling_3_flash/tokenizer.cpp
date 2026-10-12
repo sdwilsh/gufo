@@ -450,8 +450,14 @@ void LingTokenizer::EncodeText(std::string_view text,
   }
 }
 
-std::vector<TokenId> LingTokenizer::Encode(std::string_view text,
-                                           bool parse_special) const {
+std::vector<TokenId> LingTokenizer::Encode(
+    std::string_view text, bool parse_special,
+    std::span<const LiteralRange> literal_ranges) const {
+  const auto in_literal = [&](std::size_t begin, std::size_t length) {
+    return std::ranges::any_of(literal_ranges, [&](const LiteralRange& r) {
+      return r.first < begin + length && begin < r.second;
+    });
+  };
   std::vector<TokenId> out;
   struct Fragment {
     bool is_special;
@@ -482,7 +488,11 @@ std::vector<TokenId> LingTokenizer::Encode(std::string_view text,
       const std::string_view body = text.substr(f.begin, f.length);
       std::size_t pos = 0;
       while (true) {
-        const auto hit = body.find(spelling, pos);
+        auto hit = body.find(spelling, pos);
+        while (hit != std::string_view::npos &&
+               in_literal(f.begin + hit, spelling.size())) {
+          hit = body.find(spelling, hit + 1);
+        }
         if (hit == std::string_view::npos) {
           break;
         }

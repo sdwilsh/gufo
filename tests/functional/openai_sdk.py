@@ -338,13 +338,14 @@ def check_sampling_defaults(client, model, checks, preset, overrides, vision=Fal
     for thinking in (False, True):
         qwen_off = preset == "qwen38" and not thinking
         expected = {
-            "temperature": .7 if qwen_off else 1.,
+            # Ling-3.0-flash vendor defaults: temperature 0.6, top_p 0.95, top_k 20.
+            "temperature": .7 if qwen_off else (.6 if preset == "ling3" else 1.),
             "top_p": .8 if qwen_off else .95,
             "presence_penalty": 1.5 if qwen_off else 0.,
             "frequency_penalty": 0.,
             "seed": 73,
         }
-        native = {"top_k": 20 if preset == "qwen38" else 0,
+        native = {"top_k": 20 if preset in ("qwen38", "ling3") else 0,
                   "min_p": 0., "min_keep": 0, "repeat_penalty": 1.,
                   "repeat_last_n": 64}
         assert overrides.keys() <= (expected.keys() | native.keys()), overrides

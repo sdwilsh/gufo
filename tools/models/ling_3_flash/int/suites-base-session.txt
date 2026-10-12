@@ -1,0 +1,7 @@
+# Report-only base measurement: the pre-merge (int2r4) session_test binary in
+# /opt/gufo/base (GUFO_TEST_DIR), same prompts as the candidate's session steps.
+# Its results never count toward the run status; calibration lines are labelled base.
+@label=base_session @timeout=3600 ling_3_flash_session_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf
+@label=base_session_calib_30_4 @timeout=3600 ling_3_flash_session_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --prompt-tokens 30 --decode-tokens 4
+@label=base_session_calib_200_8 @timeout=3600 ling_3_flash_session_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --prompt-tokens 200 --decode-tokens 8
+@label=base_session_calib_240_12 @timeout=3600 ling_3_flash_session_test --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --prompt-tokens 240 --decode-tokens 12
