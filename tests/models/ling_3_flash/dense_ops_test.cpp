@@ -209,6 +209,35 @@ void TestQ8(std::uint32_t rows, std::uint32_t k) {
     HIP_OK(hipDeviceSynchronize());
     Name(name, sizeof name, "GemmQ8_0", rows, k, kTok);
     Check(name, dy.Get(), ref.data(), ref.size(), 3e-3);
+    // The kernel rounds activations and dequantised weights (d * q) to F16
+    // and accumulates in F32: emulate exactly that on the host.
+    std::vector<float> w16(wd.size());
+    for (std::size_t i = 0; i < wd.size(); ++i)
+      w16[i] = static_cast<float>(static_cast<_Float16>(wd[i]));
+    std::vector<float> x16(x.size());
+    for (std::size_t i = 0; i < x.size(); ++i)
+      x16[i] = static_cast<float>(static_cast<_Float16>(x[i]));
+    // The RDNA3 WMMA unit adds each group of 8 products to the F32
+    // accumulator with truncation toward zero (a plain F32 sum is up to 10x
+    // further away: see the mean error toward zero). Emulate that too.
+    std::vector<float> ref16(std::size_t{kTok} * rows);
+    for (std::size_t t = 0; t < kTok; ++t)
+      for (std::size_t r = 0; r < rows; ++r) {
+        float acc = 0.0F;
+        for (std::size_t kb = 0; kb < k; kb += 8) {
+          double sum = 0;
+          for (int i = 0; i < 8; ++i)
+            sum += double{w16[r * k + kb + i]} * x16[t * k + kb + i];
+          const double tot = double{acc} + sum;
+          float f = static_cast<float>(tot);
+          if (std::fabs(double{f}) > std::fabs(tot))
+            f = std::nextafterf(f, 0.0F);
+          acc = f;
+        }
+        ref16[t * rows + r] = acc;
+      }
+    Name(name, sizeof name, "GemmQ8_0 vs F16+RTZ-8 emulation", rows, k, kTok);
+    Check(name, dy.Get(), ref16.data(), ref16.size(), 3e-5);
   }
 }
 
