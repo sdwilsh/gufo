@@ -71,7 +71,9 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   }
   rocm::Executor::Options exec;
   exec.max_batch = options.max_batch;
+  exec.expanded_kv_bytes = options.expanded_kv_bytes;
   exec.max_context = options.max_context;
+  exec.graphs = options.graphs;
   m->executor_ = rocm::Executor::Create(*m->device_, exec, error_msg);
   if (!m->executor_) {
     return nullptr;
@@ -137,6 +139,10 @@ std::size_t Model::ScratchBytes() const noexcept {
 std::size_t Model::SessionBytes(std::uint32_t context) noexcept {
   return ling_3_flash::SessionBytes(context).Total();
 }
+std::uint64_t Model::GraphReplays() const noexcept {
+  return executor_->graph_replays();
+}
+
 double Model::UploadSeconds() const noexcept {
   return device_->stats().seconds;
 }
@@ -250,6 +256,8 @@ bool Session::Feed(std::span<const std::int32_t> tokens,
     rocm::ForwardRequest request;
     request.tokens = tokens.subspan(start, n);
     request.sink = options.sink;
+    request.block_timing = options.timings != nullptr;
+    request.op_profile = options.op_profile;
     if (want_from < n) {
       chunk_logits.resize(std::size_t{n - want_from} * kVocab);
       request.logits = chunk_logits;

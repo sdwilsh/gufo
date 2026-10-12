@@ -204,6 +204,44 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& w,
   if (!stager->Finish(error_msg)) {
     return nullptr;
   }
+  // F16 expansion weights for non-absorbed MLA prefill (dequantised once).
+  for (DeviceLayer& layer : m->layers_) {
+    if (layer.kind == LayerKind::kKda) {
+      continue;
+    }
+    void* w16 = nullptr;
+    const std::size_t bytes = mla::ExpansionWeightBytes();
+    const auto status = hipMalloc(&w16, bytes);
+    if (status != hipSuccess) {
+      if (error_msg != nullptr) {
+        *error_msg =
+            std::string("hipMalloc of MLA expansion weights failed: ") +
+            hipGetErrorString(status);
+      }
+      return nullptr;
+    }
+    m->allocations_.push_back(w16);
+    m->stats_.bytes += bytes;
+    ++m->stats_.tensors;
+    mla::BuildExpansionWeights(layer.k_b.data, layer.v_b.data,
+                               static_cast<__half*>(w16), nullptr);
+    if (const auto launch = hipGetLastError(); launch != hipSuccess) {
+      if (error_msg != nullptr) {
+        *error_msg = std::string("MLA expansion weight launch failed: ") +
+                     hipGetErrorString(launch);
+      }
+      return nullptr;
+    }
+    layer.mla_w16.data = w16;
+    layer.mla_w16.type = WeightType::kF16;
+  }
+  if (const auto sync = hipDeviceSynchronize(); sync != hipSuccess) {
+    if (error_msg != nullptr) {
+      *error_msg = std::string("MLA expansion weight build failed: ") +
+                   hipGetErrorString(sync);
+    }
+    return nullptr;
+  }
   m->stats_.seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - begin)
           .count();

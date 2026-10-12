@@ -9,19 +9,24 @@
 //    pair of 34-byte Q8_0 blocks is 17 aligned dwords), multiplies with
 //    v_dot4_i32_iu8 against the int8 activations held in LDS, and applies the
 //    two scales per block.
-//  * GemmQ8_0 / GemmF16 (prefill): 64x64 tile, K step 32, F16 WMMA with F32
-//    accumulation. Q8_0 codes are dequantised to F16 on the fly while staging
-//    to LDS; activations are rounded to F16. No activation scale quantisation.
+//  * GemmQ8_0 / GemmF16 (prefill): tiles of 16..128 tokens x 128 weight rows
+//    (shape picked from n and rows), K step 32 through double-buffered LDS, F16
+//    WMMA with F32 accumulation. Q8_0 codes are dequantised to F16 on the fly
+//    while staging to LDS; activations are rounded to F16 once up front.
+//    No activation scale quantisation.
 //  * GemvF16 / GemvF32: one wave per row (RPW rows interleaved), x slabs of
-//  1024
-//    floats staged in LDS, F32 accumulation, 16-byte weight loads.
+//    1024 floats staged in LDS, F32 accumulation, 16-byte weight loads.
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
+#include <type_traits>
 
+#include "src/models/ling_3_flash/kernels/rocm/act_quant.hip.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/kernels.hpp"
 
 namespace gufo::models::ling_3_flash::rocm::dense {
@@ -63,17 +68,28 @@ __global__ __launch_bounds__(256) void QuantizeActKernel(
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1)
     m = fmaxf(m, __shfl_xor(m, off, 32));
-  const float inv = m > 0.0F ? 127.0F / m : 0.0F;
   if (i < total) {
-    const int hi = __float2int_rn(v * inv);
-    q[i] = static_cast<std::int8_t>(hi);
-    const float s = m * (1.0F / 127.0F);
-    q2[i] = static_cast<std::int8_t>(
-        m > 0.0F ? __float2int_rn((v - static_cast<float>(hi) * s) * 127.0F / s)
-                 : 0);
+    QuantizeValue(v, m, &q[i], &q2[i]);
     if ((threadIdx.x & 31) == 0)
-      d[i >> 5] = m * (1.0F / 127.0F);
+      d[i >> 5] = QuantScale(m);
   }
+}
+
+// The quantisation of QuantizeActKernel for one element whose wave32 holds 32
+// consecutive elements of one row (so the xor-shuffle max is the block max).
+// Shared by the fused producers below so their planes equal the standalone
+// kernel's bit for bit.
+__device__ __forceinline__ void QuantizeLane(float v, std::size_t i,
+                                             std::int8_t* __restrict__ q,
+                                             std::int8_t* __restrict__ q2,
+                                             float* __restrict__ d) {
+  float m = fabsf(v);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    m = fmaxf(m, __shfl_xor(m, off, 32));
+  QuantizeValue(v, m, &q[i], &q2[i]);
+  if ((threadIdx.x & 31) == 0)
+    d[i >> 5] = QuantScale(m);
 }
 
 // ---------------------------------------------------------------------------
@@ -94,11 +110,27 @@ __device__ __forceinline__ void WaveReduceWrite(float (&acc)[NT], float* y,
   }
 }
 
+// Up to three GEMVs over the same activations in one launch (grouped by block
+// range): every row is computed exactly as in a launch of its own.
+struct Q8Groups {
+  const std::uint8_t* w[3];
+  float* y[3];
+  std::uint32_t rows[3];
+  std::uint32_t first_block[3];  // first_block[0] == 0; unused: UINT32_MAX
+};
+
 template<int NT, int RPW>
 __global__ __launch_bounds__(256) void GemvQ8Kernel(
-    const std::uint8_t* __restrict__ w, const std::int8_t* __restrict__ xq,
+    const Q8Groups groups, const std::int8_t* __restrict__ xq,
     const std::int8_t* __restrict__ xq2, const float* __restrict__ xd,
-    float* __restrict__ y, std::uint32_t k, std::uint32_t rows) {
+    std::uint32_t k) {
+  const std::uint32_t gi = blockIdx.x >= groups.first_block[2]   ? 2U
+                           : blockIdx.x >= groups.first_block[1] ? 1U
+                                                                 : 0U;
+  const std::uint8_t* __restrict__ w = groups.w[gi];
+  float* __restrict__ y = groups.y[gi];
+  const std::uint32_t rows = groups.rows[gi];
+  const std::uint32_t block_in_group = blockIdx.x - groups.first_block[gi];
   extern __shared__ __attribute__((aligned(16))) std::uint8_t smem[];
   std::int8_t* s_q = reinterpret_cast<std::int8_t*>(smem);
   std::int8_t* s_q2 =
@@ -124,7 +156,7 @@ __global__ __launch_bounds__(256) void GemvQ8Kernel(
 
   const std::uint32_t npairs = k / 64;
   const std::size_t row_bytes = std::size_t{npairs} * 68;
-  const std::uint32_t row0 = (blockIdx.x * 8 + wave) * RPW;
+  const std::uint32_t row0 = (block_in_group * 8 + wave) * RPW;
   const std::uint8_t* wrow[RPW];
 #pragma unroll
   for (int j = 0; j < RPW; ++j) {
@@ -256,7 +288,7 @@ __global__ __launch_bounds__(256) void GemvDenseKernel(
     }
     __syncthreads();
     const std::uint32_t nchunks = slab / kE;
-    for (std::uint32_t c = lane; c < nchunks; c += 32) {
+    const auto step = [&](std::uint32_t c) {
       float wf[RPW][kE];
 #pragma unroll
       for (int j = 0; j < RPW; ++j) {
@@ -294,6 +326,17 @@ __global__ __launch_bounds__(256) void GemvDenseKernel(
           for (int i = 0; i < kE; ++i)
             acc[j][t] = fmaf(wf[j][i], xv[i], acc[j][t]);
       }
+    };
+    if constexpr (kHalf) {
+      for (std::uint32_t c = lane; c < nchunks; c += 32) {
+        step(c);
+      }
+    } else {
+      // F32 (router): several 16-byte weight loads in flight per lane.
+#pragma unroll 4
+      for (std::uint32_t c = lane; c < nchunks; c += 32) {
+        step(c);
+      }
     }
   }
 #pragma unroll
@@ -305,140 +348,214 @@ __global__ __launch_bounds__(256) void GemvDenseKernel(
 
 // ---------------------------------------------------------------------------
 // WMMA GEMM over Q8_0 or F16 weights, F32 activations -> F16 -> F32 accum.
-// Block: 128 threads = 4 waves, tile 64 tokens x 64 weight rows, K step 32.
-// The activations are the WMMA A operand and the weights the B operand so
-// each lane writes consecutive output rows.
+// Activations are the WMMA A operand and the weights the B operand so each
+// lane writes consecutive output rows. A block of WT x WR waves computes a
+// (16*TF*WT tokens) x (16*RF*WR weight rows) tile; each wave owns TF x RF
+// 16x16 accumulators. K advances in steps of 32 through a double-buffered LDS
+// stage: the global loads of step kb + 1 are issued before the WMMAs of step
+// kb, converted into the other buffer afterwards, and one barrier per step
+// separates the buffers. Every output element is one accumulator chain over
+// consecutive 16-wide K slices whatever the tile shape, so results depend on
+// neither n nor the tile configuration (the dispatch below picks the shape
+// from n, rows alone).
 // ---------------------------------------------------------------------------
-constexpr int kBM = 64;   // weight rows per block
-constexpr int kBN = 64;   // tokens per block
 constexpr int kLds = 40;  // halves per LDS row (32 + 8 pad)
 
-template<bool kQ8>
-__global__ __launch_bounds__(128) void GemmKernel(
-    const std::uint8_t* __restrict__ w, const float* __restrict__ x,
+/// xh = F16(x), four values per thread.
+__global__ __launch_bounds__(256) void ConvertActKernel(
+    const float* __restrict__ x, __half* __restrict__ xh, std::size_t units) {
+  const std::size_t i = std::size_t{blockIdx.x} * 256 + threadIdx.x;
+  if (i >= units)
+    return;
+  const float4 v = reinterpret_cast<const float4*>(x)[i];
+  __half h[4] = {__float2half(v.x), __float2half(v.y), __float2half(v.z),
+                 __float2half(v.w)};
+  __builtin_memcpy(reinterpret_cast<std::uint8_t*>(xh) + i * 8, h, 8);
+}
+
+template<int TF, int RF, int WT, int WR>
+struct GemmShape {
+  static constexpr int kBN = 16 * TF * WT;  // tokens per block
+  static constexpr int kBM = 16 * RF * WR;  // weight rows per block
+  static constexpr int kThreads = 32 * WT * WR;
+};
+
+template<bool kQ8, bool kXH, int TF, int RF, int WT, int WR>
+__global__ __launch_bounds__(32 * WT * WR) void GemmKernel(
+    const std::uint8_t* __restrict__ w, const void* __restrict__ x,
     float* __restrict__ y, std::uint32_t n_tokens, std::uint32_t k,
     std::uint32_t rows, std::uint32_t ldy) {
-  __shared__ __attribute__((aligned(16))) __half s_x[kBN][kLds];
-  __shared__ __attribute__((aligned(16))) __half s_w[kBM][kLds];
+  using S = GemmShape<TF, RF, WT, WR>;
+  constexpr int kBN = S::kBN;
+  constexpr int kBM = S::kBM;
+  constexpr int kNT = S::kThreads;
+  constexpr int kWPT = kBM * 4 / kNT;  // 8-weight units per thread
+  static_assert(kBN * 8 % kNT == 0 && kBM * 4 % kNT == 0);
+  __shared__ __attribute__((aligned(16))) __half s_x[2][kBN][kLds];
+  __shared__ __attribute__((aligned(16))) __half s_w[2][kBM][kLds];
   const int tid = threadIdx.x;
   const int wave = tid >> 5;
   const int lane = tid & 31;
   const int sub = lane & 15;
   const int half_id = lane >> 4;
-  const int wt = wave >> 1;  // token half of the tile
-  const int wr = wave & 1;   // row half of the tile
+  const int wt = wave % WT;  // token slice of the tile
+  const int wr = wave / WT;  // row slice of the tile
   const std::uint32_t t0 = blockIdx.x * kBN;
   const std::uint32_t r0 = blockIdx.y * kBM;
-  const int ld_row = tid >> 1;  // staging row (token or weight row)
-  const int ld_half = tid & 1;  // which 16 k values of the stage
-  const std::uint32_t wrow = r0 + ld_row;
-  const std::uint32_t xtok = t0 + ld_row;
-  const bool w_live = wrow < rows;
-  const bool x_live = xtok < n_tokens;
   const std::size_t w_row_bytes =
       kQ8 ? std::size_t{k / 32} * 34 : std::size_t{k} * 2;
-  const std::uint8_t* wp = w + std::size_t{w_live ? wrow : 0} * w_row_bytes;
-  const float* xp = x + std::size_t{x_live ? xtok : 0} * k;
 
-  v8f acc[2][2];
+  // Staging roles: x unit = (token, 4 consecutive k); w unit = (row, 8 k).
+  // F32 activations (kXH false): float4 units; F16 activations (kXH true,
+  // converted once by ConvertActKernel): 8-half units, 4 per row of a stage.
+  constexpr int kXU = kXH ? kBN * 4 : kBN * 8;
+  constexpr int kXPT = (kXU + kNT - 1) / kNT;
+  const std::uint8_t* xp[kXPT];
+  bool x_live[kXPT];
+  int x_row[kXPT], x_c4[kXPT];
 #pragma unroll
-  for (int i = 0; i < 2; ++i)
+  for (int j = 0; j < kXPT; ++j) {
+    const int idx = tid + j * kNT;
+    x_row[j] = kXH ? idx >> 2 : idx >> 3;
+    x_c4[j] = kXH ? idx & 3 : idx & 7;  // unit within the row's 32 k values
+    const std::uint32_t tok = t0 + x_row[j];
+    x_live[j] = tok < n_tokens && idx < kXU;
+    xp[j] = static_cast<const std::uint8_t*>(x) +
+            (std::size_t{x_live[j] ? tok : 0} * k + x_c4[j] * (kXH ? 8 : 4)) *
+                (kXH ? 2 : 4);
+  }
+  const std::uint8_t* wp[kWPT];
+  bool w_live[kWPT];
+  int w_row[kWPT], w_q[kWPT];
 #pragma unroll
-    for (int j = 0; j < 2; ++j)
+  for (int j = 0; j < kWPT; ++j) {
+    const int idx = tid + j * kNT;
+    w_row[j] = idx >> 2;
+    w_q[j] = idx & 3;
+    const std::uint32_t row = r0 + w_row[j];
+    w_live[j] = row < rows;
+    wp[j] = w + std::size_t{w_live[j] ? row : 0} * w_row_bytes;
+  }
+
+  v8f acc[TF][RF];
+#pragma unroll
+  for (int i = 0; i < TF; ++i)
+#pragma unroll
+    for (int j = 0; j < RF; ++j)
       acc[i][j] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
 
-  uint4 wr_regs[2];
-  std::uint32_t scale_bits = 0;
-  float4 xr[4];
+  std::conditional_t<kXH, uint4, float4> xr[kXPT];
+  uint4 wr_regs[kWPT];  // F16: 8 halves; Q8: 8 int8 in .x/.y
+  std::uint32_t scale_bits[kWPT];
   const std::uint32_t nkb = k / 32;
 
   const auto fetch = [&](std::uint32_t kb) {
-    if constexpr (kQ8) {
-      const auto* blk =
-          reinterpret_cast<const std::uint16_t*>(wp + std::size_t{kb} * 34);
-      std::uint16_t h[8];
 #pragma unroll
-      for (int i = 0; i < 8; ++i)
-        h[i] = w_live ? blk[1 + ld_half * 8 + i] : 0;
-      scale_bits = w_live ? blk[0] : 0;
-      __builtin_memcpy(&wr_regs[0], h, 16);
-    } else {
-      const auto* src = reinterpret_cast<const uint4*>(
-          wp + std::size_t{kb} * 64 + ld_half * 32);
-      wr_regs[0] = w_live ? src[0] : make_uint4(0, 0, 0, 0);
-      wr_regs[1] = w_live ? src[1] : make_uint4(0, 0, 0, 0);
+    for (int j = 0; j < kXPT; ++j) {
+      using XT = std::conditional_t<kXH, uint4, float4>;
+      xr[j] = x_live[j] ? *reinterpret_cast<const XT*>(
+                              xp[j] + std::size_t{kb} * 32 * (kXH ? 2 : 4))
+                        : XT{};
     }
-    const auto* xs = reinterpret_cast<const float4*>(xp + std::size_t{kb} * 32 +
-                                                     ld_half * 16);
 #pragma unroll
-    for (int i = 0; i < 4; ++i)
-      xr[i] = x_live ? xs[i] : make_float4(0, 0, 0, 0);
+    for (int j = 0; j < kWPT; ++j) {
+      if constexpr (kQ8) {
+        const auto* blk = reinterpret_cast<const std::uint16_t*>(
+            wp[j] + std::size_t{kb} * 34);
+        std::uint16_t h[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+          h[i] = w_live[j] ? blk[1 + w_q[j] * 4 + i] : 0;
+        scale_bits[j] = w_live[j] ? blk[0] : 0;
+        wr_regs[j] = make_uint4(h[0] | (std::uint32_t{h[1]} << 16),
+                                h[2] | (std::uint32_t{h[3]} << 16), 0, 0);
+      } else {
+        const auto* src = reinterpret_cast<const uint4*>(
+            wp[j] + std::size_t{kb} * 64 + w_q[j] * 16);
+        wr_regs[j] = w_live[j] ? *src : make_uint4(0, 0, 0, 0);
+      }
+    }
   };
-  const auto commit = [&]() {
-    auto* dw = reinterpret_cast<uint4*>(&s_w[ld_row][ld_half * 16]);
-    if constexpr (kQ8) {
-      const float d = HalfBitsToFloat(scale_bits);
-      std::int8_t q[16];
-      __builtin_memcpy(q, &wr_regs[0], 16);
-      __half h[16];
+  const auto commit = [&](int buf) {
 #pragma unroll
-      for (int i = 0; i < 16; ++i)
-        h[i] = __float2half(static_cast<float>(q[i]) * d);
-      __builtin_memcpy(&dw[0], &h[0], 16);
-      __builtin_memcpy(&dw[1], &h[8], 16);
-    } else {
-      dw[0] = wr_regs[0];
-      dw[1] = wr_regs[1];
-    }
-    __half hx[16];
+    for (int j = 0; j < kWPT; ++j) {
+      auto* dw = reinterpret_cast<uint4*>(&s_w[buf][w_row[j]][w_q[j] * 8]);
+      if constexpr (kQ8) {
+        // d * q for int8 q, as one convert and one fused multiply-add per
+        // value on the offset-binary byte (q ^ 0x80 = q + 128): the product
+        // of the 11-bit scale and an 8-bit value is exact in F32, so this is
+        // exactly d * q.
+        const float d = HalfBitsToFloat(scale_bits[j]);
+        const float bias = -128.0F * d;
+        const std::uint32_t u[2] = {wr_regs[j].x ^ 0x80808080U,
+                                    wr_regs[j].y ^ 0x80808080U};
+        __half h[8];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      hx[4 * i] = __float2half(xr[i].x);
-      hx[4 * i + 1] = __float2half(xr[i].y);
-      hx[4 * i + 2] = __float2half(xr[i].z);
-      hx[4 * i + 3] = __float2half(xr[i].w);
+        for (int i = 0; i < 8; ++i)
+          h[i] = __float2half(__builtin_fmaf(
+              static_cast<float>(
+                  static_cast<std::uint8_t>(u[i >> 2] >> (8 * (i & 3)))),
+              d, bias));
+        __builtin_memcpy(dw, h, 16);
+      } else {
+        *dw = wr_regs[j];
+      }
     }
-    auto* dx = reinterpret_cast<uint4*>(&s_x[ld_row][ld_half * 16]);
-    __builtin_memcpy(&dx[0], &hx[0], 16);
-    __builtin_memcpy(&dx[1], &hx[8], 16);
+#pragma unroll
+    for (int j = 0; j < kXPT; ++j) {
+      if (!(kXPT * kNT == kXU || tid + j * kNT < kXU)) {
+        // idle staging slot (fewer units than threads)
+      } else if constexpr (kXH) {
+        __builtin_memcpy(&s_x[buf][x_row[j]][x_c4[j] * 8], &xr[j], 16);
+      } else {
+        __half hx[4] = {__float2half(xr[j].x), __float2half(xr[j].y),
+                        __float2half(xr[j].z), __float2half(xr[j].w)};
+        __builtin_memcpy(&s_x[buf][x_row[j]][x_c4[j] * 4], hx, 8);
+      }
+    }
   };
 
   fetch(0);
+  commit(0);
+  __syncthreads();
   for (std::uint32_t kb = 0; kb < nkb; ++kb) {
-    commit();
-    __syncthreads();
-    if (kb + 1 < nkb)
+    const int buf = static_cast<int>(kb & 1);
+    const bool more = kb + 1 < nkb;
+    if (more)
       fetch(kb + 1);
 #pragma unroll
     for (int ks = 0; ks < 2; ++ks) {
-      v16h a[2], b[2];
+      v16h a[TF], b[RF];
 #pragma unroll
-      for (int i = 0; i < 2; ++i) {
-        const __half* pa = &s_x[wt * 32 + i * 16 + sub][ks * 16];
-        const __half* pb = &s_w[wr * 32 + i * 16 + sub][ks * 16];
-        __builtin_memcpy(&a[i], pa, 32);
-        __builtin_memcpy(&b[i], pb, 32);
-      }
+      for (int i = 0; i < TF; ++i)
+        __builtin_memcpy(&a[i], &s_x[buf][(wt * TF + i) * 16 + sub][ks * 16],
+                         32);
 #pragma unroll
-      for (int i = 0; i < 2; ++i)
+      for (int j = 0; j < RF; ++j)
+        __builtin_memcpy(&b[j], &s_w[buf][(wr * RF + j) * 16 + sub][ks * 16],
+                         32);
 #pragma unroll
-        for (int j = 0; j < 2; ++j)
+      for (int i = 0; i < TF; ++i)
+#pragma unroll
+        for (int j = 0; j < RF; ++j)
           acc[i][j] =
               __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], b[j], acc[i][j]);
     }
+    if (more)
+      commit(buf ^ 1);
     __syncthreads();
   }
 
 #pragma unroll
-  for (int i = 0; i < 2; ++i)
+  for (int i = 0; i < TF; ++i)
 #pragma unroll
-    for (int j = 0; j < 2; ++j) {
-      const std::uint32_t row = r0 + wr * 32 + j * 16 + sub;
+    for (int j = 0; j < RF; ++j) {
+      const std::uint32_t row = r0 + (wr * RF + j) * 16 + sub;
       if (row >= rows)
         continue;
 #pragma unroll
       for (int e = 0; e < 8; ++e) {
-        const std::uint32_t tok = t0 + wt * 32 + i * 16 + 2 * e + half_id;
+        const std::uint32_t tok = t0 + (wt * TF + i) * 16 + 2 * e + half_id;
         if (tok < n_tokens)
           y[std::size_t{tok} * ldy + row] = acc[i][j][e];
       }
@@ -545,12 +662,107 @@ __global__ void SwiGluClampedKernel(const float* gate, const float* up,
 }
 
 // ---------------------------------------------------------------------------
+// Decode-path fusions (n <= 8 rows of kHidden): residual update + RMSNorm +
+// activation quantisation in one launch. Every value goes through the same
+// expressions, in the same order, as the separate kernels (AddResidual,
+// moe Combine, RmsNormRows, QuantizeAct), so the results are bit-identical.
+// ---------------------------------------------------------------------------
+constexpr std::uint32_t kNormThreads = 256;
+constexpr std::uint32_t kNormPer = kHidden / kNormThreads;  // 10
+static_assert(kHidden % kNormThreads == 0);
+
+// kMode 0: x = res; 1: res += addend; 2: res = (res + shared) + sum_k w[k] *
+// expert_out[k] (moe Combine); out = rmsnorm(res) * gamma; planes of out.
+template<int kMode>
+__global__ __launch_bounds__(kNormThreads) void NormQuantKernel(
+    float* res, const float* __restrict__ addend,
+    const float* __restrict__ expert_out, const float* __restrict__ weights,
+    const float* __restrict__ shared, const float* __restrict__ gamma,
+    float* __restrict__ out, std::int8_t* __restrict__ q,
+    std::int8_t* __restrict__ q2, float* __restrict__ dq, float eps) {
+  __shared__ float partial[kNormThreads / 32];
+  const std::size_t row = blockIdx.x;
+  const std::size_t base = row * kHidden;
+  float vals[kNormPer];
+  float ss = 0.0F;
+#pragma unroll
+  for (std::uint32_t j = 0; j < kNormPer; ++j) {
+    const std::uint32_t i = threadIdx.x + j * kNormThreads;
+    float v;
+    if constexpr (kMode == 0) {
+      v = res[base + i];
+    } else if constexpr (kMode == 1) {
+      v = res[base + i];
+      v += addend[base + i];
+      res[base + i] = v;
+    } else {
+      float acc = res[base + i];
+      if (shared != nullptr)
+        acc += shared[base + i];
+      float sum = 0.0F;
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        const float w = weights[row * 8 + k];
+        const float e = expert_out[(row * 8 + k) * kHidden + i];
+        sum = fmaf(w, e, sum);
+      }
+      acc += sum;
+      res[base + i] = acc;
+      v = acc;
+    }
+    vals[j] = v;
+    ss = fmaf(v, v, ss);
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    ss += __shfl_xor(ss, off, 32);
+  const int wave = threadIdx.x >> 5;
+  if ((threadIdx.x & 31) == 0)
+    partial[wave] = ss;
+  __syncthreads();
+  float total = 0.0F;
+  for (int i = 0; i < static_cast<int>(kNormThreads >> 5); ++i)
+    total += partial[i];
+  const float inv = rsqrtf(total / static_cast<float>(kHidden) + eps);
+#pragma unroll
+  for (std::uint32_t j = 0; j < kNormPer; ++j) {
+    const std::uint32_t i = threadIdx.x + j * kNormThreads;
+    const float v = vals[j] * inv;
+    const float y = v * gamma[i];
+    out[base + i] = y;
+    QuantizeLane(y, base + i, q, q2, dq);
+  }
+}
+
+// out = clamped swiglu(gate, up); planes of out (thread per element; count is
+// a multiple of 32).
+__global__ __launch_bounds__(256) void SwiGluQuantKernel(
+    const float* __restrict__ gate, const float* __restrict__ up,
+    float* __restrict__ out, std::int8_t* __restrict__ q,
+    std::int8_t* __restrict__ q2, float* __restrict__ dq, std::size_t count,
+    float limit) {
+  const std::size_t i = std::size_t{blockIdx.x} * 256 + threadIdx.x;
+  float r = 0.0F;
+  if (i < count) {
+    const float g = gate[i];
+    float a = g / (1.0F + expf(-g));
+    float u = up[i];
+    if (limit > 0.0F) {
+      a = fminf(a, limit);
+      u = fminf(fmaxf(u, -limit), limit);
+    }
+    r = a * u;
+    out[i] = r;
+  }
+  // Quantisation waves are whole (count % 32 == 0), so every lane of a wave
+  // that holds live elements is live.
+  if (i < count)
+    QuantizeLane(r, i, q, q2, dq);
+}
+
+// ---------------------------------------------------------------------------
 // Host helpers.
 // ---------------------------------------------------------------------------
-std::size_t QuantBytes(std::uint32_t n_tokens, std::uint32_t k) {
-  return 2 * Align256(std::size_t{n_tokens} * k) +
-         Align256(std::size_t{n_tokens} * (k / 32) * sizeof(float));
-}
 
 #define LING_DISPATCH_NT(n, CALL) \
   switch (n) {                    \
@@ -596,19 +808,107 @@ std::size_t QuantBytes(std::uint32_t n_tokens, std::uint32_t k) {
     }                             \
   }
 
+template<bool kQ8, bool kXH, int TF, int RF, int WT, int WR>
+void LaunchGemmShape(const std::uint8_t* w, const void* x, float* y,
+                     std::uint32_t n_tokens, std::uint32_t k,
+                     std::uint32_t rows, std::uint32_t ldy,
+                     hipStream_t stream) {
+  using S = GemmShape<TF, RF, WT, WR>;
+  const dim3 grid((n_tokens + S::kBN - 1) / S::kBN,
+                  (rows + S::kBM - 1) / S::kBM);
+  GemmKernel<kQ8, kXH, TF, RF, WT, WR>
+      <<<grid, S::kThreads, 0, stream>>>(w, x, y, n_tokens, k, rows, ldy);
+}
+
+/// Work-group processors (two CUs each; HIP counts WGPs as multiprocessors on
+/// gfx11) of the current device.
+int DeviceWgps() {
+  static const int wgps = [] {
+    int dev = 0, count = 0;
+    if (hipGetDevice(&dev) != hipSuccess ||
+        hipDeviceGetAttribute(&count, hipDeviceAttributeMultiprocessorCount,
+                              dev) != hipSuccess ||
+        count < 1)
+      return 20;  // gfx1151
+    return count;
+  }();
+  return wgps;
+}
+
+/// Tile shape from (n, rows) and the device only; the arithmetic per output
+/// element is the same for every shape (see GemmKernel). The 128 x 128 tile
+/// amortises the staging work best but only has ~3 resident blocks per WGP;
+/// the 64 x 64 tile has ~6 and runs at ~0.7 of its rate per FLOP (fitted to
+/// the gfx1151 per-shape table of WS13 round 1). The cost is the padded
+/// tile area of all blocks, with at least one full round of resident blocks
+/// (a smaller grid leaves the GPU partly idle).
+int PickGemmShape(std::uint32_t n_tokens, std::uint32_t rows) {
+  if (n_tokens <= 16)
+    return 3;
+  if (n_tokens <= 32)
+    return 2;
+  if (n_tokens <= 64)
+    return 1;
+  const double wgps = DeviceWgps();
+  const auto cost = [&](int bn, int bm, double per_wgp, double eff) {
+    const double blocks = std::ceil(n_tokens / static_cast<double>(bn)) *
+                          std::ceil(rows / static_cast<double>(bm));
+    return std::max(blocks, wgps * per_wgp) * bn * bm / eff;
+  };
+  return cost(128, 128, 3, 1.0) <= cost(64, 64, 6, 0.7) ? 0 : 1;
+}
+
+template<bool kQ8, bool kXH>
+void LaunchGemmAs(int shape, const std::uint8_t* w, const void* x, float* y,
+                  std::uint32_t n, std::uint32_t k, std::uint32_t rows,
+                  std::uint32_t ldy, hipStream_t stream) {
+  static_assert(kGemmShapes == 4, "update the shape switch");
+  if (shape < 0 || shape >= kGemmShapes)
+    throw std::invalid_argument("ling dense: invalid GEMM tile shape");
+  switch (shape) {
+    case 0:  // 128 tokens x 128 rows, 8 waves of 64 x 32
+      LaunchGemmShape<kQ8, kXH, 4, 2, 2, 4>(w, x, y, n, k, rows, ldy, stream);
+      break;
+    case 1:  // 64 x 64, 4 waves of 32 x 32
+      LaunchGemmShape<kQ8, kXH, 2, 2, 2, 2>(w, x, y, n, k, rows, ldy, stream);
+      break;
+    case 2:  // 32 x 128, 4 waves of 32 x 32
+      LaunchGemmShape<kQ8, kXH, 2, 2, 1, 4>(w, x, y, n, k, rows, ldy, stream);
+      break;
+    default:  // 3: 16 x 128, 4 waves of 16 x 32
+      LaunchGemmShape<kQ8, kXH, 1, 2, 1, 4>(w, x, y, n, k, rows, ldy, stream);
+      break;
+  }
+}
+
+/// x_half: scratch for the activations rounded to F16 (n_tokens * k halves,
+/// converted once instead of by every row block); null = convert in the
+/// kernel.
 void LaunchGemm(bool q8, const void* w, const float* x, float* y,
                 std::uint32_t n_tokens, std::uint32_t k, std::uint32_t rows,
-                std::uint32_t ldy, hipStream_t stream) {
+                std::uint32_t ldy, int shape, void* x_half,
+                hipStream_t stream) {
   if (n_tokens == 0 || rows == 0)
     return;
-  const dim3 grid((n_tokens + kBN - 1) / kBN, (rows + kBM - 1) / kBM);
+  if (shape < 0)
+    shape = PickGemmShape(n_tokens, rows);
   const auto* wb = static_cast<const std::uint8_t*>(w);
-  if (q8)
-    GemmKernel<true>
-        <<<grid, 128, 0, stream>>>(wb, x, y, n_tokens, k, rows, ldy);
-  else
-    GemmKernel<false>
-        <<<grid, 128, 0, stream>>>(wb, x, y, n_tokens, k, rows, ldy);
+  if (x_half != nullptr) {
+    const std::size_t total = std::size_t{n_tokens} * k;
+    const std::size_t units = total / 4;  // k % 32 == 0
+    ConvertActKernel<<<static_cast<unsigned>((units + 255) / 256), 256, 0,
+                       stream>>>(x, static_cast<__half*>(x_half), units);
+    if (q8)
+      LaunchGemmAs<true, true>(shape, wb, x_half, y, n_tokens, k, rows, ldy,
+                               stream);
+    else
+      LaunchGemmAs<false, true>(shape, wb, x_half, y, n_tokens, k, rows, ldy,
+                                stream);
+  } else if (q8) {
+    LaunchGemmAs<true, false>(shape, wb, x, y, n_tokens, k, rows, ldy, stream);
+  } else {
+    LaunchGemmAs<false, false>(shape, wb, x, y, n_tokens, k, rows, ldy, stream);
+  }
 }
 
 void LaunchGemvDense(bool half_w, const void* w, const float* x, float* y,
@@ -634,7 +934,91 @@ std::size_t ScratchBytes(WeightType type, std::uint32_t n_tokens,
                          std::uint32_t k) {
   if (type == WeightType::kF16 || type == WeightType::kF32)
     return 0;
-  return QuantBytes(n_tokens, k);
+  return QuantActBytes(n_tokens, k);
+}
+
+namespace {
+
+// One GEMV launch (<= 3 groups) over the quantised activations of `n` tokens
+// that start at q/q2/d (n <= 8, whole tokens fit the LDS budget).
+void LaunchGemvQ8(const Q8Group* groups, int n_groups, const std::int8_t* q,
+                  const std::int8_t* q2, const float* d, std::uint32_t n,
+                  std::uint32_t k, hipStream_t stream) {
+  const std::size_t per_token = 2 * std::size_t{k} + k / 32 * 4;
+  const std::size_t lds = std::size_t{n} * per_token;
+  const int rpw = n >= 4 ? 4 : 2;
+  Q8Groups g{};
+  std::uint32_t blocks = 0;
+  for (int i = 0; i < 3; ++i) {
+    g.first_block[i] = UINT32_MAX;
+  }
+  for (int i = 0; i < n_groups; ++i) {
+    g.w[i] = static_cast<const std::uint8_t*>(groups[i].w);
+    g.y[i] = groups[i].y;
+    g.rows[i] = groups[i].rows;
+    g.first_block[i] = blocks;
+    blocks += (groups[i].rows + 8 * rpw - 1) / (8 * rpw);
+  }
+  const dim3 grid(blocks);
+  if (n >= 4) {
+    LING_DISPATCH_NT(
+        n, (GemvQ8Kernel<NT, 4><<<grid, 256, lds, stream>>>(g, q, q2, d, k)));
+  } else {
+    LING_DISPATCH_NT(
+        n, (GemvQ8Kernel<NT, 2><<<grid, 256, lds, stream>>>(g, q, q2, d, k)));
+  }
+}
+
+}  // namespace
+
+QuantView QuantLayout(void* base, std::uint32_t n_tokens, std::uint32_t k) {
+  auto* p = static_cast<std::uint8_t*>(base);
+  const std::size_t plane = Align256(std::size_t{n_tokens} * k);
+  return {reinterpret_cast<std::int8_t*>(p),
+          reinterpret_cast<std::int8_t*>(p + plane),
+          reinterpret_cast<float*>(p + 2 * plane)};
+}
+
+std::size_t QuantActBytes(std::uint32_t n_tokens, std::uint32_t k) {
+  return 2 * Align256(std::size_t{n_tokens} * k) +
+         Align256(std::size_t{n_tokens} * (k / 32) * sizeof(float));
+}
+
+bool GemvQ8_0Fits(std::uint32_t n_tokens, std::uint32_t k) {
+  return n_tokens >= 1 && n_tokens <= kMaxGemvTokens && k % 64 == 0 &&
+         kGemvLdsBytes / (2 * std::size_t{k} + k / 32 * 4) >= 1;
+}
+
+void QuantizeActivations(const float* x, std::uint32_t n_tokens,
+                         std::uint32_t k, void* quant, hipStream_t stream) {
+  const QuantView v = QuantLayout(quant, n_tokens, k);
+  const std::size_t total = std::size_t{n_tokens} * k;
+  QuantizeActKernel<<<static_cast<unsigned>((total + 255) / 256), 256, 0,
+                      stream>>>(x, v.q, v.q2, v.d, total);
+}
+
+void GemvQ8_0Quantized(const Q8Group* groups, int n_groups, const void* quant,
+                       std::uint32_t n_tokens, std::uint32_t k,
+                       hipStream_t stream) {
+  if (n_tokens == 0 || n_groups == 0)
+    return;
+  // Sub-batches as in GemvQ8_0: as many tokens per launch as fit the LDS
+  // budget; per-token arithmetic does not depend on the sub-batch size.
+  const std::size_t per_token = 2 * std::size_t{k} + k / 32 * 4;
+  const auto sub_max = static_cast<std::uint32_t>(
+      std::min<std::size_t>(kGemvLdsBytes / per_token, kMaxGemvTokens));
+  const QuantView v = QuantLayout(const_cast<void*>(quant), n_tokens, k);
+  for (std::uint32_t t0 = 0; t0 < n_tokens; t0 += sub_max) {
+    const std::uint32_t n = std::min(sub_max, n_tokens - t0);
+    Q8Group shifted[3];
+    for (int i = 0; i < n_groups; ++i) {
+      shifted[i] = {groups[i].w, groups[i].y + std::size_t{t0} * groups[i].rows,
+                    groups[i].rows};
+    }
+    LaunchGemvQ8(shifted, n_groups, v.q + std::size_t{t0} * k,
+                 v.q2 + std::size_t{t0} * k, v.d + std::size_t{t0} * (k / 32),
+                 n, k, stream);
+  }
 }
 
 void GemvQ8_0(const void* w, const float* x, float* y, std::uint32_t n_tokens,
@@ -654,44 +1038,46 @@ void GemvQ8_0(const void* w, const float* x, float* y, std::uint32_t n_tokens,
   }
   const auto sub_max =
       static_cast<std::uint32_t>(std::min<std::size_t>(fit, kMaxGemvTokens));
-  const auto* wb = static_cast<const std::uint8_t*>(w);
   for (std::uint32_t t0 = 0; t0 < n_tokens; t0 += sub_max) {
     const std::uint32_t n = std::min(sub_max, n_tokens - t0);
-    const float* xs = x + std::size_t{t0} * k;
-    float* ys = y + std::size_t{t0} * rows;
-    const std::size_t lds = std::size_t{n} * per_token;
-    auto* q = static_cast<std::int8_t*>(scratch);
-    auto* q2 = reinterpret_cast<std::int8_t*>(
-        static_cast<std::uint8_t*>(scratch) + Align256(std::size_t{n} * k));
-    auto* d = reinterpret_cast<float*>(static_cast<std::uint8_t*>(scratch) +
-                                       2 * Align256(std::size_t{n} * k));
+    const QuantView v = QuantLayout(scratch, n, k);
     const std::size_t total = std::size_t{n} * k;
     QuantizeActKernel<<<static_cast<unsigned>((total + 255) / 256), 256, 0,
-                        stream>>>(xs, q, q2, d, total);
-    if (n >= 4) {
-      constexpr int RPW = 4;
-      const dim3 grid((rows + 8 * RPW - 1) / (8 * RPW));
-      LING_DISPATCH_NT(n, (GemvQ8Kernel<NT, RPW><<<grid, 256, lds, stream>>>(
-                              wb, q, q2, d, ys, k, rows)));
-    } else {
-      constexpr int RPW = 2;
-      const dim3 grid((rows + 8 * RPW - 1) / (8 * RPW));
-      LING_DISPATCH_NT(n, (GemvQ8Kernel<NT, RPW><<<grid, 256, lds, stream>>>(
-                              wb, q, q2, d, ys, k, rows)));
-    }
+                        stream>>>(x + std::size_t{t0} * k, v.q, v.q2, v.d,
+                                  total);
+    const Q8Group group{w, y + std::size_t{t0} * rows, rows};
+    LaunchGemvQ8(&group, 1, v.q, v.q2, v.d, n, k, stream);
   }
 }
 
 void GemmQ8_0(const void* w, const float* x, float* y, std::uint32_t n_tokens,
-              std::uint32_t k, std::uint32_t rows, void*, hipStream_t stream) {
-  LaunchGemm(true, w, x, y, n_tokens, k, rows, rows, stream);
+              std::uint32_t k, std::uint32_t rows, void* scratch,
+              hipStream_t stream) {
+  LaunchGemm(true, w, x, y, n_tokens, k, rows, rows, -1, scratch, stream);
 }
 
 void GemmQ8_0Strided(const void* w, const float* x, float* y,
                      std::uint32_t n_tokens, std::uint32_t k,
-                     std::uint32_t rows, std::uint32_t ldy, void*,
+                     std::uint32_t rows, std::uint32_t ldy, void* scratch,
                      hipStream_t stream) {
-  LaunchGemm(true, w, x, y, n_tokens, k, rows, ldy, stream);
+  LaunchGemm(true, w, x, y, n_tokens, k, rows, ldy, -1, scratch, stream);
+}
+
+int GemmShapeFor(std::uint32_t n_tokens, std::uint32_t rows) {
+  return PickGemmShape(n_tokens, rows);
+}
+
+void GemmQ8_0Shape(const void* w, const float* x, float* y,
+                   std::uint32_t n_tokens, std::uint32_t k, std::uint32_t rows,
+                   std::uint32_t ldy, int shape, void* scratch,
+                   hipStream_t stream) {
+  LaunchGemm(true, w, x, y, n_tokens, k, rows, ldy, shape, scratch, stream);
+}
+
+void GemmF16Shape(const __half* w, const float* x, float* y,
+                  std::uint32_t n_tokens, std::uint32_t k, std::uint32_t rows,
+                  int shape, void* scratch, hipStream_t stream) {
+  LaunchGemm(false, w, x, y, n_tokens, k, rows, rows, shape, scratch, stream);
 }
 
 void GemvF32(const float* w, const float* x, float* y, std::uint32_t n_tokens,
@@ -704,19 +1090,21 @@ void GemvF32(const float* w, const float* x, float* y, std::uint32_t n_tokens,
 }
 
 void GemvF16(const __half* w, const float* x, float* y, std::uint32_t n_tokens,
-             std::uint32_t k, std::uint32_t rows, hipStream_t stream) {
+             std::uint32_t k, std::uint32_t rows, void* scratch,
+             hipStream_t stream) {
   if (n_tokens == 0 || rows == 0)
     return;
   if (n_tokens > kMaxGemvTokens) {
-    GemmF16(w, x, y, n_tokens, k, rows, stream);
+    GemmF16(w, x, y, n_tokens, k, rows, scratch, stream);
     return;
   }
   LaunchGemvDense(true, w, x, y, n_tokens, k, rows, stream);
 }
 
 void GemmF16(const __half* w, const float* x, float* y, std::uint32_t n_tokens,
-             std::uint32_t k, std::uint32_t rows, hipStream_t stream) {
-  LaunchGemm(false, w, x, y, n_tokens, k, rows, rows, stream);
+             std::uint32_t k, std::uint32_t rows, void* scratch,
+             hipStream_t stream) {
+  LaunchGemm(false, w, x, y, n_tokens, k, rows, rows, -1, scratch, stream);
 }
 
 void EmbedQ4K(const void* table, const std::int32_t* tokens, float* out,
@@ -737,6 +1125,51 @@ void RmsNormRows(const float* x, const float* gamma, float* out,
   const std::uint32_t threads = 32 * std::min(8U, (d + 127) / 128);
   RmsNormRowsKernel<<<n_rows * groups, threads, 0, stream>>>(x, gamma, out, dim,
                                                              groups, d, eps);
+}
+
+void RmsNormQuantRows(const float* x, const float* gamma, float* out,
+                      std::uint32_t n_rows, float eps, void* quant,
+                      hipStream_t stream) {
+  if (n_rows == 0)
+    return;
+  const QuantView v = QuantLayout(quant, n_rows, kHidden);
+  NormQuantKernel<0><<<n_rows, kNormThreads, 0, stream>>>(
+      const_cast<float*>(x), nullptr, nullptr, nullptr, nullptr, gamma, out,
+      v.q, v.q2, v.d, eps);
+}
+
+void AddResidualRmsNormQuant(float* res, const float* addend,
+                             const float* gamma, float* out,
+                             std::uint32_t n_rows, float eps, void* quant,
+                             hipStream_t stream) {
+  if (n_rows == 0)
+    return;
+  const QuantView v = QuantLayout(quant, n_rows, kHidden);
+  NormQuantKernel<1><<<n_rows, kNormThreads, 0, stream>>>(
+      res, addend, nullptr, nullptr, nullptr, gamma, out, v.q, v.q2, v.d, eps);
+}
+
+void CombineRmsNormQuant(float* res, const float* expert_out,
+                         const float* weights, const float* shared_out,
+                         const float* gamma, float* out, std::uint32_t n_rows,
+                         float eps, void* quant, hipStream_t stream) {
+  if (n_rows == 0)
+    return;
+  const QuantView v = QuantLayout(quant, n_rows, kHidden);
+  NormQuantKernel<2><<<n_rows, kNormThreads, 0, stream>>>(
+      res, nullptr, expert_out, weights, shared_out, gamma, out, v.q, v.q2, v.d,
+      eps);
+}
+
+void SwiGluClampedQuant(const float* gate, const float* up, float* out,
+                        std::size_t count, std::uint32_t k, float limit,
+                        void* quant, hipStream_t stream) {
+  if (count == 0)
+    return;
+  const QuantView v =
+      QuantLayout(quant, static_cast<std::uint32_t>(count / k), k);
+  SwiGluQuantKernel<<<static_cast<unsigned>((count + 255) / 256), 256, 0,
+                      stream>>>(gate, up, out, v.q, v.q2, v.d, count, limit);
 }
 
 void AddResidual(float* res, const float* x, std::size_t count,

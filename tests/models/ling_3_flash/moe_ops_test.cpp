@@ -24,6 +24,7 @@
 #include "src/core/runtime_environment.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/kernels.hpp"
 #include "src/models/ling_3_flash/layout.hpp"
+#include "tests/models/ling_3_flash/parent_digests.hpp"
 
 namespace {
 
@@ -565,9 +566,203 @@ void TestCombine(int n, hipStream_t st) {
          static_cast<std::size_t>(n) * kHidden);
 }
 
+// ---- prefill: split / tile-variant invariance (bit-exact) -------------------
+std::uint64_t Fnv(const void* p, std::size_t bytes) {
+  std::uint64_t h = 1469598103934665603ULL;
+  const auto* b = static_cast<const std::uint8_t*>(p);
+  for (std::size_t i = 0; i < bytes; ++i)
+    h = (h ^ b[i]) * 1099511628211ULL;
+  return h;
+}
+
+/// Runs gate/up + down over `n` tokens in one call (default dispatch), then
+/// again with every token tile variant, then as several chunks of the same
+/// tokens. Every run must match the first one bit for bit, because an output
+/// element depends only on its own token, expert, and weights.
+void TestPrefillInvariance(Setup& s, int n, int pool, float limit,
+                           hipStream_t st, const std::string& label) {
+  Rng rng(7000 + n * 3 + pool);
+  const auto ids = MakeIds(n, pool, 0, rng);
+  std::vector<float> x(static_cast<std::size_t>(n) * kHidden);
+  for (auto& v : x)
+    v = rng.Normal();
+  std::vector<float> act_in(static_cast<std::size_t>(n) * kUsed * kFf);
+  for (auto& v : act_in)
+    v = rng.Normal();
+  Dev<float> dx(x), dact_in(act_in);
+  Dev<std::int32_t> dids(ids);
+  Dev<float> dact(act_in.size()),
+      dout(static_cast<std::size_t>(n) * kUsed * kHidden);
+  Dev<std::uint8_t> scratch(rocm::moe::PrefillScratchBytes(n));
+  using Runner = std::function<void(int t0, int cnt, unsigned nf)>;
+  const Runner run = [&](int t0, int cnt, unsigned nf) {
+    rocm::moe::ExpertGateUpPrefillTile(
+        s.dgate.get(), s.dup.get(), s.gate.type,
+        dx.get() + static_cast<std::size_t>(t0) * kHidden,
+        dids.get() + static_cast<std::size_t>(t0) * kUsed, cnt, limit,
+        dact.get() + static_cast<std::size_t>(t0) * kUsed * kFf, scratch.get(),
+        nf, st);
+    rocm::moe::ExpertDownPrefillTile(
+        s.ddown.get(), s.down.type,
+        dact_in.get() + static_cast<std::size_t>(t0) * kUsed * kFf,
+        dids.get() + static_cast<std::size_t>(t0) * kUsed, cnt,
+        dout.get() + static_cast<std::size_t>(t0) * kUsed * kHidden,
+        scratch.get(), nf, st);
+  };
+  const auto fetch = [&] {
+    CheckHip(hipStreamSynchronize(st), "inv sync");
+    return std::make_pair(dact.Read(), dout.Read());
+  };
+  run(0, n, 0);
+  const auto full = fetch();
+  std::printf("DIGEST %s %s/%s n=%d %016llx %016llx\n", label.c_str(),
+              Name(s.gate.type), Name(s.down.type), n,
+              static_cast<unsigned long long>(
+                  Fnv(full.first.data(), full.first.size() * 4)),
+              static_cast<unsigned long long>(
+                  Fnv(full.second.data(), full.second.size() * 4)));
+  {  // golden digests of the parent kernels
+    const std::string key = label + " " + Name(s.gate.type) + "/" +
+                            Name(s.down.type) + " n=" + std::to_string(n);
+    const auto da = Fnv(full.first.data(), full.first.size() * 4);
+    const auto dop = Fnv(full.second.data(), full.second.size() * 4);
+    for (const auto& g : parent_digests::kMoe)
+      if (key == g.key) {
+        const bool ok = g.act == da && g.out == dop;
+        std::printf("%-52s %s\n", (key + " == parent digest").c_str(),
+                    ok ? "PASS" : "FAIL");
+        if (!ok)
+          ++g_failures;
+      }
+  }
+  const auto same = [&](const std::string& what) {
+    const auto got = fetch();
+    const bool ok = std::memcmp(got.first.data(), full.first.data(),
+                                got.first.size() * 4) == 0 &&
+                    std::memcmp(got.second.data(), full.second.data(),
+                                got.second.size() * 4) == 0;
+    std::printf("%-52s %s\n",
+                (label + " " + Name(s.gate.type) + "/" + Name(s.down.type) +
+                 " n=" + std::to_string(n) + " " + what + " bit-identical")
+                    .c_str(),
+                ok ? "PASS" : "FAIL");
+    if (!ok)
+      ++g_failures;
+  };
+  for (unsigned nf : {1U, 2U}) {
+    CheckHip(hipMemset(dact.get(), 0xFF, act_in.size() * 4), "memset");
+    CheckHip(hipMemset(dout.get(), 0xFF, dout.Read().size() * 4), "memset");
+    run(0, n, nf);
+    same("nf=" + std::to_string(nf));
+  }
+  const std::vector<std::vector<int>> splits = {
+      {9}, {std::max(9, n - 9)}, {97, 128}, {512, 512, 512}, {64, 64, 64, 64}};
+  for (std::size_t si = 0; si < splits.size(); ++si) {
+    CheckHip(hipMemset(dact.get(), 0xFF, act_in.size() * 4), "memset");
+    CheckHip(hipMemset(dout.get(), 0xFF, dout.Read().size() * 4), "memset");
+    int t0 = 0;
+    for (int c : splits[si]) {
+      c = std::min(c, n - t0);
+      if (c <= 0)
+        break;
+      run(t0, c, 0);
+      t0 += c;
+    }
+    if (t0 < n)
+      run(t0, n - t0, 0);
+    same("split " + std::to_string(si));
+  }
+}
+
+// ---- --bench ----------------------------------------------------------------
+/// Uniform routing: 8 distinct experts per token out of `kExperts`.
+std::vector<std::int32_t> UniformIds(int n, Rng& rng) {
+  std::vector<std::int32_t> ids(static_cast<std::size_t>(n) * kUsed);
+  for (int t = 0; t < n; ++t) {
+    int ch[kUsed];
+    for (int k = 0; k < kUsed; ++k) {
+      int e;
+      bool dup;
+      do {
+        e = static_cast<int>(rng.Next() % kExperts);
+        dup = false;
+        for (int j = 0; j < k; ++j)
+          dup = dup || ch[j] == e;
+      } while (dup);
+      ch[k] = e;
+      ids[static_cast<std::size_t>(t) * kUsed + k] = e;
+    }
+  }
+  return ids;
+}
+
+void BenchExperts(Setup& s, int n, hipStream_t st) {
+  Rng rng(321 + n);
+  const auto ids = UniformIds(n, rng);
+  std::vector<float> x(static_cast<std::size_t>(n) * kHidden);
+  for (auto& v : x)
+    v = rng.Normal();
+  std::vector<float> act_in(static_cast<std::size_t>(n) * kUsed * kFf);
+  for (auto& v : act_in)
+    v = rng.Normal();
+  Dev<float> dx(x), dact_in(act_in);
+  Dev<std::int32_t> dids(ids);
+  Dev<float> dact(act_in.size()),
+      dout(static_cast<std::size_t>(n) * kUsed * kHidden);
+  Dev<std::uint8_t> scratch(rocm::moe::PrefillScratchBytes(n));
+  std::set<int> touched(ids.begin(), ids.end());
+  const double gu_bytes = 2.0 * touched.size() * kFf * s.gate.RowBytes();
+  const double dn_bytes = 1.0 * touched.size() * kHidden * s.down.RowBytes();
+  hipEvent_t e0, e1;
+  CheckHip(hipEventCreate(&e0), "ev");
+  CheckHip(hipEventCreate(&e1), "ev");
+  const auto time = [&](const std::function<void()>& f) {
+    for (int i = 0; i < 3; ++i)
+      f();
+    CheckHip(hipEventRecord(e0, st), "rec");
+    for (int i = 0; i < 10; ++i)
+      f();
+    CheckHip(hipEventRecord(e1, st), "rec");
+    CheckHip(hipEventSynchronize(e1), "sync");
+    float ms = 0;
+    CheckHip(hipEventElapsedTime(&ms, e0, e1), "elapsed");
+    return ms / 10.0;
+  };
+  struct V {
+    unsigned nf;
+  };
+  for (const V v : {V{0}, V{1}, V{2}}) {
+    const double gu = time([&] {
+      rocm::moe::ExpertGateUpPrefillTile(
+          s.dgate.get(), s.dup.get(), s.gate.type, dx.get(), dids.get(), n,
+          4.0F, dact.get(), scratch.get(), v.nf, st);
+    });
+    const double dn = time([&] {
+      rocm::moe::ExpertDownPrefillTile(s.ddown.get(), s.down.type,
+                                       dact_in.get(), dids.get(), n, dout.get(),
+                                       scratch.get(), v.nf, st);
+    });
+    const double flop_gu = 2.0 * 2 * n * kUsed * kFf * kHidden;
+    const double flop_dn = 2.0 * n * kUsed * kFf * kHidden;
+    std::printf(
+        "BENCH moe-prefill %s/%s n=%d nf=%u gate_up_ms=%.3f "
+        "(%.0f GB/s %.2f TFLOPS) down_ms=%.3f (%.0f GB/s %.2f TFLOPS) "
+        "experts=%zu\n",
+        Name(s.gate.type), Name(s.down.type), n, v.nf, gu,
+        gu_bytes / (gu * 1e-3) / 1e9, flop_gu / (gu * 1e-3) / 1e12, dn,
+        dn_bytes / (dn * 1e-3) / 1e9, flop_dn / (dn * 1e-3) / 1e12,
+        touched.size());
+  }
+  CheckHip(hipEventDestroy(e0), "ev");
+  CheckHip(hipEventDestroy(e1), "ev");
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  // Before the first HIP call: a missing $TMPDIR crashes the runtime.
+  if (!gufo::core::RequireTempDirectory())
+    return 1;
   int devices = 0;
   if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) {
     std::puts("no GPU; skipping");
@@ -576,10 +771,26 @@ int main() {
   try {
     hipStream_t st;
     CheckHip(hipStreamCreate(&st), "stream");
-    for (int n : {1, 2, 8, 64, 513})
-      TestRoute(n, st);
-    for (int n : {1, 8, 64})
-      TestCombine(n, st);
+    if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
+      struct Pair {
+        WeightType gu, dn;
+      };
+      for (const Pair pr : {Pair{WeightType::kIQ4_XS, WeightType::kQ4_K},
+                            Pair{WeightType::kQ5_K, WeightType::kQ6_K}}) {
+        Setup s(pr.gu, pr.dn, kExperts, 99, 0.06F);
+        for (int n : {64, 512, 2048})
+          BenchExperts(s, n, st);
+      }
+      return 0;
+    }
+    // --invariance: only the (fast) bit-exactness checks of the prefill path.
+    const bool quick = argc > 1 && std::strcmp(argv[1], "--invariance") == 0;
+    if (!quick) {
+      for (int n : {1, 2, 8, 64, 513})
+        TestRoute(n, st);
+      for (int n : {1, 8, 64})
+        TestCombine(n, st);
+    }
 
     struct Pair {
       WeightType gu, dn;
@@ -588,6 +799,8 @@ int main() {
                           Pair{WeightType::kQ5_K, WeightType::kQ6_K}}) {
       Setup s(pr.gu, pr.dn, 16, 42, 0.06F);
       for (float limit : {0.0F, 4.0F}) {
+        if (quick)
+          break;
         for (int n : {1, 2, 8}) {
           TestExperts(s, n, 16, 0, limit, true, 8, st,
                       "decode n=" + std::to_string(n) +
@@ -601,17 +814,29 @@ int main() {
                           " L=" + std::to_string(int(limit)));
         }
       }
-      if (pr.gu == WeightType::kIQ4_XS) {
+      if (pr.gu == WeightType::kIQ4_XS && !quick) {
         TestExperts(s, 4096, 16, 0, 4.0F, false, 6, st, "prefill n=4096 L=4");
       }
+      for (int n : {9, 64, 513})
+        TestPrefillInvariance(s, n, 16, 4.0F, st, "pool16");
     }
     {
       // Real tensor shapes: 512 stacked experts, ids over the full range.
       Setup s(WeightType::kIQ4_XS, WeightType::kQ4_K, kExperts, 77, 0.06F);
-      TestExperts(s, 8, kExperts, 0, 4.0F, true, 3, st,
-                  "real-shape 512x768x2560 decode n=8 L=4");
-      TestExperts(s, 64, kExperts, 0, 4.0F, false, 3, st,
-                  "real-shape 512x768x2560 prefill n=64 L=4");
+      if (!quick) {
+        TestExperts(s, 8, kExperts, 0, 4.0F, true, 3, st,
+                    "real-shape 512x768x2560 decode n=8 L=4");
+        TestExperts(s, 64, kExperts, 0, 4.0F, false, 3, st,
+                    "real-shape 512x768x2560 prefill n=64 L=4");
+      }
+      for (int n : {9, 64, 512, 2048})
+        TestPrefillInvariance(s, n, kExperts, 4.0F, st, "real-shape");
+    }
+    {
+      // Real shapes for the second expert type pair (layers 2, 3, 39-41).
+      Setup s(WeightType::kQ5_K, WeightType::kQ6_K, kExperts, 78, 0.06F);
+      for (int n : {9, 64, 512, 2048})
+        TestPrefillInvariance(s, n, kExperts, 4.0F, st, "real-shape");
     }
     CheckHip(hipStreamDestroy(st), "stream destroy");
   } catch (const std::exception& e) {

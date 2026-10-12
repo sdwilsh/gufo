@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -445,8 +446,9 @@ void TestRecurrent() {
     Report((nm + " state").c_str(), Compare(ds.Get(), hs), 1e-4);
   }
 
-  // Row-split prefill over strided q|k|v rows vs host and vs N decodes.
-  for (const std::uint32_t n : {1U, 7U, 64U, 300U}) {
+  // Small-batch family: RecurrentSequence over strided q|k|v rows must match
+  // the host and be bit-identical to n RecurrentDecode launches.
+  for (const std::uint32_t n : {1U, 7U, 8U}) {
     std::vector<float> hs = s0;
     std::vector<float> ho;
     HostRecurrent(hs, q, kCh, kk, kCh, v, kCh, in.g.data(), in.beta.data(), ho,
@@ -456,17 +458,16 @@ void TestRecurrent() {
     Dev<float> db(in.beta);
     Dev<float> ds(s0);
     Dev<float> dout(static_cast<std::size_t>(n) * kInner);
-    k::PrefillRowSplit(ds.get(), dqkv.get(), kCh, dqkv.get() + kInner, kCh,
-                       dqkv.get() + 2 * kInner, kCh, dg.get(), db.get(),
-                       dout.get(), n, nullptr);
+    k::RecurrentSequence(ds.get(), dqkv.get(), kCh, dqkv.get() + kInner, kCh,
+                         dqkv.get() + 2 * kInner, kCh, dg.get(), db.get(),
+                         dout.get(), n, nullptr);
     Check(hipDeviceSynchronize(), "sync");
     const auto got_o = dout.Get();
     const auto got_s = ds.Get();
-    const std::string nm = "prefill row-split n=" + std::to_string(n);
+    const std::string nm = "recurrent sequence n=" + std::to_string(n);
     Report((nm + " o vs host").c_str(), Compare(got_o, ho), 1e-4);
     Report((nm + " state vs host").c_str(), Compare(got_s, hs), 1e-4);
 
-    // Same through n RecurrentDecode launches (device-side comparison).
     Dev<float> ds2(s0);
     Dev<float> dout2(kInner);
     Err e;
@@ -484,36 +485,115 @@ void TestRecurrent() {
       e.abs = std::max(e.abs, x.abs);
       e.ref_max = std::max(e.ref_max, x.ref_max);
     }
-    Report((nm + " == n decode calls o").c_str(), e, 1e-6);
+    Report((nm + " == n decode calls o").c_str(), e, 0.0);
     Report((nm + " == n decode calls state").c_str(), Compare(ds2.Get(), got_s),
-           1e-6);
+           0.0);
+  }
+}
+
+// Prefill family: PrefillSequence over N in {9 ... 4096} tokens vs the scalar
+// double recurrence (host reference carried through the same sizes), a long
+// 4096-token run for drift, and bit-exact split invariance.
+void TestPrefill() {
+  std::mt19937 rng(2024);
+  const auto s0 = Randn(rng, l::kKdaStateFloats, 0.3F);
+  const std::vector<std::uint32_t> sizes = {9, 16, 17, 64, 300, 2048, 4096};
+  const std::uint32_t kMax = sizes.back();
+  const auto in = MakeInputs(rng, kMax);
+  Dev<float> dqkv(in.qkv);
+  Dev<float> dg(in.g);
+  Dev<float> db(in.beta);
+  const auto run = [&](Dev<float>& ds, Dev<float>& dout, std::uint32_t from,
+                       std::uint32_t n) {
+    k::PrefillSequence(
+        ds.get(), dqkv.get() + static_cast<std::size_t>(from) * kCh, kCh,
+        dqkv.get() + static_cast<std::size_t>(from) * kCh + kInner, kCh,
+        dqkv.get() + static_cast<std::size_t>(from) * kCh + 2 * kInner, kCh,
+        dg.get() + static_cast<std::size_t>(from) * kInner,
+        db.get() + static_cast<std::size_t>(from) * kH,
+        dout.get() + static_cast<std::size_t>(from) * kInner, n, nullptr);
+  };
+
+  // Host reference: one pass, state snapshots at every size (float, like the
+  // device state); outputs of all kMax tokens.
+  std::vector<float> hs = s0;
+  std::vector<float> ho_all(static_cast<std::size_t>(kMax) * kInner);
+  std::vector<std::vector<float>> snaps;
+  {
+    std::uint32_t at = 0;
+    for (const std::uint32_t n : sizes) {
+      std::vector<float> o;
+      HostRecurrent(
+          hs, in.qkv.data() + static_cast<std::size_t>(at) * kCh, kCh,
+          in.qkv.data() + static_cast<std::size_t>(at) * kCh + kInner, kCh,
+          in.qkv.data() + static_cast<std::size_t>(at) * kCh + 2 * kInner, kCh,
+          in.g.data() + static_cast<std::size_t>(at) * kInner,
+          in.beta.data() + static_cast<std::size_t>(at) * kH, o, n - at);
+      std::copy(o.begin(), o.end(),
+                ho_all.begin() + static_cast<std::size_t>(at) * kInner);
+      snaps.push_back(hs);
+      at = n;
+    }
+  }
+  for (std::size_t i = 0; i < sizes.size(); ++i) {
+    const std::uint32_t n = sizes[i];
+    Dev<float> ds(s0);
+    Dev<float> dout(static_cast<std::size_t>(kMax) * kInner);
+    run(ds, dout, 0, n);
+    Check(hipDeviceSynchronize(), "sync");
+    const auto got_o = dout.Get();
+    const std::string nm = "prefill n=" + std::to_string(n);
+    Report((nm + " o vs host").c_str(),
+           Compare(got_o.data(), ho_all.data(),
+                   static_cast<std::size_t>(n) * kInner),
+           1e-4);
+    Report((nm + " state vs host").c_str(), Compare(ds.Get(), snaps[i]), 1e-4);
+    if (n <= 300) {
+      // Against the small-batch family kernel: same math, other sum order.
+      Dev<float> ds2(s0);
+      Dev<float> dout2(static_cast<std::size_t>(n) * kInner);
+      k::RecurrentSequence(ds2.get(), dqkv.get(), kCh, dqkv.get() + kInner, kCh,
+                           dqkv.get() + 2 * kInner, kCh, dg.get(), db.get(),
+                           dout2.get(), n, nullptr);
+      Check(hipDeviceSynchronize(), "sync");
+      Report((nm + " vs recurrent sequence o").c_str(),
+             Compare(got_o.data(), dout2.Get().data(),
+                     static_cast<std::size_t>(n) * kInner),
+             1e-5);
+      Report((nm + " vs recurrent sequence state").c_str(),
+             Compare(ds.Get(), ds2.Get()), 1e-5);
+    }
   }
 
-  // Chunk invariance: 100 + 200 tokens == 300 tokens.
-  {
-    Dev<float> dqkv(in.qkv);
-    Dev<float> dg(in.g);
-    Dev<float> db(in.beta);
-    auto run = [&](Dev<float>& ds, Dev<float>& dout, std::uint32_t from,
-                   std::uint32_t n) {
-      k::PrefillRowSplit(
-          ds.get(), dqkv.get() + static_cast<std::size_t>(from) * kCh, kCh,
-          dqkv.get() + static_cast<std::size_t>(from) * kCh + kInner, kCh,
-          dqkv.get() + static_cast<std::size_t>(from) * kCh + 2 * kInner, kCh,
-          dg.get() + static_cast<std::size_t>(from) * kInner,
-          db.get() + static_cast<std::size_t>(from) * kH,
-          dout.get() + static_cast<std::size_t>(from) * kInner, n, nullptr);
-    };
+  // Split invariance: every split of a run into calls, at any token, is
+  // bit-identical to the single call (outputs and state).
+  for (const std::uint32_t total : {300U, 2048U, 4096U}) {
     Dev<float> sa(s0);
     Dev<float> oa(static_cast<std::size_t>(kMax) * kInner);
-    run(sa, oa, 0, kMax);
-    Dev<float> sb(s0);
-    Dev<float> ob(static_cast<std::size_t>(kMax) * kInner);
-    run(sb, ob, 0, 100);
-    run(sb, ob, 100, 200);
+    run(sa, oa, 0, total);
     Check(hipDeviceSynchronize(), "sync");
-    Report("prefill 100+200 == 300 o", Compare(ob.Get(), oa.Get()), 0.0);
-    Report("prefill 100+200 == 300 state", Compare(sb.Get(), sa.Get()), 0.0);
+    const auto want_o = oa.Get();
+    const auto want_s = sa.Get();
+    const std::vector<std::vector<std::uint32_t>> cuts = {
+        {1}, {5}, {8}, {9}, {16}, {17}, {100}, {total - 1}, {7, 20, 129}};
+    for (const auto& cut : cuts) {
+      Dev<float> sb(s0);
+      Dev<float> ob(static_cast<std::size_t>(kMax) * kInner);
+      std::uint32_t at = 0;
+      std::string nm = "prefill split " + std::to_string(total) + " at";
+      for (const std::uint32_t c : cut) {
+        run(sb, ob, at, c - at);
+        at = c;
+        nm += " " + std::to_string(c);
+      }
+      run(sb, ob, at, total - at);
+      Check(hipDeviceSynchronize(), "sync");
+      Report((nm + " o == whole").c_str(),
+             Compare(ob.Get().data(), want_o.data(),
+                     static_cast<std::size_t>(total) * kInner),
+             0.0);
+      Report((nm + " state == whole").c_str(), Compare(sb.Get(), want_s), 0.0);
+    }
   }
 }
 
@@ -571,9 +651,276 @@ void TestSnapshot() {
   Report("restore conv", Compare(dc.Get(), conv), 0.0);
 }
 
+// The decode fusions must equal the separate launches bit for bit.
+void ExactVerdict(bool ok, const std::string& what) {
+  std::printf("%s %s\n", ok ? "PASS" : "FAIL", what.c_str());
+  if (!ok)
+    ++g_failures;
+}
+
+bool SameBits(const std::vector<float>& a, const std::vector<float>& b) {
+  return a.size() == b.size() &&
+         std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+}
+
+void TestFusedDecode() {
+  std::mt19937 rng(777);
+  const auto wq = Randn(rng, kInner * 4, 0.5F);
+  const auto wk = Randn(rng, kInner * 4, 0.5F);
+  const auto wv = Randn(rng, kInner * 4, 0.5F);
+  Dev<float> dwq(wq), dwk(wk), dwv(wv);
+  const auto ssm_a = Randn(rng, kH, 0.5F, -1.0F);
+  const auto dt = Randn(rng, kInner, 1.0F);
+  Dev<float> da(ssm_a), ddt(dt);
+  for (int round = 0; round < 3; ++round) {
+    const auto proj = Randn(rng, kProj, round == 2 ? 6.0F : 1.5F);
+    const auto state0 = Randn(rng, l::kKdaConvStateFloats, 1.0F);
+    Dev<float> dp(proj);
+    // Reference: Conv3Decode, GateBetaPrep, L2NormHeads on q and k.
+    Dev<float> s_ref(state0), conv_ref(kCh), g_ref(kInner), b_ref(kH);
+    k::Conv3Decode(dp.get(), dwq.get(), dwk.get(), dwv.get(), s_ref.get(),
+                   conv_ref.get(), nullptr);
+    k::GateBetaPrep(dp.get(), da.get(), ddt.get(), g_ref.get(), b_ref.get(), 1,
+                    nullptr);
+    k::L2NormHeads(conv_ref.get(), kCh, 1, nullptr);
+    k::L2NormHeads(conv_ref.get() + kInner, kCh, 1, nullptr);
+    // Fused.
+    Dev<float> s_new(state0), conv_new(kCh), g_new(kInner), b_new(kH);
+    k::PrepDecode(dp.get(), dwq.get(), dwk.get(), dwv.get(), s_new.get(),
+                  da.get(), ddt.get(), conv_new.get(), g_new.get(), b_new.get(),
+                  nullptr);
+    Check(hipDeviceSynchronize(), "sync");
+    const std::string r = " round " + std::to_string(round);
+    ExactVerdict(SameBits(conv_ref.Get(), conv_new.Get()),
+                 "PrepDecode conv/q/k/v == separate" + r);
+    ExactVerdict(SameBits(s_ref.Get(), s_new.Get()),
+                 "PrepDecode conv state == separate" + r);
+    ExactVerdict(SameBits(g_ref.Get(), g_new.Get()),
+                 "PrepDecode gate == separate" + r);
+    ExactVerdict(SameBits(b_ref.Get(), b_new.Get()),
+                 "PrepDecode beta == separate" + r);
+  }
+  // OutputNormGateQuant == OutputNormGate + QuantizeActivations.
+  const auto gamma = Randn(rng, kD, 0.4F, 1.0F);
+  Dev<float> dgamma(gamma);
+  for (const std::uint32_t n : {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U}) {
+    const auto o = Randn(rng, std::size_t{n} * kInner, 2.0F);
+    const auto proj = Randn(rng, std::size_t{n} * kProj, 2.0F);
+    Dev<float> dO(o), dP(proj), out_ref(std::size_t{n} * kInner),
+        out_new(std::size_t{n} * kInner);
+    const std::size_t qb =
+        gufo::models::ling_3_flash::rocm::dense::QuantActBytes(n, kInner);
+    Dev<std::uint8_t> q_ref(qb), q_new(qb);
+    Check(hipMemset(q_ref.get(), 0, qb), "memset");
+    Check(hipMemset(q_new.get(), 0, qb), "memset");
+    k::OutputNormGate(dO.get(), dP.get(), dgamma.get(), out_ref.get(), n,
+                      nullptr);
+    gufo::models::ling_3_flash::rocm::dense::QuantizeActivations(
+        out_ref.get(), n, kInner, q_ref.get(), nullptr);
+    k::OutputNormGateQuant(dO.get(), dP.get(), dgamma.get(), out_new.get(), n,
+                           q_new.get(), nullptr);
+    Check(hipDeviceSynchronize(), "sync");
+    const auto a = q_ref.Get();
+    const auto b = q_new.Get();
+    ExactVerdict(
+        SameBits(out_ref.Get(), out_new.Get()) && a == b,
+        "OutputNormGateQuant == gate + quantise n=" + std::to_string(n));
+    // Through the Q8_0 GEMV (2560 x 4096): quantised path == standalone path.
+    {
+      namespace dn = gufo::models::ling_3_flash::rocm::dense;
+      constexpr std::uint32_t kRows = 2560;
+      std::vector<std::uint8_t> wq(std::size_t{kRows} * (kInner / 32) * 34);
+      std::mt19937 wr(99);
+      for (auto& v : wq)
+        v = static_cast<std::uint8_t>(wr() & 0x3F);
+      for (std::size_t blk = 0; blk < wq.size() / 34; ++blk) {
+        wq[blk * 34] = 0x00;  // fp16 scale = 0x3000 (0.125)
+        wq[blk * 34 + 1] = 0x30;
+      }
+      Dev<std::uint8_t> dw(wq);
+      Dev<std::uint8_t> scratch(dn::ScratchBytes(
+          gufo::models::ling_3_flash::rocm::WeightType::kQ8_0, 8, kInner));
+      Dev<float> y_ref(std::size_t{n} * kRows), y_new(std::size_t{n} * kRows);
+      dn::GemvQ8_0(dw.get(), out_ref.get(), y_ref.get(), n, kInner, kRows,
+                   scratch.get(), nullptr);
+      const dn::Q8Group group{dw.get(), y_new.get(), kRows};
+      dn::GemvQ8_0Quantized(&group, 1, q_new.get(), n, kInner, nullptr);
+      Check(hipDeviceSynchronize(), "sync");
+      ExactVerdict(SameBits(y_ref.Get(), y_new.Get()),
+                   "gate+quantise -> GemvQ8_0 chain n=" + std::to_string(n));
+    }
+  }
+}
+
+// Prefill to decode handoff through the whole mixer pipeline (conv, gate/beta,
+// L2, recurrence). The test prefills N tokens (family dispatch as in the
+// executor: n > 8 uses PrefillSequence), then runs K decode steps, and compares
+// against N + K single-token steps. The carried KDA state and conv window after
+// N tokens, and the outputs of the following steps, must agree to rounding.
+void TestHandoff() {
+  std::mt19937 rng(606);
+  const auto wq = Randn(rng, kInner * 4, 0.5F);
+  const auto wk = Randn(rng, kInner * 4, 0.5F);
+  const auto wv = Randn(rng, kInner * 4, 0.5F);
+  Dev<float> dwq(wq);
+  Dev<float> dwk(wk);
+  Dev<float> dwv(wv);
+  std::vector<float> ssm_a(kH);
+  std::uniform_real_distribution<float> ud(0.05F, 4.0F);
+  for (auto& a : ssm_a) {
+    a = ud(rng);
+  }
+  Dev<float> da(ssm_a);
+  Dev<float> ddt(Randn(rng, kInner, 1.0F));
+  const auto s0 = Randn(rng, l::kKdaStateFloats, 0.3F);
+  const auto c0 = Randn(rng, l::kKdaConvStateFloats, 1.0F);
+  constexpr std::uint32_t kSteps = 8;
+  for (const std::uint32_t n : {9U, 16U, 17U, 30U, 31U, 64U, 300U}) {
+    const std::uint32_t total = n + kSteps;
+    const auto proj = Randn(rng, static_cast<std::size_t>(total) * kProj, 1.5F);
+    Dev<float> dproj(proj);
+    // Runs tokens [from, from + len) through the pipeline in one call.
+    const auto run = [&](Dev<float>& st, Dev<float>& cs, Dev<float>& out,
+                         std::uint32_t from, std::uint32_t len) {
+      const float* p = dproj.get() + static_cast<std::size_t>(from) * kProj;
+      Dev<float> conv(static_cast<std::size_t>(len) * kCh);
+      Dev<float> g(static_cast<std::size_t>(len) * kInner);
+      Dev<float> b(static_cast<std::size_t>(len) * kH);
+      k::Conv3Prefill(p, dwq.get(), dwk.get(), dwv.get(), cs.get(), conv.get(),
+                      len, nullptr);
+      k::GateBetaPrep(p, da.get(), ddt.get(), g.get(), b.get(), len, nullptr);
+      k::L2NormHeads(conv.get(), kCh, len, nullptr);
+      k::L2NormHeads(conv.get() + kInner, kCh, len, nullptr);
+      float* o = out.get() + static_cast<std::size_t>(from) * kInner;
+      if (len == 1) {
+        k::RecurrentDecode(st.get(), conv.get(), conv.get() + kInner,
+                           conv.get() + 2 * kInner, g.get(), b.get(), o,
+                           nullptr);
+      } else if (len <= 8) {
+        k::RecurrentSequence(st.get(), conv.get(), kCh, conv.get() + kInner,
+                             kCh, conv.get() + 2 * kInner, kCh, g.get(),
+                             b.get(), o, len, nullptr);
+      } else {
+        k::PrefillSequence(st.get(), conv.get(), kCh, conv.get() + kInner, kCh,
+                           conv.get() + 2 * kInner, kCh, g.get(), b.get(), o,
+                           len, nullptr);
+      }
+      Check(hipDeviceSynchronize(), "sync");
+    };
+    Dev<float> sa(s0);
+    Dev<float> ca(c0);
+    Dev<float> oa(static_cast<std::size_t>(total) * kInner);
+    run(sa, ca, oa, 0, n);  // prefill family
+    const auto state_a = sa.Get();
+    const auto conv_a = ca.Get();
+    for (std::uint32_t t = n; t < total; ++t) {
+      run(sa, ca, oa, t, 1);
+    }
+    Dev<float> sb(s0);
+    Dev<float> cb(c0);
+    Dev<float> ob(static_cast<std::size_t>(total) * kInner);
+    std::vector<float> state_b;
+    std::vector<float> conv_b;
+    for (std::uint32_t t = 0; t < total; ++t) {
+      run(sb, cb, ob, t, 1);
+      if (t + 1 == n) {
+        state_b = sb.Get();
+        conv_b = cb.Get();
+      }
+    }
+    const std::string nm = "handoff n=" + std::to_string(n);
+    Report((nm + " state after prefill").c_str(), Compare(state_a, state_b),
+           5e-5);
+    Report((nm + " conv after prefill").c_str(), Compare(conv_a, conv_b), 0.0);
+    Report((nm + " o of prefill").c_str(),
+           Compare(oa.Get().data(), ob.Get().data(),
+                   static_cast<std::size_t>(n) * kInner),
+           5e-5);
+    Report((nm + " o of 8 decode steps").c_str(),
+           Compare(oa.Get().data() + static_cast<std::size_t>(n) * kInner,
+                   ob.Get().data() + static_cast<std::size_t>(n) * kInner,
+                   static_cast<std::size_t>(kSteps) * kInner),
+           5e-5);
+    Report((nm + " final state").c_str(), Compare(sa.Get(), sb.Get()), 5e-5);
+    Report((nm + " final conv").c_str(), Compare(ca.Get(), cb.Get()), 0.0);
+  }
+}
+
+// Informational device timings (best of 7) of one layer's KDA prefill stages.
+template<typename F>
+double TimeMs(F&& f) {
+  hipEvent_t a;
+  hipEvent_t b;
+  Check(hipEventCreate(&a), "event");
+  Check(hipEventCreate(&b), "event");
+  // Spin the clocks up first: a few short launches measure the idle DPM state.
+  for (int r = 0; r < 20; ++r) {
+    f();
+  }
+  Check(hipDeviceSynchronize(), "sync");
+  constexpr int kReps = 7;
+  float best = 1e30F;
+  for (int r = 0; r < kReps; ++r) {
+    Check(hipEventRecord(a, nullptr), "record");
+    f();
+    Check(hipEventRecord(b, nullptr), "record");
+    Check(hipEventSynchronize(b), "sync");
+    float ms = 0;
+    Check(hipEventElapsedTime(&ms, a, b), "elapsed");
+    best = std::min(best, ms);
+  }
+  (void)hipEventDestroy(a);
+  (void)hipEventDestroy(b);
+  return best;
+}
+
+void BenchStages() {
+  std::mt19937 rng(31);
+  for (const std::uint32_t n : {512U, 2048U}) {
+    const auto in = MakeInputs(rng, n);
+    Dev<float> dqkv(in.qkv);
+    Dev<float> dg(in.g);
+    Dev<float> db(in.beta);
+    Dev<float> ds(Randn(rng, l::kKdaStateFloats, 0.1F));
+    Dev<float> dout(static_cast<std::size_t>(n) * kInner);
+    Dev<float> dproj(static_cast<std::size_t>(n) * kProj);
+    Dev<float> dcs(Randn(rng, l::kKdaConvStateFloats, 1.0F));
+    Dev<float> dw(Randn(rng, kInner * 4, 0.5F));
+    Dev<float> dssm(Randn(rng, kD, 1.0F));
+    const double rec = TimeMs([&] {
+      k::PrefillSequence(ds.get(), dqkv.get(), kCh, dqkv.get() + kInner, kCh,
+                         dqkv.get() + 2 * kInner, kCh, dg.get(), db.get(),
+                         dout.get(), n, nullptr);
+    });
+    const double conv = TimeMs([&] {
+      k::Conv3Prefill(dproj.get(), dw.get(), dw.get(), dw.get(), dcs.get(),
+                      dqkv.get(), n, nullptr);
+    });
+    const double prep = TimeMs([&] {
+      k::GateBetaPrep(dproj.get(), dssm.get(), dw.get(), dg.get(), db.get(), n,
+                      nullptr);
+      k::L2NormHeads(dqkv.get(), kCh, n, nullptr);
+      k::L2NormHeads(dqkv.get() + kInner, kCh, n, nullptr);
+    });
+    const double onorm = TimeMs([&] {
+      k::OutputNormGate(dout.get(), dproj.get(), dssm.get(), dout.get(), n,
+                        nullptr);
+    });
+    std::printf(
+        "TIMING n=%u: recurrence %.3f ms, conv %.3f ms, gate+l2 %.3f ms, "
+        "out-norm-gate %.3f ms\n",
+        n, rec, conv, prep, onorm);
+  }
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  // Before the first HIP call: a missing $TMPDIR crashes the runtime.
+  if (!gufo::core::RequireTempDirectory())
+    return 1;
+  // --bench prints informational stage timings (not part of correctness runs).
+  const bool bench = argc > 1 && std::string(argv[1]) == "--bench";
   int count = 0;
   if (hipGetDeviceCount(&count) != hipSuccess || count == 0) {
     std::printf("SKIP: no HIP device\n");
@@ -583,8 +930,14 @@ int main() {
     TestConv();
     TestPrep();
     TestRecurrent();
+    TestPrefill();
+    TestHandoff();
     TestOutputNormGate();
     TestSnapshot();
+    TestFusedDecode();
+    if (bench) {
+      BenchStages();
+    }
   } catch (const std::exception& e) {
     std::printf("FAIL: %s\n", e.what());
     return 1;

@@ -35,8 +35,11 @@ enum class WeightType : std::uint32_t {
 // ===========================================================================
 namespace dense {
 
-/// Device bytes of activation-quantisation scratch the Q8_0/k-quant paths
-/// need for `n_tokens` rows of `k` columns (0 for F16/F32 weights).
+/// Device bytes of scratch the Q8_0 paths need for `n_tokens` rows of `k`
+/// columns: the int8 activation planes of GemvQ8_0 and, for the GEMMs, the
+/// activations rounded to F16 (2 * n_tokens * k bytes). 0 for F16/F32 weights.
+/// Every Q8_0 entry point may overwrite the whole area; keep it free of live
+/// data. The F16 head GEMM needs `2 * n_tokens * k` bytes of the same buffer.
 std::size_t ScratchBytes(WeightType type, std::uint32_t n_tokens,
                          std::uint32_t k);
 
@@ -45,25 +48,96 @@ std::size_t ScratchBytes(WeightType type, std::uint32_t n_tokens,
 void GemvQ8_0(const void* w, const float* x, float* y, std::uint32_t n_tokens,
               std::uint32_t k, std::uint32_t rows, void* scratch,
               hipStream_t stream);
-/// Same math as GemvQ8_0, tiled for prefill (any `n_tokens`).
+/// Same math as GemvQ8_0, tiled for prefill (any `n_tokens`). `scratch`
+/// (>= ScratchBytes) is written: it receives the activations rounded to F16 so
+/// the row blocks do not each convert them. Null converts inside the kernel
+/// (same bits).
 void GemmQ8_0(const void* w, const float* x, float* y, std::uint32_t n_tokens,
               std::uint32_t k, std::uint32_t rows, void* scratch,
               hipStream_t stream);
 /// Strided output form: y[t * ldy + r]; used to write into the stacked KDA
-/// projection `[token][kKdaProjRows]` and similar wide rows.
+/// projection `[token][kKdaProjRows]` and similar wide rows. `scratch` is
+/// written as for GemmQ8_0.
 void GemmQ8_0Strided(const void* w, const float* x, float* y,
                      std::uint32_t n_tokens, std::uint32_t k,
                      std::uint32_t rows, std::uint32_t ldy, void* scratch,
                      hipStream_t stream);
 
+/// Test/benchmark hook: GemmQ8_0Strided with an explicit tile shape
+/// (0..kGemmShapes - 1: 128x128, 64x64, 32x128, 16x128 tokens x rows). Every
+/// shape returns the same bits as the default dispatch (GemmQ8_0Strided).
+inline constexpr int kGemmShapes = 4;
+/// The shape the default dispatch picks for (n_tokens, rows).
+int GemmShapeFor(std::uint32_t n_tokens, std::uint32_t rows);
+void GemmQ8_0Shape(const void* w, const float* x, float* y,
+                   std::uint32_t n_tokens, std::uint32_t k, std::uint32_t rows,
+                   std::uint32_t ldy, int shape, void* scratch,
+                   hipStream_t stream);
+void GemmF16Shape(const __half* w, const float* x, float* y,
+                  std::uint32_t n_tokens, std::uint32_t k, std::uint32_t rows,
+                  int shape, void* scratch, hipStream_t stream);
+
 /// y[t][r] = dot(w[r], x[t]) with F32 weights (routers, 512 rows).
 void GemvF32(const float* w, const float* x, float* y, std::uint32_t n_tokens,
              std::uint32_t k, std::uint32_t rows, hipStream_t stream);
 /// F16 weights `[rows][k]` with F32 accumulation (the lm_head, rows = 157184).
+/// `scratch` (>= 2 * n_tokens * k bytes, written) holds the F16 activations
+/// of the GEMM path (n_tokens > 8); null converts inside the kernel.
 void GemvF16(const __half* w, const float* x, float* y, std::uint32_t n_tokens,
-             std::uint32_t k, std::uint32_t rows, hipStream_t stream);
+             std::uint32_t k, std::uint32_t rows, void* scratch,
+             hipStream_t stream);
 void GemmF16(const __half* w, const float* x, float* y, std::uint32_t n_tokens,
-             std::uint32_t k, std::uint32_t rows, hipStream_t stream);
+             std::uint32_t k, std::uint32_t rows, void* scratch,
+             hipStream_t stream);
+
+/// Quantised activations as the Q8_0 GEMV consumes them: two int8 planes
+/// (value, residual) of `n_tokens` x k and one F32 scale per 32 values, in one
+/// buffer of QuantActBytes(n_tokens, k) bytes (layout depends on n_tokens, k).
+struct QuantView {
+  std::int8_t* q;
+  std::int8_t* q2;
+  float* d;
+};
+QuantView QuantLayout(void* base, std::uint32_t n_tokens, std::uint32_t k);
+std::size_t QuantActBytes(std::uint32_t n_tokens, std::uint32_t k);
+/// True when GemvQ8_0Quantized accepts (n_tokens in 1..8, k % 64 == 0).
+bool GemvQ8_0Fits(std::uint32_t n_tokens, std::uint32_t k);
+/// Quantises x[n][k] into `quant` (what GemvQ8_0 does internally).
+void QuantizeActivations(const float* x, std::uint32_t n_tokens,
+                         std::uint32_t k, void* quant, hipStream_t stream);
+struct Q8Group {
+  const void* w;  ///< `rows` Q8_0 rows of k columns
+  float* y;       ///< y[t * rows + r]
+  std::uint32_t rows;
+};
+/// GemvQ8_0 over already quantised activations, for up to three weight
+/// matrices in one launch (rows computed exactly as by separate launches).
+void GemvQ8_0Quantized(const Q8Group* groups, int n_groups, const void* quant,
+                       std::uint32_t n_tokens, std::uint32_t k,
+                       hipStream_t stream);
+
+/// Decode fusions (n_rows <= 8 rows of 2560): norm + quantisation in one
+/// launch, bit-identical to RmsNormRows (+ AddResidual / moe::Combine) followed
+/// by QuantizeActivations. `out` is the normalised F32 row, `quant` the planes.
+/// out = norm(x) * gamma
+void RmsNormQuantRows(const float* x, const float* gamma, float* out,
+                      std::uint32_t n_rows, float eps, void* quant,
+                      hipStream_t stream);
+/// res += addend; out = norm(res) * gamma
+void AddResidualRmsNormQuant(float* res, const float* addend,
+                             const float* gamma, float* out,
+                             std::uint32_t n_rows, float eps, void* quant,
+                             hipStream_t stream);
+/// moe::Combine into res, then out = norm(res) * gamma
+void CombineRmsNormQuant(float* res, const float* expert_out,
+                         const float* weights, const float* shared_out,
+                         const float* gamma, float* out, std::uint32_t n_rows,
+                         float eps, void* quant, hipStream_t stream);
+/// SwiGluClamped over count = rows * k values, and the planes of the result
+/// (count % 32 == 0).
+void SwiGluClampedQuant(const float* gate, const float* up, float* out,
+                        std::size_t count, std::uint32_t k, float limit,
+                        void* quant, hipStream_t stream);
 
 /// out[t][:] = dequant(table[tokens[t]]); table is Q4_K rows of `hidden`.
 void EmbedQ4K(const void* table, const std::int32_t* tokens, float* out,
@@ -127,10 +201,21 @@ void L2NormHeads(float* x, std::uint32_t ld, std::uint32_t n_rows,
 void RecurrentDecode(float* state, const float* q, const float* k,
                      const float* v, const float* g, const float* beta,
                      float* o, hipStream_t stream);
-/// The same recurrence applied sequentially over `n_tokens` (row-split over
-/// the value axis across blocks); inputs are `[t][4096]` rows (`ld_*` strides
-/// in floats), beta `[t][32]`; `state` is updated to the last token.
-void PrefillRowSplit(float* state, const float* q, std::uint32_t ld_q,
+/// The same recurrence applied sequentially over `n_tokens` with the decode
+/// kernel's arithmetic (the small-batch numeric family, n <= 8: bit-identical
+/// to `n_tokens` RecurrentDecode calls). Inputs are `[t][4096]` rows (`ld_*`
+/// strides in floats), beta `[t][32]`; `state` is updated to the last token.
+void RecurrentSequence(float* state, const float* q, std::uint32_t ld_q,
+                       const float* k, std::uint32_t ld_k, const float* v,
+                       std::uint32_t ld_v, const float* g, const float* beta,
+                       float* o, std::uint32_t n_tokens, hipStream_t stream);
+/// The same recurrence, token-sequential, restructured for throughput (the
+/// prefill numeric family, n > 8; valid for any n >= 1). The result is a fixed
+/// function of the token sequence: any split into calls, at any token, is
+/// bit-identical to one call. It differs from RecurrentSequence only in
+/// rounding order (summation order of the two per-token dot products, possibly
+/// fast-math contraction; about 1e-7 relative).
+void PrefillSequence(float* state, const float* q, std::uint32_t ld_q,
                      const float* k, std::uint32_t ld_k, const float* v,
                      std::uint32_t ld_v, const float* g, const float* beta,
                      float* o, std::uint32_t n_tokens, hipStream_t stream);
@@ -139,6 +224,20 @@ void PrefillRowSplit(float* state, const float* q, std::uint32_t ld_q,
 /// sigmoid(proj[t][kKdaGaRow + h*128 + j]); eps 1e-6.
 void OutputNormGate(const float* o, const float* proj, const float* ssm_norm,
                     float* out, std::uint32_t n_tokens, hipStream_t stream);
+
+/// One-token (decode) fusion of Conv3Decode, GateBetaPrep and L2NormHeads on q
+/// and k: `conv_out` `[3 * 4096]` (q|k normalised, v), g `[4096]`, beta `[32]`.
+/// Bit-identical to calling those three (n_tokens = 1).
+void PrepDecode(const float* proj, const float* w_q, const float* w_k,
+                const float* w_v, float* conv_state, const float* ssm_a,
+                const float* dt_bias, float* conv_out, float* g, float* beta,
+                hipStream_t stream);
+/// OutputNormGate that also writes the activation planes of `out` for the
+/// following Q8_0 GEMV (dense::QuantLayout(quant, n_tokens, 4096)).
+void OutputNormGateQuant(const float* o, const float* proj,
+                         const float* ssm_norm, float* out,
+                         std::uint32_t n_tokens, void* quant,
+                         hipStream_t stream);
 
 /// Rollback copies of the recurrent state of all 35 KDA layers (state then
 /// conv, in layout.hpp order): Snapshot copies live -> snap, Restore the
@@ -163,10 +262,12 @@ void LatentNormRope(const float* kv_a, const float* gamma,
                     const std::int32_t* positions, float* kv_out,
                     std::uint32_t n_tokens, hipStream_t stream);
 
-/// cache[(first_pos + t) * 576 + c] = half(kv[t][c]) for the layer's cache base
+/// cache[positions[t] * 576 + c] = half(kv[t][c]) for the layer's cache base
 /// pointer (already offset by MlaCacheLayout::LayerStride() * mla index).
-void CacheAppend(__half* layer_cache, const float* kv, std::uint32_t first_pos,
-                 std::uint32_t n_tokens, hipStream_t stream);
+/// `positions` is device memory (so a captured graph replays at any position).
+void CacheAppend(__half* layer_cache, const float* kv,
+                 const std::int32_t* positions, std::uint32_t n_tokens,
+                 hipStream_t stream);
 
 /// q_abs[t][h][0..512] = sum_d q_nope[t][h][d] * k_b[h][c][d] (k_b Q8_0
 /// `[head][512][128]`); q_abs[t][h][512..576] = NORM rope(q_pe[t][h]) at
@@ -176,18 +277,65 @@ void QAbsorb(const float* q, const void* k_b, const std::int32_t* positions,
 
 /// Device bytes of split-K partial scratch for one decode attention call.
 std::size_t DecodeScratchBytes(std::uint32_t max_context);
-/// One query token over `context` cached rows: s[h][p] = q_abs[h] . cache[p]
-/// / sqrt(192) over all 576 channels; out[h][0..512] = sum_p softmax(s)[h][p] *
-/// cache[p][0..512] (latent rows act as values). Split-K across `context`.
+/// One query token at `*position` (device int32) over `*position + 1` cached
+/// rows: s[h][p] = q_abs[h] . cache[p] / sqrt(192) over all 576 channels;
+/// out[h][0..512] = sum_p softmax(s)[h][p] * cache[p][0..512] (latent rows act
+/// as values). Split-K across the context; the split plan is a function of the
+/// context alone and is evaluated on the device (the grid is the maximum plan,
+/// surplus blocks exit), so the launch is identical for every position and can
+/// be captured in a HIP graph.
 void DecodeAttention(const float* q_abs, const __half* layer_cache,
-                     std::uint32_t context, float* out_latent, void* scratch,
-                     hipStream_t stream);
-/// Prefill: query t sits at position `first_pos + t` and attends causally to
-/// cache rows 0..first_pos+t (the chunk's own rows are already appended).
-/// q_abs `[t][32][576]` -> out_latent `[t][32][512]`; same math as decode.
-void PrefillAttention(const float* q_abs, const __half* layer_cache,
-                      std::uint32_t first_pos, std::uint32_t n_tokens,
-                      float* out_latent, void* scratch, hipStream_t stream);
+                     const std::int32_t* position, float* out_latent,
+                     void* scratch, hipStream_t stream);
+/// Device milliseconds of the parts of one PrefillAttentionNonAbsorbed call
+/// (profiling aid: passing it brackets each launch with events and waits).
+struct PrefillTimes {
+  double expand_ms{0.0};  ///< Transient expansion of rows past the store.
+  double attn_ms{0.0};    ///< Per-block flash attention.
+  double merge_ms{0.0};   ///< Ordered fold, normalise, gate.
+};
+
+/// Non-absorbed prefill (n > 8 token chunks). `w16` is the per-layer F16
+/// expansion weight (ExpansionWeightBytes()): per head 256 rows of 512, rows
+/// 0..127 = k_b[h][:, d] (transposed), 128..255 = v_b[h][e][:]; both Q8_0
+/// tensors dequantised then rounded to F16 once at load.
+std::size_t ExpansionWeightBytes();
+void BuildExpansionWeights(const void* k_b, const void* v_b, __half* w16,
+                           hipStream_t stream);
+/// Transient device bytes for chunks of up to `max_batch` tokens: expanded K/V
+/// of two 2048-key blocks, a bounded group of per-block attention partials
+/// (>= 64 MiB) and the fold state.
+std::size_t NonAbsorbedScratchBytes(std::uint32_t max_batch);
+/// Persistent expanded K/V of one layer for rows [0, rows) (a multiple of
+/// 2048): per head k_nope `[row][128]` then V^T `[128][row]` (keys permuted in
+/// each 16-key group), F16, ExpandedLayerBytes(rows) = rows * 16 KiB.
+std::size_t ExpandedLayerBytes(std::uint32_t rows);
+/// Expands cache rows [start, min(end, rows)) into the persistent store. The
+/// result is a pure function of the cache row (same bits as the transient
+/// expansion).
+void ExpandRows(const __half* layer_cache, const __half* w16,
+                __half* layer_expanded, std::uint32_t rows, std::uint32_t start,
+                std::uint32_t end, hipStream_t stream);
+/// q_rope[t][h][0..128] = q_nope, q_rope[t][h][128..192] = NORM rope(q_pe) at
+/// positions[t]; q is `[t][32][192]`.
+void QPrepare(const float* q, const std::int32_t* positions, float* q_rope,
+              std::uint32_t n_tokens, hipStream_t stream);
+/// Prefill: query t at position `first_pos + t` attends causally to cache rows
+/// 0..first_pos+t (already appended): per head p = softmax(q . [k_nope | k_pe]
+/// / sqrt(192)) over expanded K/V, out[t][h][0..128] = p.v (times
+/// sigmoid(gate_logits[t][h]) when `gate_logits` is not null), ready for
+/// attn_output. Keys below `expanded_rows` (a multiple of 2048, may be 0) are
+/// read from `layer_expanded` (rows must have been expanded with ExpandRows);
+/// the rest are expanded per call into `scratch`. Keys fold in absolute
+/// 2048-key blocks (per-block partials merged in block order), so any split of
+/// a token run into chunks gives identical bits, and so does moving rows
+/// between the persistent store and the transient path.
+void PrefillAttentionNonAbsorbed(
+    const float* q_rope, const __half* layer_cache, const __half* w16,
+    const __half* layer_expanded, std::uint32_t expanded_rows,
+    const float* gate_logits, std::uint32_t first_pos, std::uint32_t n_tokens,
+    float* out, void* scratch, hipStream_t stream,
+    PrefillTimes* times = nullptr);
 
 /// out[t][h][d] = sum_c lat[t][h][c] * v_b[h][d][c] (v_b Q8_0
 /// `[head][128][512]`) * sigmoid(gate_logits[t][h]); `out` is `[t][4096]`
@@ -210,7 +358,8 @@ namespace moe {
 void Route(const float* logits, const float* bias, std::int32_t* ids,
            float* weights, std::uint32_t n_tokens, hipStream_t stream);
 
-/// Device bytes of scratch (sorted token lists) the prefill kernels need.
+/// Device bytes of scratch (sorted token lists and their F16 activations) the
+/// prefill kernels need.
 std::size_t PrefillScratchBytes(std::uint32_t n_tokens);
 /// Device bytes of scratch (unique-expert list) the decode kernels need.
 std::size_t DecodeScratchBytes();
@@ -231,6 +380,24 @@ void ExpertGateUpDecode(const void* gate, const void* up, WeightType type,
 void ExpertDownDecode(const void* down, WeightType type, const float* act,
                       const std::int32_t* ids, std::uint32_t n_tokens,
                       float* out, void* scratch, hipStream_t stream);
+/// Route for 1..8 decode tokens that also builds the expert plan the *Planned
+/// launches use (the last block to finish does it). `counter` is a device word
+/// that must be zero before the first call and is left zero.
+void RouteDecode(const float* logits, const float* bias, std::int32_t* ids,
+                 float* weights, std::uint32_t n_tokens, void* scratch,
+                 std::uint32_t* counter, hipStream_t stream);
+/// ExpertGateUpDecode using the plan RouteDecode left in `scratch`.
+void ExpertGateUpDecodePlanned(const void* gate, const void* up,
+                               WeightType type, const float* x,
+                               const std::int32_t* ids, std::uint32_t n_tokens,
+                               float limit, float* act, void* scratch,
+                               hipStream_t stream);
+/// ExpertDownDecode right after ExpertGateUpDecode on the same `ids` and
+/// `scratch`: reuses that call's expert plan (one launch fewer).
+void ExpertDownDecodePlanned(const void* down, WeightType type,
+                             const float* act, const std::int32_t* ids,
+                             std::uint32_t n_tokens, float* out, void* scratch,
+                             hipStream_t stream);
 /// Prefill grouped form of ExpertGateUpDecode for `n_tokens` rows; x
 /// `[t][2560]`, ids `[t][8]`, act `[t][8][768]`. Tokens are grouped per expert
 /// and run through F16 WMMA tiles (F32 accumulation). `scratch` is
@@ -244,6 +411,18 @@ void ExpertGateUpPrefill(const void* gate, const void* up, WeightType type,
 void ExpertDownPrefill(const void* down, WeightType type, const float* act,
                        const std::int32_t* ids, std::uint32_t n_tokens,
                        float* out, void* scratch, hipStream_t stream);
+/// Test/benchmark hooks: the prefill kernels with an explicit token-tile
+/// width (nf * 16 tokens, 1 or 2; 0 = the dispatch default). Every combination
+/// returns the same bits.
+void ExpertGateUpPrefillTile(const void* gate, const void* up, WeightType type,
+                             const float* x, const std::int32_t* ids,
+                             std::uint32_t n_tokens, float limit, float* act,
+                             void* scratch, std::uint32_t nf,
+                             hipStream_t stream);
+void ExpertDownPrefillTile(const void* down, WeightType type, const float* act,
+                           const std::int32_t* ids, std::uint32_t n_tokens,
+                           float* out, void* scratch, std::uint32_t nf,
+                           hipStream_t stream);
 
 /// res[t][i] += sum_k weights[t][k] * expert_out[t][k][i] + shared_out[t][i]
 /// (the shared expert is ungated); in-place on the residual stream.
