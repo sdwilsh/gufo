@@ -179,9 +179,13 @@ void TestQ8(std::uint32_t rows, std::uint32_t k) {
     auto got = dy.Get();
     got.resize(std::size_t{n} * rows);
     Name(name, sizeof name, "GemvQ8_0", rows, k, n);
-    Check(name, got, ref.data(), got.size(), 3e-2);
+    // Two int8 activation planes: as accurate as the F16-activation GEMM.
+    // Every n <= 8 runs the int8 kernel (in LDS-sized sub-batches).
+    const bool gemv = n <= 8;
+    Check(name, got, ref.data(), got.size(), gemv ? 1e-3 : 3e-3);
   }
-  {  // Activations already on the int8 grid: the int8 path is then exact.
+  {  // Activations already on the int8 grid: the int8 path is then exact
+    // (the residual plane is zero).
     constexpr std::uint32_t n = 8;
     std::vector<float> xe(std::size_t{n} * k);
     std::uniform_int_distribution<int> qd(-127, 127);
@@ -205,6 +209,40 @@ void TestQ8(std::uint32_t rows, std::uint32_t k) {
     HIP_OK(hipDeviceSynchronize());
     Name(name, sizeof name, "GemmQ8_0", rows, k, kTok);
     Check(name, dy.Get(), ref.data(), ref.size(), 3e-3);
+  }
+}
+
+// Batch invariance: token t of an n-token call (n <= 8) must be bit-identical
+// to the same token in a 1-token call, including when n exceeds the LDS
+// sub-batch size (k = 6144 fits only 4 tokens).
+void TestQ8BatchInvariant(std::uint32_t rows, std::uint32_t k) {
+  const auto wq = QuantizeQ8_0(Randn(std::size_t{rows} * k, 0.5F), k);
+  const auto x = Randn(std::size_t{8} * k);
+  Dev<std::uint8_t> dw(wq);
+  Dev<float> dx(x);
+  Dev<float> dy(std::size_t{8} * rows);
+  Dev<std::uint8_t> scratch(dn::ScratchBytes(WeightType::kQ8_0, 8, k));
+  std::vector<float> one(std::size_t{8} * rows);
+  for (std::uint32_t t = 0; t < 8; ++t) {
+    dn::GemvQ8_0(dw.p, dx.p + std::size_t{t} * k, dy.p, 1, k, rows, scratch.p,
+                 nullptr);
+    HIP_OK(hipDeviceSynchronize());
+    const auto g = dy.Get();
+    std::copy_n(g.begin(), rows, one.begin() + std::size_t{t} * rows);
+  }
+  for (std::uint32_t n = 2; n <= 8; ++n) {
+    HIP_OK(hipMemset(dy.p, 0xFF, dy.n * sizeof(float)));
+    dn::GemvQ8_0(dw.p, dx.p, dy.p, n, k, rows, scratch.p, nullptr);
+    HIP_OK(hipDeviceSynchronize());
+    auto got = dy.Get();
+    got.resize(std::size_t{n} * rows);
+    char name[128];
+    Name(name, sizeof name, "GemvQ8_0 batch-invariant", rows, k, n);
+    const bool ok =
+        std::memcmp(got.data(), one.data(), got.size() * sizeof(float)) == 0;
+    std::printf("%s %s\n", ok ? "PASS" : "FAIL", name);
+    if (!ok)
+      ++g_failures;
   }
 }
 
@@ -413,6 +451,9 @@ int main() {
       {2560, 4096},  {2560, 6144}, {768, 2560}, {2560, 768}};
   for (const auto& [rows, k] : q8_shapes)
     TestQ8(rows, k);
+  TestQ8BatchInvariant(6144, 6144);  // dense FFN down: 4-token sub-batches
+  TestQ8BatchInvariant(2560, 2560);
+  TestQ8BatchInvariant(576, 4096);
   TestQ8Strided();
   TestF32Router();
   TestF16(157184, 2560);

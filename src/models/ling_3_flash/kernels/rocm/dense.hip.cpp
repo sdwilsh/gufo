@@ -2,12 +2,13 @@
 // embedding gather, RMSNorm, residual add and clamped SwiGLU. Wave32 (gfx11).
 //
 // Design summary
-//  * GemvQ8_0 (decode, 1..8 tokens): activations are first quantised to int8
-//    with one F32 scale per 32 values (the Q8_1 scheme llama.cpp uses for Q8_0
-//    matmuls, without the block sum). Each wave streams whole rows of the
-//    weights exactly once with dword loads (a pair of 34-byte Q8_0 blocks is 17
-//    aligned dwords), multiplies with v_dot4_i32_iu8 against the int8
-//    activations held in LDS, and applies the two scales per block.
+//  * GemvQ8_0 (decode, 1..8 tokens): activations are first quantised to two
+//    int8 planes (value and residual) with one F32 scale per 32 values (a
+//    single plane, llama.cpp's Q8_1 scheme, was too noisy for this model). Each
+//    wave streams whole rows of the weights exactly once with dword loads (a
+//    pair of 34-byte Q8_0 blocks is 17 aligned dwords), multiplies with
+//    v_dot4_i32_iu8 against the int8 activations held in LDS, and applies the
+//    two scales per block.
 //  * GemmQ8_0 / GemmF16 (prefill): 64x64 tile, K step 32, F16 WMMA with F32
 //    accumulation. Q8_0 codes are dequantised to F16 on the fly while staging
 //    to LDS; activations are rounded to F16. No activation scale quantisation.
@@ -48,9 +49,14 @@ __device__ __forceinline__ int Dot4(int a, int b, int c) {
 // ---------------------------------------------------------------------------
 // Activation quantisation: x[t][k] -> q int8 [t][k], d F32 [t][k / 32].
 // ---------------------------------------------------------------------------
+// Two int8 planes: q1 = round(x / s), q2 = round((x - q1 s) * 127 / s) with
+// s = absmax / 127, so x ~ s * (q1 + q2 / 127). One plane alone (llama.cpp's
+// Q8_1) leaves ~0.3% rms noise per projection; for this model that noise,
+// compounded over 42 layers, moved logit margins by up to ~1 nat. The second
+// plane brings the activation error to ~3e-5 of the block maximum.
 __global__ __launch_bounds__(256) void QuantizeActKernel(
     const float* __restrict__ x, std::int8_t* __restrict__ q,
-    float* __restrict__ d, std::size_t total) {
+    std::int8_t* __restrict__ q2, float* __restrict__ d, std::size_t total) {
   const std::size_t i = std::size_t{blockIdx.x} * 256 + threadIdx.x;
   const float v = i < total ? x[i] : 0.0F;
   float m = fabsf(v);
@@ -59,7 +65,12 @@ __global__ __launch_bounds__(256) void QuantizeActKernel(
     m = fmaxf(m, __shfl_xor(m, off, 32));
   const float inv = m > 0.0F ? 127.0F / m : 0.0F;
   if (i < total) {
-    q[i] = static_cast<std::int8_t>(__float2int_rn(v * inv));
+    const int hi = __float2int_rn(v * inv);
+    q[i] = static_cast<std::int8_t>(hi);
+    const float s = m * (1.0F / 127.0F);
+    q2[i] = static_cast<std::int8_t>(
+        m > 0.0F ? __float2int_rn((v - static_cast<float>(hi) * s) * 127.0F / s)
+                 : 0);
     if ((threadIdx.x & 31) == 0)
       d[i >> 5] = m * (1.0F / 127.0F);
   }
@@ -86,19 +97,25 @@ __device__ __forceinline__ void WaveReduceWrite(float (&acc)[NT], float* y,
 template<int NT, int RPW>
 __global__ __launch_bounds__(256) void GemvQ8Kernel(
     const std::uint8_t* __restrict__ w, const std::int8_t* __restrict__ xq,
-    const float* __restrict__ xd, float* __restrict__ y, std::uint32_t k,
-    std::uint32_t rows) {
+    const std::int8_t* __restrict__ xq2, const float* __restrict__ xd,
+    float* __restrict__ y, std::uint32_t k, std::uint32_t rows) {
   extern __shared__ __attribute__((aligned(16))) std::uint8_t smem[];
   std::int8_t* s_q = reinterpret_cast<std::int8_t*>(smem);
-  float* s_d = reinterpret_cast<float*>(smem + std::size_t{NT} * k);
+  std::int8_t* s_q2 =
+      reinterpret_cast<std::int8_t*>(smem + std::size_t{NT} * k);
+  float* s_d = reinterpret_cast<float*>(smem + std::size_t{2 * NT} * k);
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int wave = tid >> 5;
   {
     const auto* src = reinterpret_cast<const uint4*>(xq);
     auto* dst = reinterpret_cast<uint4*>(s_q);
-    for (std::uint32_t i = tid; i < NT * k / 16; i += 256)
+    const auto* src2 = reinterpret_cast<const uint4*>(xq2);
+    auto* dst2 = reinterpret_cast<uint4*>(s_q2);
+    for (std::uint32_t i = tid; i < NT * k / 16; i += 256) {
       dst[i] = src[i];
+      dst2[i] = src2[i];
+    }
     const std::uint32_t nd = NT * (k / 32);
     for (std::uint32_t i = tid; i < nd; i += 256)
       s_d[i] = xd[i];
@@ -156,18 +173,39 @@ __global__ __launch_bounds__(256) void GemvQ8Kernel(
                          static_cast<int>(x2.z), static_cast<int>(x2.w),
                          static_cast<int>(x3.x), static_cast<int>(x3.y),
                          static_cast<int>(x3.z), static_cast<int>(x3.w)};
+      const auto* xp2 = reinterpret_cast<const uint4*>(
+          s_q2 + std::size_t{static_cast<unsigned>(t)} * k +
+          std::size_t{p} * 64);
+      const uint4 y0 = xp2[0], y1 = xp2[1], y2 = xp2[2], y3 = xp2[3];
+      const int ya[8] = {static_cast<int>(y0.x), static_cast<int>(y0.y),
+                         static_cast<int>(y0.z), static_cast<int>(y0.w),
+                         static_cast<int>(y1.x), static_cast<int>(y1.y),
+                         static_cast<int>(y1.z), static_cast<int>(y1.w)};
+      const int yb[8] = {static_cast<int>(y2.x), static_cast<int>(y2.y),
+                         static_cast<int>(y2.z), static_cast<int>(y2.w),
+                         static_cast<int>(y3.x), static_cast<int>(y3.y),
+                         static_cast<int>(y3.z), static_cast<int>(y3.w)};
       const float sx0 = s_d[t * (k / 32) + 2 * p];
       const float sx1 = s_d[t * (k / 32) + 2 * p + 1];
 #pragma unroll
       for (int j = 0; j < RPW; ++j) {
-        int s0 = 0, s1 = 0;
+        int s0 = 0, s1 = 0, r0 = 0, r1 = 0;
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
           s0 = Dot4(qa[j][i], xa[i], s0);
           s1 = Dot4(static_cast<int>(u[j][9 + i]), xb[i], s1);
+          r0 = Dot4(qa[j][i], ya[i], r0);
+          r1 = Dot4(static_cast<int>(u[j][9 + i]), yb[i], r1);
         }
-        acc[j][t] = fmaf(d0[j] * sx0, static_cast<float>(s0), acc[j][t]);
-        acc[j][t] = fmaf(d1[j] * sx1, static_cast<float>(s1), acc[j][t]);
+        constexpr float kRes = 1.0F / 127.0F;
+        acc[j][t] =
+            fmaf(d0[j] * sx0,
+                 fmaf(static_cast<float>(r0), kRes, static_cast<float>(s0)),
+                 acc[j][t]);
+        acc[j][t] =
+            fmaf(d1[j] * sx1,
+                 fmaf(static_cast<float>(r1), kRes, static_cast<float>(s1)),
+                 acc[j][t]);
       }
     }
   }
@@ -510,7 +548,7 @@ __global__ void SwiGluClampedKernel(const float* gate, const float* up,
 // Host helpers.
 // ---------------------------------------------------------------------------
 std::size_t QuantBytes(std::uint32_t n_tokens, std::uint32_t k) {
-  return Align256(std::size_t{n_tokens} * k) +
+  return 2 * Align256(std::size_t{n_tokens} * k) +
          Align256(std::size_t{n_tokens} * (k / 32) * sizeof(float));
 }
 
@@ -604,30 +642,43 @@ void GemvQ8_0(const void* w, const float* x, float* y, std::uint32_t n_tokens,
               hipStream_t stream) {
   if (n_tokens == 0 || rows == 0)
     return;
-  const std::size_t lds = std::size_t{n_tokens} * (k + k / 32 * 4);
-  if (n_tokens > kMaxGemvTokens || k % 64 != 0 || lds > kGemvLdsBytes) {
+  // Tokens per launch: as many as fit the LDS budget (at most 8). Every token
+  // goes through the same per-token arithmetic whatever the sub-batch size, so
+  // results for n <= 8 never depend on n; the weights are read once per
+  // sub-batch.
+  const std::size_t per_token = 2 * std::size_t{k} + k / 32 * 4;
+  const std::size_t fit = kGemvLdsBytes / per_token;
+  if (n_tokens > kMaxGemvTokens || k % 64 != 0 || fit == 0) {
     GemmQ8_0(w, x, y, n_tokens, k, rows, scratch, stream);
     return;
   }
-  auto* q = static_cast<std::int8_t*>(scratch);
-  auto* d = reinterpret_cast<float*>(static_cast<std::uint8_t*>(scratch) +
-                                     Align256(std::size_t{n_tokens} * k));
-  const std::size_t total = std::size_t{n_tokens} * k;
-  QuantizeActKernel<<<static_cast<unsigned>((total + 255) / 256), 256, 0,
-                      stream>>>(x, q, d, total);
+  const auto sub_max =
+      static_cast<std::uint32_t>(std::min<std::size_t>(fit, kMaxGemvTokens));
   const auto* wb = static_cast<const std::uint8_t*>(w);
-  if (n_tokens >= 4) {
-    constexpr int RPW = 4;
-    const dim3 grid((rows + 8 * RPW - 1) / (8 * RPW));
-    LING_DISPATCH_NT(n_tokens,
-                     (GemvQ8Kernel<NT, RPW>
-                      <<<grid, 256, lds, stream>>>(wb, q, d, y, k, rows)));
-  } else {
-    constexpr int RPW = 2;
-    const dim3 grid((rows + 8 * RPW - 1) / (8 * RPW));
-    LING_DISPATCH_NT(n_tokens,
-                     (GemvQ8Kernel<NT, RPW>
-                      <<<grid, 256, lds, stream>>>(wb, q, d, y, k, rows)));
+  for (std::uint32_t t0 = 0; t0 < n_tokens; t0 += sub_max) {
+    const std::uint32_t n = std::min(sub_max, n_tokens - t0);
+    const float* xs = x + std::size_t{t0} * k;
+    float* ys = y + std::size_t{t0} * rows;
+    const std::size_t lds = std::size_t{n} * per_token;
+    auto* q = static_cast<std::int8_t*>(scratch);
+    auto* q2 = reinterpret_cast<std::int8_t*>(
+        static_cast<std::uint8_t*>(scratch) + Align256(std::size_t{n} * k));
+    auto* d = reinterpret_cast<float*>(static_cast<std::uint8_t*>(scratch) +
+                                       2 * Align256(std::size_t{n} * k));
+    const std::size_t total = std::size_t{n} * k;
+    QuantizeActKernel<<<static_cast<unsigned>((total + 255) / 256), 256, 0,
+                        stream>>>(xs, q, q2, d, total);
+    if (n >= 4) {
+      constexpr int RPW = 4;
+      const dim3 grid((rows + 8 * RPW - 1) / (8 * RPW));
+      LING_DISPATCH_NT(n, (GemvQ8Kernel<NT, RPW><<<grid, 256, lds, stream>>>(
+                              wb, q, q2, d, ys, k, rows)));
+    } else {
+      constexpr int RPW = 2;
+      const dim3 grid((rows + 8 * RPW - 1) / (8 * RPW));
+      LING_DISPATCH_NT(n, (GemvQ8Kernel<NT, RPW><<<grid, 256, lds, stream>>>(
+                              wb, q, q2, d, ys, k, rows)));
+    }
   }
 }
 
