@@ -88,6 +88,9 @@ void Session::DestroyGraphs() noexcept {
 
 Session::~Session() {
   DestroyGraphs();
+  if (forward_done_ != nullptr) {
+    (void)hipEventDestroy(forward_done_);
+  }
   (void)hipFree(state_.kda_state);
   (void)hipFree(state_.kda_conv);
   (void)hipFree(state_.mla_cache);
@@ -107,15 +110,6 @@ bool Session::Reset(std::string* error_msg) {
          Check(hipMemset(state_.kda_conv, 0, sizes.kda_conv), "reset conv",
                error_msg) &&
          Check(hipDeviceSynchronize(), "reset sync", error_msg);
-}
-
-RecurrentSnapshot::~RecurrentSnapshot() {
-  (void)hipFree(state_);
-  (void)hipFree(conv_);
-}
-
-std::size_t RecurrentSnapshot::bytes() const noexcept {
-  return SessionBytes(0).snapshot;
 }
 
 // ---- Executor --------------------------------------------------------------
@@ -163,6 +157,12 @@ Executor::~Executor() {
   if (stream_ != nullptr) {
     (void)hipStreamDestroy(stream_);
   }
+  if (transfer_stream_ != nullptr) {
+    (void)hipStreamDestroy(transfer_stream_);
+  }
+  if (transfer_staging_ != nullptr) {
+    (void)hipHostFree(transfer_staging_);
+  }
 }
 
 std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
@@ -185,7 +185,11 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
 }
 
 bool Executor::Init(std::string* error) {
-  if (!Check(hipStreamCreate(&stream_), "hipStreamCreate", error)) {
+  if (!Check(hipStreamCreate(&stream_), "hipStreamCreate", error) ||
+      !Check(hipStreamCreateWithFlags(&transfer_stream_, hipStreamNonBlocking),
+             "transfer stream", error) ||
+      !Check(hipHostMalloc(&transfer_staging_, kTransferStagingBytes),
+             "pinned snapshot staging", error)) {
     return false;
   }
   const std::size_t B = options_.max_batch;
@@ -298,6 +302,10 @@ std::unique_ptr<Session> Executor::CreateSession(std::uint32_t max_context,
     return nullptr;
   }
   std::unique_ptr<Session> s(new Session());
+  if (!Check(hipEventCreateWithFlags(&s->forward_done_, hipEventDisableTiming),
+             "session event", error_msg)) {
+    return nullptr;
+  }
   const auto sizes = SessionBytes(max_context);
   s->state_.cache.capacity = max_context;
   if (!Alloc(&s->state_.kda_state, sizes.kda_state / sizeof(float), "KDA state",
@@ -1125,31 +1133,6 @@ bool Executor::RunBlock(Session& session, std::uint32_t il,
                               hipMemcpyDeviceToHost, stream_),
                "download block output", error) &&
          Check(hipStreamSynchronize(stream_), "block", error);
-}
-
-std::unique_ptr<RecurrentSnapshot> Executor::SaveRecurrent(
-    const Session& session, std::string* error) {
-  std::unique_ptr<RecurrentSnapshot> s(new RecurrentSnapshot());
-  const auto sizes = SessionBytes(0);
-  if (!Alloc(&s->state_, sizes.kda_state / 4, "snapshot state", nullptr,
-             error) ||
-      !Alloc(&s->conv_, sizes.kda_conv / 4, "snapshot conv", nullptr, error)) {
-    return nullptr;
-  }
-  kda::SnapshotState(session.state_.kda_state, session.state_.kda_conv,
-                     s->state_, s->conv_, stream_);
-  if (!Check(hipStreamSynchronize(stream_), "snapshot", error)) {
-    return nullptr;
-  }
-  return s;
-}
-
-bool Executor::RestoreRecurrent(Session& session,
-                                const RecurrentSnapshot& snapshot,
-                                std::string* error) {
-  kda::RestoreState(session.state_.kda_state, session.state_.kda_conv,
-                    snapshot.state_, snapshot.conv_, stream_);
-  return Check(hipStreamSynchronize(stream_), "restore", error);
 }
 
 bool Executor::ReadKdaState(const Session& session, std::uint32_t il,

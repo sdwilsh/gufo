@@ -2,7 +2,7 @@
 // within one numeric family, gated at exact equality (prefill family: two
 // chunks of more than 8 tokens == one chunk; small-batch family: chunks of 3,
 // 5 or 8 == token by token), cross-family agreement (small-batch vs prefill,
-// bounded at logits level) and the snapshot/restore round trip. Compares
+// bounded at logits level) and a snapshot/restore round trip. Compares
 // logits, the recurrent KDA state, the conv windows and the latent cache rows.
 // Exit 77 without --model.
 //
@@ -406,7 +406,8 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
                  std::move(o));
   }
 
-  // Snapshot / restore round trip.
+  // The self-contained snapshot / restore contract is checked exhaustively by
+  // snapshot_test; here only the basic same-session round trip.
   {
     auto s4 = model->CreateSession(ctx, &error);
     if (!s4 || !s4->Feed(std::span(ids).first(N), {}, &error)) {
@@ -420,15 +421,11 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
     if (!snap) {
       return fail_with("save snapshot");
     }
-    std::vector<float> first_logits;
-    std::vector<std::int32_t> chain;
     for (std::uint32_t i = 0; i < K; ++i) {
       if (!s4->Feed(std::span(ids).subspan(N + i, 1), {}, &error)) {
         return fail_with("decode after snapshot");
       }
-      chain.push_back(s4->Argmax());
     }
-    first_logits.assign(s4->Logits().begin(), s4->Logits().end());
     if (!s4->RestoreSnapshot(*snap, &error)) {
       return fail_with("restore snapshot");
     }
@@ -437,32 +434,10 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
       return fail_with("capture after restore");
     }
     const Diff restored = Compare(after, before);
-    bool replay_ok = true;
-    for (std::uint32_t i = 0; i < K; ++i) {
-      replay_ok =
-          replay_ok && s4->Feed(std::span(ids).subspan(N + i, 1), {}, &error);
-    }
-    if (!replay_ok) {
-      return fail_with("replay after restore");
-    }
-    const double replay_rel = RelL2(s4->Logits(), first_logits);
-    const bool replay_top1 = s4->Argmax() == chain.back();
-    // A divergent history must be rejected.
-    std::vector<std::int32_t> other(ids.begin(), ids.begin() + N);
-    other[N / 2] = (other[N / 2] + 7) % 1000;
-    std::string reject_error;
-    s4->Reset();
-    const bool refed = s4->Feed(other, {}, &error);
-    const bool rejected = refed && !s4->RestoreSnapshot(*snap, &reject_error);
     auto o = ToJson(restored);
     o["restored_position"] = U(snap->Position());
     o["snapshot_bytes"] = static_cast<double>(snap->SizeBytes());
-    o["replay_logits_rel_l2"] = Round(replay_rel);
-    o["replay_top1_same"] = replay_top1;
-    o["divergent_history_rejected"] = rejected;
-    const bool pass =
-        restored.bitwise && replay_rel <= 1e-4 && replay_top1 && rejected;
-    finish_check("snapshot_restore", pass, std::move(o));
+    finish_check("snapshot_restore", restored.bitwise, std::move(o));
   }
 
   report.Set("checks", std::move(checks));
