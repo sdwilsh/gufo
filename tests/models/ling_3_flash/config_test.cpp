@@ -275,8 +275,11 @@ void CheckWeightBinding() {
 
   assert(ling::IsAllowedExpertGateUpType(gufo::core::GgmlType::kIQ4_XS));
   assert(ling::IsAllowedExpertGateUpType(gufo::core::GgmlType::kQ5_K));
-  assert(!ling::IsAllowedExpertGateUpType(gufo::core::GgmlType::kQ4_K));
+  assert(ling::IsAllowedExpertGateUpType(gufo::core::GgmlType::kQ4_K));
+  assert(ling::IsAllowedExpertGateUpType(gufo::core::GgmlType::kQ6_K));
+  assert(!ling::IsAllowedExpertGateUpType(gufo::core::GgmlType::kQ8_0));
   assert(ling::IsAllowedExpertDownType(gufo::core::GgmlType::kQ4_K));
+  assert(ling::IsAllowedExpertDownType(gufo::core::GgmlType::kQ5_K));
   assert(ling::IsAllowedExpertDownType(gufo::core::GgmlType::kQ6_K));
   assert(!ling::IsAllowedExpertDownType(gufo::core::GgmlType::kIQ4_XS));
 }

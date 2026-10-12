@@ -111,8 +111,10 @@
 ///
 /// Memory: 0.5 GiB shared checkpoint scratch, per session 1152 bytes per
 /// context token (the MTP latent cache, 75 MiB at 64k) plus 10 KiB, and the
-/// block-42 weights (about 1.2 GiB: Q8_0 MLA/shared/eh_proj, IQ4_XS/Q4_K
-/// experts) plus the 0.40 GiB Q8_0 draft head. Snapshots carry the MTP rows and
+/// block-42 weights (the experts take 1.52 GiB with the original IQ4_XS/Q4_K
+/// quant, 1.58 GiB with AD-Q4_K_S's Q4_K and 1.93 GiB with AD-Q5_K_M's Q5_K;
+/// the Q8_0 MLA/shared/eh_proj tensors add 0.05 GiB) plus the 0.40 GiB Q8_0
+/// draft head. Snapshots carry the MTP rows and
 /// hidden carry so restored sessions keep drafting.
 ///
 /// Wiring. The block lives in the main GGUF, so `--speculative mtp` needs no
