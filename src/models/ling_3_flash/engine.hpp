@@ -351,20 +351,28 @@ public:
   /// Appends `tokens` (2..8) as one verify step that records rollback points.
   /// Fills `argmax` (one entry per token) with the device argmax of every row,
   /// and `rows` (when given) with all rows' logits (`tokens.size()` * vocab).
-  /// The session then holds the whole chunk until Rollback().
+  /// The session then holds the whole chunk until Rollback(). `op_profile`
+  /// (profiling) receives the per-operation device times of the step.
   [[nodiscard]] bool Verify(std::span<const std::int32_t> tokens,
                             std::span<std::int32_t> argmax,
                             std::vector<float>* rows,
-                            std::string* error_msg = nullptr);
+                            std::string* error_msg = nullptr,
+                            std::vector<OpTiming>* op_profile = nullptr);
   /// Completes a Verify keeping its first `keep` tokens (1..n): the recurrent
   /// state, position, tokens and logits become those after row keep - 1.
   [[nodiscard]] bool Rollback(std::uint32_t keep,
                               std::string* error_msg = nullptr);
   /// One MTP draft step for `token` (the token after the last committed one,
   /// or after the previous draft when `chain`); see rocm::DraftRequest.
+  /// `op_profile` (profiling) receives the per-operation device times.
   [[nodiscard]] bool Draft(std::int32_t token, bool chain,
                            std::span<float> logits, std::int32_t* argmax,
-                           std::string* error_msg = nullptr);
+                           std::string* error_msg = nullptr,
+                           std::vector<OpTiming>* op_profile = nullptr);
+  /// Host issue / wall time and device span of the model's last forward step
+  /// (Feed chunk, Evaluate, Verify) or draft step (profiling; sessions of one
+  /// model share it).
+  [[nodiscard]] LaunchTiming LastLaunchTiming() const noexcept;
   /// Test hook: draft block alone on a host hidden row at an explicit MTP
   /// position (no trunk state needed; writes MTP cache row `position`).
   [[nodiscard]] bool DraftWithHidden(

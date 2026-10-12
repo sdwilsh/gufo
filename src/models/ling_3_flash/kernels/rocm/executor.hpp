@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -192,6 +193,8 @@ struct DraftRequest {
   /// shared-head-normed hidden output.
   std::span<const float> h_host;
   std::span<float> h_out;
+  /// Merges per-operation device times of this step into the vector.
+  std::vector<OpTiming>* op_profile{nullptr};
 };
 
 /// Single-stream layer loop of the Ling-3.0-flash trunk (PLAN section 1) over
@@ -332,6 +335,10 @@ public:
   [[nodiscard]] const ForwardTiming& last_timing() const noexcept {
     return timing_;
   }
+  /// Host issue / wall time and device span of the last Forward or MtpDraft.
+  [[nodiscard]] const LaunchTiming& last_launch() const noexcept {
+    return launch_;
+  }
   [[nodiscard]] const Options& options() const noexcept { return options_; }
   [[nodiscard]] std::uint32_t layer_count() const noexcept {
     return static_cast<std::uint32_t>(model_.layers().size());
@@ -376,7 +383,11 @@ private:
   /// Attributes the stream time since the previous mark to `label` (profile
   /// steps only; a no-op otherwise). `bytes` is the traffic the op must read.
   void Mark(const char* label, std::size_t bytes);
+  /// Starts an op profile at the current stream position (Mark / Finish).
+  void BeginProfile();
   void FinishProfile(std::vector<OpTiming>* out);
+  /// Milliseconds since the current step entered Forward / MtpDraft.
+  [[nodiscard]] double StepMs() const;
   /// Q8_0 GEMVs over the planes of the fused norm in `xq` (up to 3 weights).
   void Q8Quantized(
       std::initializer_list<std::pair<const DeviceTensor*, float*>> groups,
@@ -427,6 +438,9 @@ private:
   std::size_t scratch_total_{0};
   std::vector<hipEvent_t> events_;
   ForwardTiming timing_;
+  LaunchTiming launch_;
+  std::chrono::steady_clock::time_point step_start_{};
+  hipEvent_t draft_events_[2]{nullptr, nullptr};  ///< draft device span
   bool graphs_enabled_{true};
   bool rollback_active_{false};  ///< Kda() stores rollback points this step
   bool capture_invalidated_{false};

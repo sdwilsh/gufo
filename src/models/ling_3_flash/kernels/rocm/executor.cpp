@@ -158,6 +158,11 @@ Executor::~Executor() {
   for (hipEvent_t e : mark_events_) {
     (void)hipEventDestroy(e);
   }
+  for (hipEvent_t e : draft_events_) {
+    if (e != nullptr) {
+      (void)hipEventDestroy(e);
+    }
+  }
   for (void* p : b_->all) {
     (void)hipFree(p);
   }
@@ -325,6 +330,11 @@ bool Executor::Init(std::string* error) {
       return false;
     }
   }
+  for (auto& e : draft_events_) {
+    if (!Check(hipEventCreate(&e), "hipEventCreate", error)) {
+      return false;
+    }
+  }
   return true;
 }
 
@@ -481,6 +491,22 @@ void Executor::Mark(const char* label, std::size_t bytes) {
   }
   marks_.push_back({label, bytes});
   (void)hipEventRecord(mark_events_[marks_.size()], stream_);
+}
+
+void Executor::BeginProfile() {
+  profiling_ = true;
+  marks_.clear();
+  if (mark_events_.empty()) {
+    mark_events_.resize(1);
+    (void)hipEventCreate(&mark_events_[0]);
+  }
+  (void)hipEventRecord(mark_events_[0], stream_);
+}
+
+double Executor::StepMs() const {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - step_start_)
+      .count();
 }
 
 void Executor::FinishProfile(std::vector<OpTiming>* out) {
@@ -1023,6 +1049,9 @@ bool Executor::FinishForward(Session& session, const ForwardRequest& r,
   (void)hipEventElapsedTime(&total, events_[0], events_[layers + 1]);
   timing_.total_ms = total;
   timing_.head_ms = head;
+  launch_.wall_ms = StepMs();
+  launch_.device_ms = total;
+  launch_.graph = graph;
   session.set_position(first_pos + n);
   return true;
 }
@@ -1133,6 +1162,7 @@ bool Executor::ForwardGraph(Session& session, const ForwardRequest& r,
   if (!Check(hipGraphLaunch(exec, stream_), "graph launch", error)) {
     return false;
   }
+  launch_.issue_ms = StepMs();
   ++graph_replays_;
   return MtpAfterForward(session, n, first_pos, error) &&
          FinishForward(session, r, n, from, layers, true, error);
@@ -1140,6 +1170,8 @@ bool Executor::ForwardGraph(Session& session, const ForwardRequest& r,
 
 bool Executor::Forward(Session& session, const ForwardRequest& r,
                        std::string* error) {
+  step_start_ = std::chrono::steady_clock::now();
+  launch_ = {};
   const auto n = static_cast<std::uint32_t>(r.tokens.size());
   const std::uint32_t first_pos = session.position();
   const auto fail = [&](const std::string& message) {
@@ -1228,18 +1260,13 @@ bool Executor::Forward(Session& session, const ForwardRequest& r,
     return false;
   }
   if (r.op_profile != nullptr) {
-    profiling_ = true;
-    marks_.clear();
-    if (mark_events_.empty()) {
-      mark_events_.resize(1);
-      (void)hipEventCreate(&mark_events_[0]);
-    }
-    (void)hipEventRecord(mark_events_[0], stream_);
+    BeginProfile();
   }
   rollback_active_ = r.rollback;
   const bool trunk_ok =
       Trunk(session, n, first_pos, /*head_from=*/n, true, r.sink, error);
   rollback_active_ = false;
+  launch_.issue_ms = StepMs();
   if (!trunk_ok) {
     profiling_ = false;
     return false;
@@ -1331,6 +1358,8 @@ bool Executor::MtpDraft(Session& session, const DraftRequest& r,
   }
   const DeviceMtp& m = *model_.mtp();
   Buffers& b = *b_;
+  step_start_ = std::chrono::steady_clock::now();
+  launch_ = {};
   staging_[0] = r.token;
   staging_[8] = static_cast<std::int32_t>(r.position);
   if (!Check(hipMemcpyAsync(b.tokens, staging_, sizeof(std::int32_t),
@@ -1347,15 +1376,21 @@ bool Executor::MtpDraft(Session& session, const DraftRequest& r,
              "upload draft hidden", error)) {
     return false;
   }
+  (void)hipEventRecord(draft_events_[0], stream_);
+  if (r.op_profile != nullptr) {
+    BeginProfile();
+  }
   dense::EmbedQ4K(model_.token_embd().data, b.tokens, b.ga, 1, kHidden,
                   stream_);
   const float* h_in = r.chain || host_h ? b.mtp_hn : st.mtp_h;
   mtp::ConcatNormRows(b.ga, h_in, m.enorm.f32(), m.hnorm.f32(), b.gb, 1,
                       kRmsEps, stream_);
   Q8(m.eh_proj, b.gb, b.h, 1);
+  Mark("draft.embed_eh_proj", TensorBytes(m.eh_proj));
   const bool fuse = dense::GemvQ8_0Fits(1, kHidden);
   if (!BlockOf(m.block, session, kMtpBlock, r.position, 1, nullptr, fuse, false,
                nullptr, error)) {
+    profiling_ = false;
     (void)hipStreamSynchronize(stream_);
     return false;
   }
@@ -1363,7 +1398,11 @@ bool Executor::MtpDraft(Session& session, const DraftRequest& r,
                      kRmsEps, stream_);
   dense::GemvF16(model_.output().f16(), b.mtp_hn, b.logits, 1, kHidden,
                  kVocabRows, b.scratch, stream_);
+  Mark("draft.head_logits_gemv", TensorBytes(model_.output()));
   mtp::ArgmaxRows(b.logits, 1, kVocabRows, b.argmax_idx, b.argmax_val, stream_);
+  Mark("draft.argmax", 0);
+  (void)hipEventRecord(draft_events_[1], stream_);
+  launch_.issue_ms = StepMs();
   std::int32_t index = -1;
   if (!Check(hipMemcpyAsync(&index, b.argmax_idx, sizeof(index),
                             hipMemcpyDeviceToHost, stream_),
@@ -1379,7 +1418,17 @@ bool Executor::MtpDraft(Session& session, const DraftRequest& r,
               "copy draft hidden", error)) ||
       !Check(hipStreamSynchronize(stream_), "draft", error) ||
       !Check(hipGetLastError(), "draft", error)) {
+    profiling_ = false;
     return false;
+  }
+  launch_.wall_ms = StepMs();
+  {
+    float ms = 0.0F;
+    (void)hipEventElapsedTime(&ms, draft_events_[0], draft_events_[1]);
+    launch_.device_ms = ms;
+  }
+  if (r.op_profile != nullptr) {
+    FinishProfile(r.op_profile);
   }
   if (index < 0) {
     return fail("MTP draft logits are not comparable");

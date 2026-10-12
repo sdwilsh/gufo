@@ -1,6 +1,8 @@
 # Ling-3.0-flash MTP image: everything of the integration image (gfx1151 test
-# binaries, release gufo, harness) plus the MTP tests, the real-text corpora and
-# ling-mtp-suite. Context = build/ling-mtp-image-ctx (see build-mtp-image.sh).
+# binaries, release gufo, harness) plus the MTP tests, the real-text corpora,
+# ling-mtp-suite and the profiling tools of ling-int-bench's mtp_profile stage
+# (gfx1151_peak, prof.py, rocprofv3). Context = build/ling-mtp-image-ctx (see
+# build-mtp-image.sh).
 FROM registry.fedoraproject.org/fedora:44
 RUN dnf -y install --setopt=install_weak_deps=False \
       python3 python3-openai python3-httpx python3-jsonschema python3-pydantic libicu libcurl libpng libjpeg-turbo libwebp libgomp \
@@ -8,6 +10,18 @@ RUN dnf -y install --setopt=install_weak_deps=False \
       rocm-hip rocm-runtime hipblas hipblaslt rocblas rocsolver \
   && dnf clean all && rm -rf /var/cache/* /usr/share/doc /usr/share/man \
   && find /usr/lib64/rocblas/library /usr/lib64/hipblaslt/library -type f -name '*gfx[0-9]*' ! -name '*gfx1151*' -delete
+# rocprofv3 is not packaged by Fedora, and Fedora's HIP/HSA are built without the
+# rocprofiler-register hooks it needs. AMD's 7.1.1 rpms (EL10 build, same ROCm
+# release and HIP 7.1.52802 as the Fedora packages) install under /opt/rocm-7.1.1;
+# only profiling runs put that directory first in LD_LIBRARY_PATH (ling-int-bench
+# does this), so everything else runs on the Fedora libraries.
+RUN for p in rocprofiler-sdk rocprofiler-sdk-rocpd rocprofiler-sdk-roctx; do \
+      curl -fsSL -o /tmp/$p.rpm https://repo.radeon.com/rocm/rhel10/7.1.1/main/$p-1.0.0.70101-38.el10.x86_64.rpm; done \
+  && for p in hip-runtime-amd-7.1.52802 hsa-rocr-1.18.0 rocm-core-7.1.1 rocprofiler-register-0.6.0 hsa-amd-aqlprofile-1.0.0; do \
+      curl -fsSL -o /tmp/$p.rpm https://repo.radeon.com/rocm/rhel10/7.1.1/main/$p.70101-38.el10.x86_64.rpm; done \
+  && rpm -i --nodeps --nosignature /tmp/*.rpm && rm -f /tmp/*.rpm \
+  && rm -rf /opt/rocm-7.1.1/include /opt/rocm-7.1.1/lib/cmake /opt/rocm-7.1.1/lib/*.a
+COPY prof.py /usr/local/lib/gufo/prof.py
 COPY run-suite /usr/local/bin/run-suite
 COPY tests/ /opt/gufo/tests/
 COPY suites/ /opt/gufo/suites/
@@ -20,8 +34,8 @@ COPY corpus/ /opt/gufo/corpus/
 COPY compare_routing.py /opt/gufo/compare_routing.py
 COPY functional/ /opt/gufo/tests/functional/
 COPY flake.lock /opt/gufo/flake.lock
-COPY gufo ling-mtp-suite ling-int-suite ling-int-bench ling-serve-suite ling-cache-suite /usr/local/bin/
-RUN chmod -R a+rX /opt/gufo && chmod a+rx /usr/local/bin/* /opt/gufo/tests/ling_3_flash_* \
+COPY gufo gfx1151_peak ling-mtp-suite ling-int-suite ling-int-bench ling-serve-suite ling-cache-suite /usr/local/bin/
+RUN chmod -R a+rX /opt/gufo /usr/local/lib/gufo && chmod a+rx /usr/local/bin/* /opt/gufo/tests/ling_3_flash_* \
   && mkdir -p /work && chmod 1777 /work
 # restricted PSS: non-root, read-only rootfs; the only writable path is /work (emptyDir)
 USER 1000:1000
