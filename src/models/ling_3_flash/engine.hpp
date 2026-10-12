@@ -155,6 +155,14 @@ public:
   /// unserialized wait from another thread would); each such step must still
   /// run eagerly with identical bits and leave the executor usable.
   void BreakCapturesForTest(std::uint32_t count) noexcept;
+  /// Most sessions one Session::EvaluateBatch pass takes (8, or fewer with a
+  /// smaller max_batch).
+  [[nodiscard]] std::uint32_t BatchRowLimit() const noexcept;
+  /// Test hook: the next `count` Session::EvaluateBatch passes fail after
+  /// their launches, at the final wait or (`before_wait`) right after the
+  /// trunk launches. Host bookkeeping only: no device fault is injected.
+  void FailBatchesForTest(std::uint32_t count,
+                          bool before_wait = false) noexcept;
 
 private:
   Model() = default;
@@ -260,6 +268,21 @@ private:
 /// Verified bit-exact over all 42 blocks (block output, KDA state/conv, MLA
 /// cache rows) by `layer_check --invariance` and end to end by session_test.
 ///
+/// Batch invariance (Session::EvaluateBatch, rocm::Executor::ForwardBatch).
+/// The family rule holds per session: a batched decode step gives each
+/// session a segment of 1..8 tokens computed in the small-batch family,
+/// whatever else shares the forward pass. A session's committed tokens,
+/// logits, KDA state, conv windows, MLA and MTP cache rows and MTP carry after
+/// a batched step are bit-identical to the same step run alone, whatever the
+/// number of sessions, their order, depths or segment widths, and whether
+/// peers were refused. The decode-family kernels compute every row
+/// independently of the rows beside it (weights are shared, arithmetic is
+/// per row; routed-expert plans dot each (token, slot) pair on its own), and
+/// every per-session part (conv window, recurrence, cache append, attention
+/// over the session's own context, MTP cache fill) runs on that session's
+/// rows alone. A forward never mixes families. Verified by
+/// ling_3_flash_batch_test and the batched cohorts of decode_digest.
+///
 /// One conversation's context. Prefill/Sync feed prompts, Evaluate appends one
 /// token; the logits of the last token are kept (greedy decoding is
 /// `Evaluate(Argmax())`). Sessions of one model share its executor: use them
@@ -282,6 +305,27 @@ public:
                           std::string* error_msg = nullptr);
   [[nodiscard]] bool Evaluate(std::int32_t token,
                               std::string* error_msg = nullptr);
+
+  /// One lane of EvaluateBatch: `token` is appended to `session`.
+  struct BatchLane {
+    Session* session{nullptr};
+    std::int32_t token{0};
+    bool ok{false};  ///< Out.
+    /// Out: not run for a batch-only reason (no row left, a snapshot transfer
+    /// in flight); the session is untouched and can be evaluated alone.
+    bool deferred{false};
+    std::string error;  ///< Out, when !ok.
+  };
+  /// Evaluate for several sessions of one model in one forward pass (at most
+  /// Model::BatchRowLimit() lanes, one per session). Each lane ends exactly as
+  /// its own Evaluate would (batch invariance, above): a lane that Evaluate
+  /// would refuse (an invalid session, a pending verify, a full context, a
+  /// token outside the vocabulary, another model, a session listed twice)
+  /// fails alone, with the same effect on its session, and the others still
+  /// run. A lane the batch alone cannot take is `deferred`, untouched. If the
+  /// pass fails after launch, every launched lane fails and its session is
+  /// emptied without device calls (Invalidate(): the device may be lost).
+  static void EvaluateBatch(std::span<BatchLane> lanes);
 
   /// Logits of the last token; empty when invalid or nothing was fed.
   [[nodiscard]] std::span<const float> Logits() const noexcept {

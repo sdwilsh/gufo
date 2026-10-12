@@ -165,6 +165,16 @@ void Model::BreakCapturesForTest(std::uint32_t count) noexcept {
   executor_->BreakCapturesForTest(count);
 }
 
+std::uint32_t Model::BatchRowLimit() const noexcept {
+  return executor_->batch_row_limit();
+}
+
+void Model::FailBatchesForTest(std::uint32_t count, bool before_wait) noexcept {
+  executor_->FailBatchesForTest(
+      count, before_wait ? rocm::Executor::BatchFailurePoint::kBeforeSync
+                         : rocm::Executor::BatchFailurePoint::kAfterSync);
+}
+
 double Model::UploadSeconds() const noexcept {
   return device_->stats().seconds;
 }
@@ -251,6 +261,113 @@ bool Session::Sync(std::span<const std::int32_t> prompt,
 
 bool Session::Evaluate(std::int32_t token, std::string* error_msg) {
   return Feed(std::span<const std::int32_t>(&token, 1), {}, error_msg);
+}
+
+void Session::EvaluateBatch(std::span<BatchLane> lanes) {
+  std::vector<rocm::BatchSegment> segments;
+  std::vector<BatchLane*> members;
+  std::vector<bool> had_logits;
+  segments.reserve(lanes.size());
+  members.reserve(lanes.size());
+  const Model* model = nullptr;
+  for (std::size_t i = 0; i < lanes.size(); ++i) {
+    BatchLane& lane = lanes[i];
+    lane.ok = false;
+    lane.deferred = false;
+    lane.error.clear();
+    Session* s = lane.session;
+    if (s == nullptr) {
+      lane.error = "batch lane has no session";
+      continue;
+    }
+    if (model == nullptr) {
+      model = s->model_.get();
+    }
+    if (s->model_.get() != model) {
+      lane.error = "batch lane belongs to another model";
+      continue;
+    }
+    if (std::any_of(lanes.begin(), lanes.begin() + i,
+                    [&](const BatchLane& o) { return o.session == s; })) {
+      lane.error = "session appears twice in one batch";
+      continue;
+    }
+    if (segments.size() == model->executor_->batch_row_limit()) {
+      lane.error = "a batch holds at most " +
+                   std::to_string(model->executor_->batch_row_limit()) +
+                   " sessions";
+      lane.deferred = true;
+      continue;
+    }
+    // Evaluate's own checks (Feed), in its order and with its effects.
+    if (!s->valid_) {
+      lane.error = "session is invalid after an earlier failure";
+      continue;
+    }
+    if (s->reset_pending_) {
+      if (!s->session_->Reset(&lane.error)) {
+        s->valid_ = false;
+        continue;
+      }
+      s->reset_pending_ = false;
+    }
+    if (s->pending_.active) {
+      lane.error = "a verify step is waiting for Rollback()";
+      continue;
+    }
+    const std::uint32_t position = s->session_->position();
+    if (position + 1 > s->session_->capacity()) {
+      lane.error = "context overflow: " + std::to_string(position) + " + 1 > " +
+                   std::to_string(s->session_->capacity());
+      continue;
+    }
+    // Refusals of the forward itself leave an Evaluate'd session invalid.
+    if (model->executor_->first_layer() != 0 || lane.token < 0 ||
+        static_cast<std::uint32_t>(lane.token) >= kVocab) {
+      lane.error = model->executor_->first_layer() != 0
+                       ? "forward needs the trunk from block 0 (layer_first "
+                         "is set)"
+                       : "token id " + std::to_string(lane.token) +
+                             " outside the vocabulary";
+      s->valid_ = false;
+      s->logits_.clear();
+      continue;
+    }
+    had_logits.push_back(s->logits_.size() == kVocab);
+    s->logits_.resize(kVocab);
+    segments.push_back({.session = s->session_.get(),
+                        .tokens = std::span<const std::int32_t>(&lane.token, 1),
+                        .logits = s->logits_});
+    members.push_back(&lane);
+  }
+  if (segments.empty()) {
+    return;
+  }
+  (void)model->executor_->ForwardBatch(segments);
+  for (std::size_t i = 0; i < members.size(); ++i) {
+    BatchLane& lane = *members[i];
+    Session& s = *lane.session;
+    switch (segments[i].status) {
+      case rocm::BatchSegment::Status::kDone:
+        s.tokens_.push_back(lane.token);
+        lane.ok = true;
+        break;
+      case rocm::BatchSegment::Status::kRejected:
+        // Batch-only refusal (row budget, a snapshot in flight): nothing ran.
+        if (!had_logits[i]) {
+          s.logits_.clear();
+        }
+        lane.error = segments[i].error;
+        lane.deferred = true;
+        break;
+      default:
+        // Launched and failed: the state is lost and the device may be too.
+        s.Invalidate();
+        lane.error = segments[i].error.empty() ? "batched forward failed"
+                                               : segments[i].error;
+        break;
+    }
+  }
 }
 
 bool Session::Feed(std::span<const std::int32_t> tokens,
