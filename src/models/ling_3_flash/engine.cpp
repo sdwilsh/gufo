@@ -680,17 +680,12 @@ bool Session::DecodeStep(std::size_t max_tokens,
     return true;
   }
 
-  // Draft chain. A sampled proposal uses its own stream, seeded from the
-  // request's RNG, so target verification keeps independent draws.
-  std::uint64_t draft_rng =
-      sampled ? sampling::NextRandom(sampler.mutable_rng_state()) : 0;
-  std::optional<sampling::SamplerState> draft_sampler;
+  // Draft chain. A sampled proposal uses its own stream (MtpProposer).
+  std::optional<MtpProposer> proposer;
   if (sampled) {
-    draft_sampler = sampler.WithoutConstraint();
-    draft_sampler->Accept(static_cast<sampling::TokenId>(anchor));
+    proposer.emplace(sampler, static_cast<sampling::TokenId>(anchor));
   }
   std::vector<std::int32_t> chain{anchor};
-  std::vector<MtpProposal> proposals;
   if (sampled && draft_logits_.size() != kVocab) {
     draft_logits_.resize(kVocab);
   }
@@ -706,10 +701,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
       return false;  // the trunk state is untouched by draft steps
     }
     if (sampled) {
-      proposals.push_back(SampleMtpProposal(TopCandidates(draft_logits_),
-                                            *draft_sampler, &draft_rng));
-      index = static_cast<std::int32_t>(proposals.back().token);
-      draft_sampler->Accept(proposals.back().token);
+      index = static_cast<std::int32_t>(proposer->Propose(draft_logits_));
     }
     chain.push_back(index);
   }
@@ -735,7 +727,19 @@ bool Session::DecodeStep(std::size_t max_tokens,
     if (hooks_.after_verify) {
       hooks_.after_verify();
     }
-    while (keep < k) {
+    if (sampled) {
+      const auto verified =
+          VerifySampledChain(row_logits, proposer->proposals(), sampler,
+                             [&](sampling::TokenId token) {
+                               return is_stop(static_cast<std::int32_t>(token));
+                             });
+      keep = verified.keep;
+      result->stop = verified.stop;
+      if (verified.correction) {
+        correction = static_cast<std::int32_t>(*verified.correction);
+      }
+    }
+    while (!sampled && keep < k) {
       if (greedy_fast) {
         const std::int32_t predicted = argmax[keep - 1];
         if (predicted < 0) {
@@ -752,22 +756,6 @@ bool Session::DecodeStep(std::size_t max_tokens,
           break;
         }
         sampler.Accept(static_cast<sampling::TokenId>(predicted));
-        ++keep;
-        continue;
-      }
-      if (sampled) {
-        const auto verified = VerifyMtpProposal(row_logits(keep - 1),
-                                                proposals[keep - 1], sampler);
-        const auto token = static_cast<std::int32_t>(verified.token);
-        if (is_stop(token)) {
-          result->stop = true;
-          break;
-        }
-        if (!verified.accepted) {
-          correction = token;
-          break;
-        }
-        sampler.Accept(static_cast<sampling::TokenId>(token));
         ++keep;
         continue;
       }

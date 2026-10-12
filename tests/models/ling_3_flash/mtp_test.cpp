@@ -13,6 +13,17 @@
 //     rejected rows (real continuation drafts and unrelated garbage drafts).
 //   * cache_fill_matches_draft: the MTP cache row written by a forward pass
 //     equals the row a draft step writes from the same (hidden, token).
+//   * constrained_*: with the server's Bailing tool grammar (strict const
+//     value), greedy speculative decoding equals constrained autoregressive
+//     decoding and sampled speculative decoding commits only grammar tokens.
+//   * serving_strict_tool_*: InferenceBackend with MTP answers a forced
+//     strict tool (the const value holds `</tool_call>`) with exactly that
+//     value through the Bailing parser.
+//   * serving_cached_replay_thinking_*: InferenceBackend with MTP restores a
+//     repeated >= 128-token prompt whole (no prefill) after uncached requests
+//     with other samplers, and replays the first answer (the openai_sdk
+//     sampling-defaults sequence). "serving_cached_replay_short" reports the
+//     same sequence for a prompt below Ling's snapshot floor.
 //   * sampled_replay: a seeded sampled speculative run reproduces itself, also
 //     from a restored snapshot (so snapshots carry the MTP state); the draft
 //     path was exercised.
@@ -421,6 +432,240 @@ int Execute(const Args& args, Report& report,
     auto o = json::Value::object();
     o["draft_argmax"] = arg;
     check("cache_fill_matches_draft", same, std::move(o));
+  }
+
+  // ---- grammar-constrained decoding ---------------------------------------
+  // The Bailing tool grammar of the server (a forced, strict call whose const
+  // value holds `</tool_call>`) bound to the real vocabulary. The drafts are
+  // unconstrained; the verifier applies the mask (greedy: VerifyDraft with a
+  // constrained Sample; sampled: p from the masked Distribution). Greedy
+  // speculative output must equal constrained autoregressive output token for
+  // token, and every committed token must keep the grammar viable.
+  {
+    // A truncated trunk may wander in the admitted whitespace before the call;
+    // only the full trunk must finish it within the token budget.
+    const bool full = model->LayerCount() == l3::kTrunkLayers;
+    constexpr std::string_view kLiteral = "<think>literal</think></tool_call>";
+    auto schema = json::parse(R"({"type":"object","properties":{
+      "value":{"type":"string"}},"required":["value"],
+      "additionalProperties":false})");
+    schema["properties"]["value"]["const"] = std::string(kLiteral);
+    using Constraint = sampling::JsonConstraint;
+    const auto grammar = Constraint::WithTools(
+        nullptr,
+        {{"record", Constraint::ToolParameters(
+                        schema, true, Constraint::ToolFormat::kBailing, true)}},
+        true, false, Constraint::ToolFormat::kBailing);
+    auto binding = std::make_shared<sampling::TokenConstraint>();
+    binding->grammar = grammar;
+    binding->vocabulary = std::make_shared<sampling::ConstraintVocabulary>(
+        model->VocabSize(), [&](std::uint32_t id) {
+          const auto token = static_cast<std::int32_t>(id);
+          return sampling::ConstraintVocabulary::Piece{
+              model->TokenText(token), model->IsStopToken(token)};
+        });
+    const auto viable = [&](const Run& run, bool* complete) {
+      std::string text;
+      for (const auto token : run.tokens)
+        text += model->TokenText(token);
+      auto state = grammar->Start();
+      for (const unsigned char byte : text) {
+        state = grammar->Advance(state, byte);
+        if (state.empty())
+          return false;
+      }
+      *complete = text.find("<arg_value>" + std::string(kLiteral) +
+                            "</arg_value>") != std::string::npos;
+      return true;
+    };
+    sampling::SamplingConfig constrained;
+    constrained.constraint = binding;
+    const auto& prompt = prompts[0];
+    auto s_ar = fresh();
+    Run ar;
+    if (!s_ar || !GenerateAr(*model, *s_ar, constrained, prompt, G, layers, &ar,
+                             &error)) {
+      return fail_with("constrained autoregressive run");
+    }
+    for (const std::uint32_t k : {1U, 3U}) {
+      auto s = fresh();
+      Run mtp;
+      if (!s || !GenerateMtp(*model, *s, constrained, prompt, G, k, layers,
+                             &mtp, &error)) {
+        return fail_with("constrained speculative run");
+      }
+      bool complete = false;
+      const bool ok = viable(mtp, &complete);
+      auto o = json::Value::object();
+      o["max_drafts"] = U(k);
+      o["drafted"] = U(mtp.stats.drafted);
+      o["accepted"] = U(mtp.stats.accepted);
+      o["tokens"] = U(mtp.tokens.size());
+      o["tokens_equal"] = ar.tokens == mtp.tokens;
+      o["call_complete"] = complete;
+      o["full_trunk"] = full;
+      check("constrained_greedy_equals_ar_k" + std::to_string(k),
+            ar.tokens == mtp.tokens && ok && (complete || !full) &&
+                mtp.stats.drafted > 0 &&
+                session_tool::Exact(Compare(mtp.end, ar.end)),
+            std::move(o));
+    }
+    sampling::SamplingConfig sampled = constrained;
+    sampled.temperature = 0.8F;
+    sampled.top_p = 0.95F;
+    sampled.top_k = 40;
+    sampled.seed = 4321;
+    auto s1 = fresh();
+    auto s2 = fresh();
+    Run a, b;
+    if (!s1 || !s2 ||
+        !GenerateMtp(*model, *s1, sampled, prompt, G, 3, layers, &a, &error) ||
+        !GenerateMtp(*model, *s2, sampled, prompt, G, 3, layers, &b, &error)) {
+      return fail_with("constrained sampled runs");
+    }
+    bool complete = false;
+    const bool ok = viable(a, &complete);
+    auto o = json::Value::object();
+    o["drafted"] = U(a.stats.drafted);
+    o["accepted"] = U(a.stats.accepted);
+    o["tokens"] = U(a.tokens.size());
+    o["call_complete"] = complete;
+    check("constrained_sampled_obeys_grammar",
+          ok && (complete || !full) && a.tokens == b.tokens &&
+              a.stats.drafted > 0,
+          std::move(o));
+
+    // The serving path end to end: ConstrainChatRequest binds the Bailing
+    // grammar for a forced strict tool, the MTP runner decodes under it and
+    // the Bailing parser reads the const value back. The call admits only
+    // optional newlines besides its fixed bytes, so it completes within the
+    // budget even on a truncated trunk.
+    {
+      namespace server = gufo::server;
+      server::InferenceBackend backend;
+      server::TextSpeculativeConfig speculative;
+      speculative.backend = server::TextSpeculativeBackend::kMtp;
+      if (!backend.load(model, &error, std::min<std::uint32_t>(ctx, 2048), 1,
+                        {}, {}, speculative)) {
+        return fail_with("serving load");
+      }
+      auto definition = json::parse(R"({"type":"function","function":{
+        "name":"record","strict":true}})");
+      definition["function"]["parameters"] = schema;
+      server::ChatRequest request({{gufo::tokenization::ChatRole::kUser,
+                                    "Call record once with the required "
+                                    "value. No explanation."}});
+      request.reasoning.enabled = false;
+      request.tools = {{.name = "record",
+                        .parameters_json = schema.dump(),
+                        .definition_json = definition.dump()}};
+      request.tool_choice = server::ChatRequest::ToolChoice::kRequired;
+      request.forced_tool_name = "record";
+      request.parallel_tool_calls = false;
+      for (const float temperature : {0.0F, 0.8F}) {
+        sampling::SamplingConfig config;
+        config.temperature = temperature;
+        config.seed = 99;
+        const auto result = backend.chat(request, 256, config);
+        const auto scan = models::ling_3_flash::ScanBailingToolCalls(
+            result.text, models::ling_3_flash::BailingTools(request.tools),
+            true, false);
+        const bool exact = scan.calls.size() == 1 &&
+                           scan.calls[0].name == "record" &&
+                           scan.calls[0].arguments.size() == 1 &&
+                           scan.calls[0].arguments[0].name == "value" &&
+                           scan.calls[0].arguments[0].value == kLiteral;
+        auto serving = json::Value::object();
+        serving["temperature"] = temperature;
+        serving["completion_tokens"] = U(result.completion_tokens);
+        serving["draft_tokens"] = U(result.draft_tokens);
+        serving["text_head"] = result.text.substr(0, 400);
+        check(std::string("serving_strict_tool_") +
+                  (temperature == 0.0F ? "greedy" : "sampled"),
+              exact, std::move(serving));
+      }
+    }
+  }
+
+  // ---- serving: cached replay of a repeated prompt -------------------------
+  // The openai_sdk sampling-defaults sequence with MTP on: the prompt with
+  // cache_prompt=false and the Ling preset, then with greedy penalties, then
+  // with cache_prompt=true and the preset again. The last must restore the
+  // whole prompt (no prefill) and replay the first answer. The Ling sampling
+  // prompt clears the runner's 128-token snapshot floor; the bare question
+  // (31 tokens) stays below it and is reported, not checked, because no prompt
+  // snapshot exists and the decoded frontier cannot be cut back to it.
+  {
+    namespace server = gufo::server;
+    server::InferenceBackend backend;
+    server::TextSpeculativeConfig speculative;
+    speculative.backend = server::TextSpeculativeBackend::kMtp;
+    if (!backend.load(model, &error, std::min<std::uint32_t>(ctx, 2048), 2, {},
+                      {}, speculative)) {
+      return fail_with("serving cache load");
+    }
+    constexpr std::string_view kQuestion =
+        "Name three animals and describe each in one sentence.";
+    // tests/functional/openai_sdk.py SAMPLING_CONTEXT.
+    constexpr std::string_view kContext =
+        "You are helping a teacher prepare a short handout for a "
+        "primary-school nature club. The club meets every Thursday afternoon "
+        "in the school garden, where the children watch birds, look for "
+        "insects under stones and keep a notebook of everything they find. "
+        "The teacher wants the handout to be friendly, accurate and easy to "
+        "read aloud, with plain words and no jargon. Each entry should say "
+        "where the animal lives and one thing that makes it special, so the "
+        "children can remember it on their next walk. Keep the tone warm and "
+        "curious, and avoid anything frightening. The handout will be printed "
+        "on a single page together with a few drawings made by the children "
+        "themselves.\n\n";
+    sampling::SamplingConfig preset;
+    preset.temperature = 0.6F;
+    preset.top_p = 0.95F;
+    preset.top_k = 20;
+    preset.seed = 73;
+    sampling::SamplingConfig penalties;
+    penalties.seed = 73;
+    penalties.frequency_penalty = 0.3F;
+    penalties.presence_penalty = 0.4F;
+    penalties.repeat_penalty = 1.1F;
+    penalties.repeat_last_n = 16;
+    const auto replay = [&](const std::string& content, bool thinking) {
+      server::ChatRequest request(
+          {{gufo::tokenization::ChatRole::kUser, content}});
+      request.reasoning.enabled = thinking;
+      request.cache_prompt = false;
+      const auto inherited = backend.chat(request, 8, preset);
+      (void)backend.chat(request, 8, penalties);
+      request.cache_prompt = true;
+      const auto cached = backend.chat(request, 8, preset);
+      auto o = json::Value::object();
+      o["thinking"] = thinking;
+      o["prompt_tokens"] = U(cached.prompt_tokens);
+      o["cached_tokens"] = U(cached.cached_prompt_tokens);
+      o["prefill_tokens"] = U(cached.prefill_tokens);
+      o["cache_hit"] = cached.cache_hit;
+      o["cache_miss_reason"] = cached.cache_miss_reason;
+      o["cache_common_prefix_tokens"] = U(cached.cache_common_prefix_tokens);
+      o["cache_checkpoint_tokens"] = U(cached.cache_checkpoint_tokens);
+      o["draft_tokens"] = U(inherited.draft_tokens + cached.draft_tokens);
+      o["same_answer"] = cached.tokens == inherited.tokens;
+      const bool pass = cached.cache_hit && cached.prefill_tokens == 0 &&
+                        cached.prompt_tokens >= 128 &&
+                        cached.cached_prompt_tokens == cached.prompt_tokens &&
+                        cached.tokens == inherited.tokens &&
+                        inherited.draft_tokens + cached.draft_tokens > 0;
+      return std::pair{pass, std::move(o)};
+    };
+    for (const bool thinking : {false, true}) {
+      auto [pass, o] =
+          replay(std::string(kContext) + std::string(kQuestion), thinking);
+      check(std::string("serving_cached_replay_thinking_") +
+                (thinking ? "on" : "off"),
+            pass, std::move(o));
+    }
+    report.Set("serving_cached_replay_short",
+               replay(std::string(kQuestion), false).second);
   }
 
   // ---- sampled replay ------------------------------------------------------
