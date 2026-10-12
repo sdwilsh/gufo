@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """Ling-3.0-Flash prompt-cache validation (WS15). Prints one compact JSON object on stdout.
 
-usage: ling-cache-suite [--model PATH] [--suites a,b,...] [--skip-hermes]
+usage: ling-cache-suite [--model PATH] [--suites a,b,...] [--skip-hermes] [--speculative off|mtp]
                         [--skip-functional] [--context N] [--sessions N]
                         [--cache-ram-bytes N] [--hermes-steps N] [--timeout SEC]
 Environment equivalents: MODEL, LING_SUITES, LING_CONTEXT, LING_SESSIONS,
@@ -161,11 +161,14 @@ def main():
     ap.add_argument("--hermes-steps", type=int, default=int(os.environ.get("LING_HERMES_STEPS", 5)))
     ap.add_argument("--startup-timeout", type=int, default=1800)
     ap.add_argument("--timeout", type=int, default=14400)
+    ap.add_argument("--speculative", choices=("off", "mtp"), default="mtp",
+                    help="speculative mode of every server this suite starts, passed explicitly "
+                         "(Ling's default is mtp)")
     args = ap.parse_args()
     t0 = time.monotonic()
     summary = {"tool": "ling-cache-suite", "image": os.environ.get("GUFO_IMAGE"),
                "model": args.model, "settings": {k: getattr(args, k.replace("-", "_")) for k in
-                                                 ("context", "sessions", "cache-ram-bytes")},
+                                                 ("context", "sessions", "cache-ram-bytes", "speculative")},
                "env": gpu_and_memory(), "phases": {}}
     if not os.path.exists(args.model):
         summary["status"] = "skipped"
@@ -174,7 +177,7 @@ def main():
         return 77
     os.makedirs(HOME + "/tmp", exist_ok=True)
     server_args = ["serve", "llm", "--model", args.model, "--sessions", str(args.sessions),
-                   "--context", str(args.context), "--speculative", "off",
+                   "--context", str(args.context), "--speculative", args.speculative,
                    "--cache-ram-bytes", str(args.cache_ram_bytes)]
     ok = True
 

@@ -221,6 +221,11 @@ bool IsAllowedExpertDownType(GgmlType type) noexcept {
   return false;
 }
 
+bool HasMtpBlock(const core::GgufReader& reader) {
+  return reader.FindTensor("blk." + std::to_string(kMtpBlock) +
+                           ".nextn.eh_proj.weight") != nullptr;
+}
+
 std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
                                                std::string* error_msg) {
   auto config = Config::FromGguf(reader, error_msg);
@@ -244,7 +249,7 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
 
   // The MTP block is optional: trunk-only files lack it.
   const std::string mtp = "blk." + std::to_string(kMtpBlock) + ".";
-  if (b.ok && reader.FindTensor(mtp + "nextn.eh_proj.weight") != nullptr) {
+  if (b.ok && HasMtpBlock(reader)) {
     MtpWeights m;
     m.block = b.Layer(mtp, c.kinds[kMtpBlock], true);
     m.eh_proj = b.Get(mtp + "nextn.eh_proj.weight", 2 * kHidden, kHidden, 1,

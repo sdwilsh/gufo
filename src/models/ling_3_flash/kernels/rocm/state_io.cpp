@@ -4,9 +4,14 @@
 // (chunked), so no stream is created and no pageable memory is handed to the
 // HIP runtime per snapshot (a pageable copy issued from a worker thread can
 // invalidate a global-mode graph capture running elsewhere). The session's last
-// forward pass is awaited through its event, never assumed finished.
+// forward pass is awaited through its event, never assumed finished; that wait
+// holds the executor's capture mutex, because it may run on a worker thread
+// while the scheduler thread captures a decode graph on the executor stream
+// (executor.hpp).
 #include <algorithm>
 #include <cstring>
+#include <mutex>
+#include <vector>
 
 #include "src/models/ling_3_flash/kernels/rocm/executor.hpp"
 
@@ -23,6 +28,15 @@ bool Check(hipError_t status, const char* what, std::string* error) {
     *error = std::string(what) + ": " + hipGetErrorString(status);
   }
   return false;
+}
+
+/// Waits for an event recorded on the executor stream, never during a decode
+/// graph capture on that stream.
+bool AwaitForward(std::mutex& capture_mutex, hipEvent_t forward_done,
+                  std::string* error) {
+  const std::lock_guard<std::mutex> lock(capture_mutex);
+  return Check(hipEventSynchronize(forward_done),
+               "wait for the session's last forward", error);
 }
 
 /// Device -> host through the pinned staging buffer.
@@ -73,8 +87,7 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t rows,
   }
   const auto& st = session.state_;
   const std::lock_guard<std::mutex> lock(transfer_mutex_);
-  if (!Check(hipEventSynchronize(session.forward_done_),
-             "wait for the session's last forward", error_msg) ||
+  if (!AwaitForward(capture_mutex_, session.forward_done_, error_msg) ||
       !CopyOut(transfer_stream_, transfer_staging_, out.kda_state, st.kda_state,
                kKdaLayers * kKdaStateFloats * sizeof(float), error_msg) ||
       !CopyOut(transfer_stream_, transfer_staging_, out.kda_conv, st.kda_conv,
@@ -87,6 +100,22 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t rows,
                  static_cast<const std::uint8_t*>(st.mla_cache) +
                      m * st.cache.LayerStride() * sizeof(std::uint16_t),
                  width, error_msg)) {
+      return false;
+    }
+  }
+  if (out.mtp_h != nullptr && st.mtp_cache != nullptr) {
+    if (!session.mtp_valid_) {
+      if (error_msg != nullptr) {
+        *error_msg = "the session's MTP state is not valid";
+      }
+      return false;
+    }
+    // Rows [0, rows - 1): the last row is written by the next forward.
+    const std::size_t mtp_width = std::size_t{rows - (rows != 0)} * kRowBytes;
+    if (!CopyOut(transfer_stream_, transfer_staging_, out.mtp_h, st.mtp_h,
+                 kHidden * sizeof(float), error_msg) ||
+        !CopyOut(transfer_stream_, transfer_staging_, out.mtp, st.mtp_cache,
+                 mtp_width, error_msg)) {
       return false;
     }
   }
@@ -104,8 +133,7 @@ bool Executor::RestoreSnapshot(Session& session, std::uint32_t rows,
   }
   auto& st = session.state_;
   const std::lock_guard<std::mutex> lock(transfer_mutex_);
-  if (!Check(hipEventSynchronize(session.forward_done_),
-             "wait for the session's last forward", error_msg) ||
+  if (!AwaitForward(capture_mutex_, session.forward_done_, error_msg) ||
       !CopyIn(transfer_stream_, transfer_staging_, st.kda_state, in.kda_state,
               kKdaLayers * kKdaStateFloats * sizeof(float), error_msg) ||
       !CopyIn(transfer_stream_, transfer_staging_, st.kda_conv, in.kda_conv,
@@ -113,16 +141,62 @@ bool Executor::RestoreSnapshot(Session& session, std::uint32_t rows,
     return false;
   }
   const std::size_t width = std::size_t{rows} * kRowBytes;
+  // The persistent expanded K/V rows of a layer are a pure function of the
+  // latent rows below them. Rows that the restore leaves bit-identical (the
+  // shared prefix of the old and the restored history, *in the same numeric
+  // family*, which only the bytes can tell) keep their expansion; compare the
+  // watermarked rows with the snapshot and rewrite only from the first
+  // difference on.
+  std::uint32_t same[kMlaLayers]{};
+  constexpr std::size_t kCompareRows = 4096;
+  std::vector<std::uint8_t> device_rows(kCompareRows * kRowBytes);
   for (std::uint32_t m = 0; m < kMlaLayers && rows != 0; ++m) {
+    auto* layer = static_cast<std::uint8_t*>(st.mla_cache) +
+                  m * st.cache.LayerStride() * sizeof(std::uint16_t);
+    const std::uint32_t limit = std::min(st.mla_expanded_to[m], rows);
+    std::uint32_t row = 0;
+    while (row < limit) {
+      const std::uint32_t n =
+          std::min<std::uint32_t>(kCompareRows, limit - row);
+      if (!CopyOut(transfer_stream_, transfer_staging_, device_rows.data(),
+                   layer + std::size_t{row} * kRowBytes,
+                   std::size_t{n} * kRowBytes, error_msg)) {
+        return false;
+      }
+      const auto* snap = in.mla + m * width + std::size_t{row} * kRowBytes;
+      const auto diff = std::mismatch(device_rows.begin(),
+                                      device_rows.begin() + n * kRowBytes, snap)
+                            .first -
+                        device_rows.begin();
+      if (static_cast<std::size_t>(diff) < std::size_t{n} * kRowBytes) {
+        row += static_cast<std::uint32_t>(diff / kRowBytes);
+        break;
+      }
+      row += n;
+    }
+    same[m] = std::min(row, limit);
     if (!CopyIn(transfer_stream_, transfer_staging_,
-                static_cast<std::uint8_t*>(st.mla_cache) +
-                    m * st.cache.LayerStride() * sizeof(std::uint16_t),
-                in.mla + m * width, width, error_msg)) {
+                layer + std::size_t{same[m]} * kRowBytes,
+                in.mla + m * width + std::size_t{same[m]} * kRowBytes,
+                width - std::size_t{same[m]} * kRowBytes, error_msg)) {
       return false;
     }
   }
+  if (st.mtp_cache != nullptr) {
+    session.mtp_valid_ = false;
+    if (in.mtp_h != nullptr) {
+      const std::size_t mtp_width = std::size_t{rows - (rows != 0)} * kRowBytes;
+      if (!CopyIn(transfer_stream_, transfer_staging_, st.mtp_h, in.mtp_h,
+                  kHidden * sizeof(float), error_msg) ||
+          !CopyIn(transfer_stream_, transfer_staging_, st.mtp_cache, in.mtp,
+                  mtp_width, error_msg)) {
+        return false;
+      }
+      session.mtp_valid_ = true;
+    }
+  }
   session.set_position(rows);
-  session.OnStateReplaced(rows);
+  session.OnStateReplaced(rows, same);
   return true;
 }
 

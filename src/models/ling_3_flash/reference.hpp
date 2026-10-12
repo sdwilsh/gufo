@@ -81,8 +81,9 @@ private:
 
 /// Single-token, float32, scalar reference of the Ling-3.0-flash trunk
 /// (PLAN.md section 1). Weights are decoded row by row from the mapped file
-/// and released after use, so resident memory stays small. The MTP block is
-/// not run. Speed is irrelevant here.
+/// and released after use, so resident memory stays small. The trunk Step()
+/// does not run the MTP block; MtpStep() runs it on request (mtp.hpp). Speed is
+/// irrelevant here.
 class ReferenceModel {
 public:
   struct Options {
@@ -130,6 +131,28 @@ public:
                               std::span<float> out, DumpSink* sink = nullptr,
                               std::string* error_msg = nullptr);
 
+  /// One MTP draft step (mtp.hpp): the block-42 draft for `token` (the token
+  /// after the one whose hidden state is `h`) at the next MTP position,
+  /// appending its latent cache row. `h` is the output-normed trunk hidden of
+  /// the previous position (LastHidden() after Step()) or the previous draft's
+  /// `h_next`. `logits` (vocab floats) and `h_next` (hidden floats, the
+  /// shared-head-normed block output) are filled when non-empty. Needs the
+  /// artifact's MTP block. The MTP position advances by one.
+  [[nodiscard]] bool MtpStep(std::int32_t token, std::span<const float> h,
+                             std::span<float> logits, std::span<float> h_next,
+                             DumpSink* sink = nullptr,
+                             std::string* error_msg = nullptr);
+  /// MTP cache rows written so far (the next MtpStep's position).
+  [[nodiscard]] std::uint32_t MtpPosition() const noexcept {
+    return layer_pos_.size() > kMtpBlock ? layer_pos_[kMtpBlock] : 0;
+  }
+  /// Cuts the MTP cache back to `position` rows (rolling a draft chain back).
+  void MtpRewind(std::uint32_t position);
+  /// Output-normed hidden state (result_norm) of the last Step().
+  [[nodiscard]] std::span<const float> LastHidden() const noexcept {
+    return last_hidden_;
+  }
+
   /// Embedding of one token (hidden floats).
   [[nodiscard]] bool Embed(std::int32_t token, std::span<float> out,
                            std::string* error_msg = nullptr) const;
@@ -171,8 +194,16 @@ private:
   void Moe(std::uint32_t il, std::span<const float> x, std::span<float> out,
            std::uint32_t token, DumpSink* sink);
 
+  [[nodiscard]] const LayerWeights& Layer(std::uint32_t il) const {
+    return il == kMtpBlock ? w_.mtp->block : w_.layers[il];
+  }
+  [[nodiscard]] std::uint32_t StateLayers() const noexcept {
+    return c_.num_layers + (w_.mtp ? 1U : 0U);
+  }
+
   const ModelWeights& w_;
   const Config& c_;
+  std::vector<float> last_hidden_;
   Options opt_;
   std::vector<std::uint32_t> layer_pos_;
   std::vector<std::vector<float>> kda_state_;     ///< per block, [h][i][j]

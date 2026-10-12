@@ -1,0 +1,267 @@
+#!/usr/bin/python3
+"""Ling-3.0-Flash MTP (WS22) suite driver. Prints JSON lines on stdout and progress on stderr.
+
+usage: ling-mtp-suite [--part tests|measure|serve-mtp|all] [--model PATH] [--work DIR]
+                      [--depths 0,16384,65536] [--gen 128] [--no-bench] [--no-serve]
+
+  tests    run-suite over /opt/gufo/suites/mtp-tests.txt (draft block against the CPU
+           reference, greedy MTP == AR, rollback, sampled replay, snapshot MTP state,
+           MTP-on decode digests), then the standard integration tests (int-tests.txt:
+           op tests, B2, invariance, decode digests, session, snapshot, novel KL). The
+           digests of decode_digest_mtp must equal those of decode_digest, because
+           enabling MTP must not change a bit of the trunk. ~10 min + ~65 min.
+  measure  real-text decode speed and acceptance, AR against MTP, at the given depths
+           on two corpora (project docs "prose" and sources "code", built by
+           make_corpus.py):
+             serve: gufo serve llm --speculative off and mtp, one greedy /v1/completions
+                    request per (corpus, depth). It reads decode_tps and
+                    draft_accepted/proposed from the server's completed line. The
+                    texts must be identical.
+             bench: gufo bench -p 0 -n GEN -d DEPTHS --text-file CORPUS [-o jsonl]
+                    with and without --speculative mtp (tg t/s, mtp records).
+           ~60-80 min.
+  serve-mtp  server-level functional pass with `--speculative mtp` (vendor sampling
+           preset, so requests are sampled). ling-serve-suite runs
+           tests/functional/ling_agent.py, the Hermes cache replay (strip and echo
+           loops, real tool calls required, restart from disk), and the openai_sdk
+           `tools` suite, with every server started with --speculative mtp. Every
+           functional failure fails the part. The per-request draft counters of the
+           servers' completed lines (proposed, accepted, rounds) are reported in
+           "draft_requests", and a pass with zero proposed drafts fails.
+           ~60-90 min. (`all` does not include it; name it explicitly.)
+Exit 0 only when every check passed.
+"""
+import argparse, http.client, json, os, re, signal, subprocess, sys, time
+
+CORPUS = "/opt/gufo/corpus"
+
+
+def log(msg):
+    print("[ling-mtp] " + msg, file=sys.stderr, flush=True)
+
+
+def out(obj):
+    print(json.dumps(obj), flush=True)
+
+
+def run_suite(suite, timeout):
+    p = subprocess.run(["run-suite", "--suite", suite, "--timeout", str(timeout)],
+                       stdout=subprocess.PIPE, stderr=sys.stderr, text=True)
+    try:
+        return json.loads(p.stdout)
+    except ValueError:
+        return {"results": [], "error": p.stdout[-2000:]}
+
+
+def digests(result, label):
+    for r in result.get("results", []):
+        if r.get("name") == label:
+            return (r.get("json") or {}).get("digests")
+    return None
+
+
+def part_tests(args):
+    ok = True
+    mtp = run_suite("/opt/gufo/suites/mtp-tests.txt", 3600)
+    out({"stage": "mtp-tests", "result": mtp})
+    std = run_suite("/opt/gufo/suites/int-tests.txt", 7200)
+    out({"stage": "int-tests", "result": std})
+    for r in mtp.get("results", []) + std.get("results", []):
+        if r.get("status") != "PASS":
+            ok = False
+            out({"stage": "failed-check", "name": r.get("name"), "status": r.get("status")})
+    a, b = digests(std, "decode_digest"), digests(mtp, "decode_digest_mtp")
+    same = a is not None and a == b
+    out({"stage": "mtp-off-identical", "pass": same, "steps": len(a or []),
+         "note": "decode_digest digests with and without --mtp"})
+    return ok and same
+
+
+# ---- measure ---------------------------------------------------------------
+
+COMPLETED = re.compile(r"event=completed .*path=/v1/completions")
+
+
+def field(line, name):
+    m = re.search(r"\b%s=(\S+)" % name, line)
+    return m.group(1) if m else None
+
+
+def wait_health(port, proc, timeout):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if proc.poll() is not None:
+            raise RuntimeError("server exited %s" % proc.returncode)
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+            c.request("GET", "/health")
+            if c.getresponse().status == 200:
+                return
+        except OSError:
+            pass
+        time.sleep(2)
+    raise RuntimeError("server did not become healthy")
+
+
+def post(port, body, timeout=3600):
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    c.request("POST", "/v1/completions", json.dumps(body), {"Content-Type": "application/json"})
+    r = c.getresponse()
+    return json.loads(r.read())
+
+
+CHARS_PER_TOKEN = {"prose": 3.8, "code": 3.1}
+
+
+def serve_pass(args, mode, port):
+    log_path = os.path.join(args.work, "serve-%s.log" % mode)
+    cmd = ["gufo", "serve", "llm", "--model", args.model, "--sessions", "1",
+           "--context", str(max(args.depths) + 2048), "--speculative", mode,
+           "--cache-ram-bytes", str(2 << 30), "--host", "127.0.0.1", "--port", str(port),
+           "--served-model-name", "ling", "--log-level", "info"]
+    rows = []
+    with open(log_path, "wb") as lf:
+        proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            wait_health(port, proc, 1800)
+            for corpus in ("prose", "code"):
+                text = open(os.path.join(CORPUS, corpus + ".txt"), encoding="utf-8").read()
+                for depth in args.depths:
+                    chars = int(max(depth, 40) * CHARS_PER_TOKEN[corpus])
+                    log("%s %s depth %d (%d chars)" % (mode, corpus, depth, chars))
+                    before = open(log_path, errors="replace").read().count("event=completed")
+                    resp = post(port, {"model": "ling", "prompt": text[:chars],
+                                       "max_tokens": args.gen, "temperature": 0})
+                    time.sleep(1.0)
+                    lines = [l for l in open(log_path, errors="replace").read().splitlines()
+                             if COMPLETED.search(l)]
+                    line = lines[-1] if len(lines) > before else ""
+                    rows.append({
+                        "mode": mode, "corpus": corpus, "depth_target": depth,
+                        "prompt_tokens": (resp.get("usage") or {}).get("prompt_tokens"),
+                        "generated_tokens": (resp.get("usage") or {}).get("completion_tokens"),
+                        "decode_tps": float(field(line, "decode_tps") or 0),
+                        "draft_accepted": int(field(line, "draft_accepted") or 0),
+                        "draft_proposed": int(field(line, "draft_proposed") or 0),
+                        "draft_rounds": int(field(line, "draft_rounds") or 0),
+                        "text": (resp.get("choices") or [{}])[0].get("text", "")})
+        finally:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGINT)
+                try:
+                    proc.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+    return rows
+
+
+def part_measure_serve(args):
+    ar = serve_pass(args, "off", 8101)
+    mtp = serve_pass(args, "mtp", 8102)
+    table, ok = [], True
+    for a, m in zip(ar, mtp):
+        same = a["text"] == m["text"]
+        ok = ok and same and a["decode_tps"] > 0 and m["decode_tps"] > 0
+        prop = m["draft_proposed"]
+        table.append({"corpus": a["corpus"], "depth": a["prompt_tokens"],
+                      "ar_decode_tps": a["decode_tps"], "mtp_decode_tps": m["decode_tps"],
+                      "speedup": round(m["decode_tps"] / a["decode_tps"], 3) if a["decode_tps"] else None,
+                      "draft_proposed": prop, "draft_accepted": m["draft_accepted"],
+                      "acceptance": round(m["draft_accepted"] / prop, 3) if prop else None,
+                      "verified_cycles": m["draft_rounds"], "greedy_text_identical": same,
+                      "generated_tokens": m["generated_tokens"]})
+    out({"stage": "measure-serve", "rows": table})
+    return ok
+
+
+def bench_pass(args, corpus, mode):
+    cmd = ["gufo", "bench", "--model", args.model, "-p", "0", "-n", str(args.gen),
+           "-d", ",".join(map(str, args.depths)), "-r", "2", "-o", "jsonl",
+           "--text-file", os.path.join(CORPUS, corpus + ".txt")]
+    cmd += ["--speculative", mode]
+    log("bench %s %s" % (corpus, mode))
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=sys.stderr, text=True)
+    recs = []
+    for line in p.stdout.splitlines():
+        try:
+            recs.append(json.loads(line))
+        except ValueError:
+            pass
+    return p.returncode, recs
+
+
+def part_measure_bench(args):
+    rows, ok = [], True
+    for corpus in ("prose", "code"):
+        rc_a, ar = bench_pass(args, corpus, "off")
+        rc_m, mt = bench_pass(args, corpus, "mtp")
+        ok = ok and rc_a == 0 and rc_m == 0
+        base = {r["n_depth"]: r["avg_ts"] for r in ar if r.get("record") == "result" and r.get("n_gen")}
+        spec = {r["n_depth"]: r["avg_ts"] for r in mt if r.get("record") == "result" and r.get("n_gen")}
+        acc = {r["n_depth"]: r for r in mt if r.get("record") == "mtp"}
+        for d in sorted(base):
+            a = acc.get(d, {})
+            rows.append({"corpus": corpus, "depth": d, "ar_tg_tps": round(base[d], 2),
+                         "mtp_tg_tps": round(spec.get(d, 0), 2),
+                         "speedup": round(spec.get(d, 0) / base[d], 3) if base[d] else None,
+                         "acceptance": a.get("acceptance"),
+                         "tokens_per_verified_cycle": a.get("tokens_per_verified_cycle")})
+    out({"stage": "measure-bench", "rows": rows})
+    return ok
+
+
+def part_measure(args):
+    ok = True
+    if not args.no_serve:
+        ok = part_measure_serve(args) and ok
+    if not args.no_bench:
+        ok = part_measure_bench(args) and ok
+    return ok
+
+
+def part_serve_mtp(args):
+    work = os.path.join(args.work, "serve-mtp")
+    os.makedirs(work, exist_ok=True)
+    cmd = ["ling-serve-suite", "--model", args.model, "--work", work, "--speculative", "mtp",
+           "--sdk-suites", "tools", "--sdk-required", "--skip-stream-start", "--skip-device-loss",
+           "--skip-tool-reasoning"]
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=sys.stderr, text=True)
+    try:
+        doc = json.loads(p.stdout)
+    except ValueError:
+        out({"stage": "serve-mtp", "pass": False, "error": "no document", "tail": p.stdout[-2000:]})
+        return False
+    stages = {st.get("name"): {k: st.get(k) for k in ("status", "failed_cases", "failures", "error",
+                                                        "exit_reason", "suites", "seconds")
+                               if st.get(k) not in (None, {}, [])} for st in doc.get("stages", [])}
+    drafts = doc.get("draft_requests", [])
+    ok = p.returncode == 0 and doc.get("status") == "passed"
+    out({"stage": "serve-mtp", "pass": ok, "exit": p.returncode, "status": doc.get("status"),
+         "stages": stages, "draft_totals": doc.get("draft_totals"), "error": doc.get("error"),
+         "draft_requests": drafts})
+    return ok
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--part", default="tests")
+    ap.add_argument("--model", default="/models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf")
+    ap.add_argument("--work", default=os.path.join(os.environ.get("HOME", "/work"), "mtp"))
+    ap.add_argument("--depths", default="0,16384,65536")
+    ap.add_argument("--gen", type=int, default=128)
+    ap.add_argument("--no-bench", action="store_true")
+    ap.add_argument("--no-serve", action="store_true")
+    args = ap.parse_args()
+    args.depths = [int(x) for x in args.depths.split(",")]
+    os.makedirs(args.work, exist_ok=True)
+    parts = ["tests", "measure"] if args.part == "all" else args.part.split(",")
+    status = {}
+    for part in parts:
+        status[part] = {"tests": part_tests, "measure": part_measure,
+                        "serve-mtp": part_serve_mtp}[part](args)
+    out({"stage": "mtp-done", "status": status})
+    return 0 if all(status.values()) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

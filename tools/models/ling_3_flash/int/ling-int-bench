@@ -1,0 +1,472 @@
+#!/usr/bin/python3
+"""Ling-3.0-Flash integration measurement suite. Prints one JSON object per line on stdout.
+
+usage: ling-int-bench [--stages env,peak,bench,small,maxbatch] [--model PATH]
+                      [--depths 0,4096,16384,65536] [--repetitions 3]
+                      [--hold SECONDS] [--bench-timeout SEC]
+                      [--fit-stores B,B,...] [--fit-repetitions N]
+
+Every bench stage except `fit` pins `--speculative off`, because Ling's default is MTP
+and these stages measure the autoregressive kernels. `fit` states the mode explicitly.
+
+Stages (each prints one JSON line {"stage": NAME, ...} when it finishes):
+  env       image, node, GPU and GTT, memory limits, model files, gufo diagnose text
+  peak      gfx1151_peak: measured compute and DRAM read/write/copy rates
+  bench     gufo bench -p 2048 -n 128 -d 0,4096,16384,65536 -r 3 -o jsonl
+            --op-profile (header, per-repetition samples and the in-binary
+            op_profile records of one eager decode run and one serialised
+            prefill chunk per depth, same fields as llama-bench jsonl);
+            prefill chunk 512
+  small     gufo bench -p 16,64,128,512 -d 16384,65536 -r 3 (small chunks at
+            depth, the persistent expanded-K/V and block-fold stress)
+  maxbatch  gufo bench --max-batch 2048 -p 2048 -n 128 -d 0,16384 -r 3
+            (WS13's 2048-token prefill chunk; the server keeps 512)
+  long      (separate image) gufo bench -p 2048 -n 128 -d 131072,194432,259968 -r 1
+            --max-batch 512 with the default 12 GiB expanded-K/V budget; the device
+            memory peak (GTT/VRAM sampled every 2 s) is in "device_memory"
+  long24    the same with --expanded-kv-bytes 25769803776 (24 GiB)
+  fit       production fit. For each expanded-K/V budget in --fit-stores (default
+            0, 4 GiB, 12 GiB; 0 disables the store) with MTP off, then the same with
+            --speculative mtp: gufo bench -p 2048 -n 128 -d 0,65536,131072,194432
+            -r --fit-repetitions (default 2) --max-batch 512 --text-file CORPUS -o
+            jsonl. The bench allocates the deepest depth + 2048 + 1 = 196,481 context
+            tokens, the same 96 expanded-K/V blocks and within 127 latent rows of
+            `gufo serve --context 196608 --sessions 1`. CORPUS is the real-text corpus
+            (project docs, then sources) so MTP acceptance is realistic; MTP-off runs
+            read the same tokens. One JSON line per (store, mtp) run, printed as each
+            run ends, carries every bench record, the mtp acceptance records, the
+            "[ling] ready" line, hipMemGetInfo and sysfs GTT use right after the model
+            load, the GTT/VRAM peak with its time, and UTC start/end timestamps (to
+            match Prometheus GTT peaks). Six runs, about 1.5-2 h in total.
+A last {"stage": "done"} line carries the stage status table. Progress and raw
+child stderr go to stderr with the prefix [ling-bench]. Only /work is written.
+Every stage is bit-for-bit the same code path as the server's, but timings are
+only meaningful on the real gfx1151 node.
+"""
+import argparse, ctypes, glob, json, os, platform, re, subprocess, sys, time
+
+GUFO = "gufo"
+PROF = "/usr/local/lib/gufo/prof.py"
+WORK = os.environ.get("HOME", "/work")
+
+
+def log(msg):
+    print("[ling-bench] " + msg, file=sys.stderr, flush=True)
+
+
+def emit(obj):
+    line = json.dumps(obj, separators=(",", ":"))
+    if len(line) > 900_000:
+        obj = {k: (v if not isinstance(v, str) else v[-20000:]) for k, v in obj.items()}
+        obj["truncated"] = True
+        line = json.dumps(obj, separators=(",", ":"))
+    print(line, flush=True)
+
+
+def read(path):
+    try:
+        return open(path).read().strip()
+    except OSError:
+        return None
+
+
+def gpu_info():
+    info = {"name": None, "gfx": None}
+    for p in sorted(glob.glob("/sys/class/kfd/kfd/topology/nodes/*/properties")):
+        props = dict(l.split(None, 1) for l in (read(p) or "").splitlines() if len(l.split(None, 1)) == 2)
+        v = int(props.get("gfx_target_version", "0"))
+        if v:
+            info["gfx"] = "gfx%d%x%x" % (v // 10000, (v // 100) % 100, v % 100)
+            break
+    try:
+        hip = ctypes.CDLL("libamdhip64.so.7")
+        buf = ctypes.create_string_buffer(256)
+        if hip.hipDeviceGetName(buf, 256, 0) == 0:
+            info["name"] = buf.value.decode()
+    except Exception as e:  # noqa
+        info["name_error"] = str(e)
+    for d in sorted(glob.glob("/sys/class/drm/card*/device")):
+        t, u = read(d + "/mem_info_gtt_total"), read(d + "/mem_info_gtt_used")
+        vt = read(d + "/mem_info_vram_total")
+        if t is not None:
+            info.update(gtt_total=int(t), gtt_used=int(u or 0), vram_total=int(vt or 0))
+            break
+    return info
+
+
+def run(cmd, timeout, env=None, **kw):
+    """Run a child; return (returncode, stdout, stderr_tail, seconds)."""
+    log("run: " + " ".join(cmd))
+    t0 = time.monotonic()
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         errors="replace", start_new_session=True, env=env, **kw)
+    err_lines = []
+
+    import threading
+
+    def pump():
+        for line in p.stderr:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+            err_lines.append(line)
+            if len(err_lines) > 400:
+                del err_lines[:100]
+
+    th = threading.Thread(target=pump, daemon=True)
+    th.start()
+    out, code = read_stdout(p, timeout)
+    th.join(5)
+    return code, out, "".join(err_lines)[-6000:], round(time.monotonic() - t0, 1)
+
+
+def read_stdout(p, timeout):
+    """Reads the child's stdout to EOF (stderr belongs to the caller's pump
+    thread: communicate() would read it too and split its lines) and returns
+    (stdout, exit code or "timeout")."""
+    import threading
+    expired = threading.Event()
+
+    def kill():
+        expired.set()
+        os.killpg(p.pid, 9)
+
+    timer = threading.Timer(timeout, kill)
+    timer.start()
+    try:
+        out = p.stdout.read()
+        p.wait()
+    finally:
+        timer.cancel()
+    return out, "timeout" if expired.is_set() else p.returncode
+
+
+def stage_env(a):
+    meminfo = {}
+    for line in (read("/proc/meminfo") or "").splitlines()[:3]:
+        k, _, v = line.partition(":")
+        meminfo[k] = v.strip()
+    model_files = []
+    m = re.match(r"(.*)-(\d+)-of-(\d+)\.gguf$", a.model)
+    paths = ([f"{m.group(1)}-{i:05d}-of-{m.group(3)}.gguf" for i in range(1, int(m.group(3)) + 1)]
+             if m else [a.model])
+    for p in paths:
+        model_files.append({"path": p, "bytes": os.path.getsize(p) if os.path.exists(p) else None})
+    code, out, err, _ = run([GUFO, "diagnose"], 120)
+    return {"image": os.environ.get("GUFO_IMAGE"), "host": platform.node(), "uid": os.getuid(),
+            "gpu": gpu_info(), "meminfo": meminfo,
+            "cgroup_memory_max": read("/sys/fs/cgroup/memory.max"),
+            "model_files": model_files, "diagnose_exit": code, "diagnose": out[-6000:],
+            "env": {k: os.environ[k] for k in ("HSA_OVERRIDE_GFX_VERSION", "HIP_VISIBLE_DEVICES",
+                                               "ROCR_VISIBLE_DEVICES") if k in os.environ}}
+
+
+PEAK_LINE = re.compile(r"^\s*(?P<name>.+?)\s{2,}(?P<value>[\d.]+)\s+(?P<unit>TOPS|TFLOPS|GB/s)\b")
+
+
+def stage_peak(a):
+    code, out, err, secs = run(["gfx1151_peak"], 600)
+    rows, section = [], ""
+    for line in out.splitlines():
+        if line.startswith("--"):
+            section = line.strip("- ").strip()
+            continue
+        mt = PEAK_LINE.match(line)
+        if mt:
+            rows.append({"section": section, "name": mt["name"].strip(), "value": float(mt["value"]),
+                         "unit": mt["unit"], "verified": "checksums verified" in line})
+    return {"exit": code, "seconds": secs, "rows": rows, "raw": out[-6000:], "stderr_tail": err[-1500:]}
+
+
+def stage_bench(a):
+    cmd = [GUFO, "bench", "-m", a.model, "-p", "2048", "-n", "128", "-d", a.depths,
+           "-r", str(a.repetitions), "-o", "jsonl", "--op-profile",
+           "--speculative", "off"]
+    code, out, err, secs = run(cmd, a.bench_timeout)
+    records = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                records.append(json.loads(line))
+            except ValueError:
+                records.append({"record": "unparsed", "text": line[:300]})
+    depth_fill = [l for l in err.splitlines() if l.startswith("[depth ")]
+    return {"command": cmd, "exit": code, "seconds": secs, "records": records,
+            "depth_fill_log": depth_fill, "stderr_tail": err[-2500:]}
+
+
+def bench_stage(a, args, repetitions=None):
+    cmd = [GUFO, "bench", "-m", a.model, *args, "-r", str(repetitions or a.repetitions), "-o", "jsonl",
+           "--speculative", "off"]
+    code, out, err, secs = run(cmd, a.bench_timeout)
+    records = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                records.append(json.loads(line))
+            except ValueError:
+                records.append({"record": "unparsed", "text": line[:300]})
+    depth_fill = [l for l in err.splitlines() if l.startswith("[depth ")]
+    return {"command": cmd, "exit": code, "seconds": secs, "records": records,
+            "depth_fill_log": depth_fill, "stderr_tail": err[-2500:]}
+
+
+def stage_small(a):
+    return bench_stage(a, ["-p", "16,64,128,512", "-d", "16384,65536", "--op-profile"])
+
+
+def stage_maxbatch(a):
+    return bench_stage(a, ["--max-batch", "2048", "-p", "2048", "-n", "128", "-d", "0,16384"])
+
+
+def gtt_used():
+    for d in sorted(glob.glob("/sys/class/drm/card*/device")):
+        u, v = read(d + "/mem_info_gtt_used"), read(d + "/mem_info_vram_used")
+        if u is not None:
+            return int(u), int(v or 0)
+    return None
+
+
+class MemorySampler:
+    """Polls the device's GTT/VRAM use while a child runs; keeps the peak."""
+
+    def __init__(self, period=2.0):
+        import threading
+        self.period, self.peak_gtt, self.peak_vram, self.samples = period, 0, 0, 0
+        self.peak_utc = None
+        self.base = gtt_used()
+        self.stop_flag = threading.Event()
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+
+    def loop(self):
+        while not self.stop_flag.wait(self.period):
+            m = gtt_used()
+            if m:
+                if m[0] > self.peak_gtt:
+                    self.peak_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                self.peak_gtt, self.peak_vram = max(self.peak_gtt, m[0]), max(self.peak_vram, m[1])
+                self.samples += 1
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop_flag.set()
+        self.thread.join(5)
+
+    def report(self):
+        gib = 1 << 30
+        return {"gtt_used_before_gib": round(self.base[0] / gib, 2) if self.base else None,
+                "peak_gtt_used_gib": round(self.peak_gtt / gib, 2),
+                "peak_vram_used_gib": round(self.peak_vram / gib, 2), "samples": self.samples,
+                "peak_gtt_utc": self.peak_utc}
+
+
+LONG_DEPTHS = "131072,194432,259968"
+
+
+def long_stage(a, extra, label):
+    """pp2048+tg128 at 128k/190k/254k (the model maximum is 262,144) with the in-binary
+    op_profile records; device memory is sampled over the whole run, whose last
+    phase is the deepest point."""
+    with MemorySampler() as mem:
+        body = bench_stage(a, ["-p", "2048", "-n", "128", "-d", LONG_DEPTHS, "--max-batch", "512", "--op-profile", *extra],
+                           repetitions=1)
+    body["expanded_kv"] = label
+    body["device_memory"] = mem.report()
+    body["note"] = ("peak_gtt_used includes the model (about 67.5 GiB), latent cache (1.97 GiB at "
+                    "262,144 rows), the expanded K/V store (up to its budget), scratch and state")
+    return body
+
+
+def stage_long(a):
+    return long_stage(a, [], "default 12 GiB")
+
+
+def stage_long24(a):
+    return long_stage(a, ["--expanded-kv-bytes", str(24 << 30)], "24 GiB")
+
+
+def stage_profile(a):
+    results = []
+    workloads = [("decode_d0", ["-n", "128", "-d", "0"]), ("pp2048_d0", ["-p", "2048", "-d", "0"])]
+    os.makedirs(os.path.join(WORK, "prof"), exist_ok=True)
+    for name, args in workloads:
+        out_dir = os.path.join(WORK, "prof", name)
+        cmd = ["python3", PROF, "run", "-o", out_dir, "--tag", name, "--stages", "ling",
+               "--top", "40", "--json", "--passes", "200", "--",
+               GUFO, "bench", "-m", a.model, *args, "-r", "1", "-o", "jsonl", "--speculative", "off"]
+        # AMD's HIP/HSA (hooked for rocprofiler) are used for profiling runs only.
+        env = {**os.environ, "LD_LIBRARY_PATH": "/opt/rocm-7.1.1/lib"}
+        code, out, err, secs = run(cmd, a.bench_timeout, env=env)
+        db = os.path.join(out_dir, name + "_results.db")
+        entry = {"name": name, "command": cmd, "exit": code, "seconds": secs,
+                 "db": db if os.path.exists(db) else None,
+                 "db_bytes": os.path.getsize(db) if os.path.exists(db) else None,
+                 "stderr_tail": err[-1500:]}
+        start = out.find("{")
+        if start >= 0:
+            try:
+                entry["summary"] = json.loads(out[start:])
+            except ValueError:
+                entry["summary_text"] = out[-8000:]
+        else:
+            entry["summary_text"] = out[-8000:]
+        results.append(entry)
+    return {"note": "rocprofv3 kernel trace: each profile covers weight upload, one untimed warmup "
+                    "repetition and one timed repetition of a gufo bench run. If a run fails here, the "
+                    "bench stage's stage_ms_per_rep (device-event time per block class) is the fallback "
+                    "breakdown.",
+            "runs": results}
+
+
+FIT_DEPTHS = "0,65536,131072,194432"
+FIT_CORPUS = ("/opt/gufo/corpus/prose.txt", "/opt/gufo/corpus/code.txt")
+
+
+def utc():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def hip_mem_info():
+    """hipMemGetInfo of device 0 from this process (device-wide free/total)."""
+    try:
+        hip = ctypes.CDLL("libamdhip64.so.7")
+        free, total = ctypes.c_size_t(0), ctypes.c_size_t(0)
+        code = hip.hipMemGetInfo(ctypes.byref(free), ctypes.byref(total))
+        if code != 0:
+            return {"error": "hipMemGetInfo returned %d" % code}
+        gib = 1 << 30
+        return {"free_gib": round(free.value / gib, 3), "total_gib": round(total.value / gib, 3),
+                "used_gib": round((total.value - free.value) / gib, 3)}
+    except Exception as e:  # noqa
+        return {"error": repr(e)}
+
+
+def fit_corpus():
+    """Docs then sources, written once to $TMPDIR; well over 196,481 tokens."""
+    path = os.path.join(os.environ.get("TMPDIR", os.path.join(WORK, "tmp")), "fit-corpus.txt")
+    if not os.path.exists(path):
+        parts = [open(p, encoding="utf-8").read() for p in FIT_CORPUS if os.path.exists(p)]
+        if not parts:
+            raise RuntimeError("no corpus under /opt/gufo/corpus")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n\n".join(parts))
+    return path
+
+
+def fit_run(a, store, mtp, corpus):
+    cmd = [GUFO, "bench", "-m", a.model, "-p", "2048", "-n", "128", "-d", FIT_DEPTHS,
+           "-r", str(a.fit_repetitions), "--max-batch", "512", "--expanded-kv-bytes", str(store),
+           "--text-file", corpus, "-o", "jsonl"]
+    cmd += ["--speculative", "mtp" if mtp else "off"]
+    log("run: " + " ".join(cmd))
+    import threading
+    body = {"expanded_kv_bytes": store, "expanded_kv_gib": round(store / (1 << 30), 2),
+            "speculative": "mtp" if mtp else "off", "command": cmd, "start_utc": utc(),
+            "note": ("after_load.hip_mem_info is hipMemGetInfo called from this driver process "
+                     "when the bench prints its ready line; whether it includes the bench's "
+                     "allocations depends on the driver. after_load.gtt_used_gib and "
+                     "device_memory (sysfs, sampled every 2 s) are device-wide.")}
+    t0 = time.monotonic()
+    after_load = {}
+    err_lines = []
+    with MemorySampler() as mem:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             errors="replace", start_new_session=True)
+
+        def pump():
+            for line in p.stderr:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+                err_lines.append(line)
+                if len(err_lines) > 600:
+                    del err_lines[:100]
+                if line.startswith("[ling] ready:") and not after_load:
+                    m = gtt_used()
+                    after_load.update(
+                        ready_line=line.strip(), utc=utc(), hip_mem_info=hip_mem_info(),
+                        gtt_used_gib=round(m[0] / (1 << 30), 3) if m else None,
+                        vram_used_gib=round(m[1] / (1 << 30), 3) if m else None)
+
+        th = threading.Thread(target=pump, daemon=True)
+        th.start()
+        out, code = read_stdout(p, a.bench_timeout)
+        th.join(5)
+    records = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                records.append(json.loads(line))
+            except ValueError:
+                records.append({"record": "unparsed", "text": line[:300]})
+    err = "".join(err_lines)
+    body.update(end_utc=utc(), exit=code, seconds=round(time.monotonic() - t0, 1),
+                after_load=after_load, device_memory=mem.report(), records=records,
+                acceptance=[r for r in records if r.get("record") == "mtp"],
+                depth_fill_log=[l for l in err.splitlines() if l.startswith("[depth ")],
+                stderr_tail=err[-2500:])
+    return body
+
+
+def stage_fit(a):
+    corpus = fit_corpus()
+    stores = [int(v) for v in a.fit_stores.split(",")]
+    runs = []
+    for mtp in (False, True):
+        for store in stores:
+            body = fit_run(a, store, mtp, corpus)
+            emit({"stage": "fit-run", **body})
+            runs.append({k: body[k] for k in ("expanded_kv_bytes", "speculative", "exit", "seconds",
+                                              "start_utc", "end_utc")})
+    return {"corpus": corpus, "depths": FIT_DEPTHS, "repetitions": a.fit_repetitions,
+            "runs": runs}
+
+
+STAGES = {"env": stage_env, "peak": stage_peak, "bench": stage_bench, "small": stage_small,
+          "maxbatch": stage_maxbatch, "long": stage_long, "long24": stage_long24,
+          "profile": stage_profile, "fit": stage_fit}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--stages", default=os.environ.get("LING_BENCH_STAGES", "env,peak,bench,small,maxbatch"))
+    ap.add_argument("--model", default=os.environ.get("MODEL",
+                    "/models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf"))
+    ap.add_argument("--depths", default="0,4096,16384,65536")
+    ap.add_argument("--repetitions", type=int, default=3)
+    ap.add_argument("--bench-timeout", type=float, default=4 * 3600)
+    ap.add_argument("--fit-stores", default="0,%d,%d" % (4 << 30, 12 << 30),
+                    help="fit stage: expanded-K/V budgets in bytes")
+    ap.add_argument("--fit-repetitions", type=int, default=2)
+    ap.add_argument("--hold", type=float, default=float(os.environ.get("LING_BENCH_HOLD", 0)),
+                    help="sleep this many seconds at the end so /work can be copied out")
+    a = ap.parse_args()
+    for v in ("XDG_CACHE_HOME", "TMPDIR"):
+        os.makedirs(os.environ.get(v, os.path.join(WORK, v.lower())), exist_ok=True)
+    status = {}
+    for name in a.stages.split(","):
+        name = name.strip()
+        if name not in STAGES:
+            raise SystemExit("unknown stage " + name)
+        log("stage " + name)
+        t0 = time.monotonic()
+        try:
+            body = STAGES[name](a)
+            codes = [body.get("exit")] + [r.get("exit") for r in body.get("runs", [])]
+            status[name] = "ok" if all(c in (None, 0) for c in codes) else "failed"
+        except Exception as e:  # noqa
+            body = {"error": repr(e)}
+            status[name] = "error"
+        emit({"stage": name, "seconds": round(time.monotonic() - t0, 1), **body})
+    emit({"stage": "done", "image": os.environ.get("GUFO_IMAGE"), "status": status})
+    if a.hold > 0:
+        log("holding %.0f s; copy /work/prof now" % a.hold)
+        time.sleep(a.hold)
+    return 0 if all(v == "ok" for v in status.values()) else 1
+
+
+sys.exit(main())

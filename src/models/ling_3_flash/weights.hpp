@@ -105,6 +105,9 @@ struct MtpWeights {
   TensorRef layer_output_norm;  ///< F32 [2560]
 };
 
+/// True when the GGUF carries the block-42 MTP weights (without binding them).
+[[nodiscard]] bool HasMtpBlock(const core::GgufReader& reader);
+
 struct ModelWeights {
   Config config;
   TensorRef token_embd;              ///< Q4_K [2560 -> 157184]

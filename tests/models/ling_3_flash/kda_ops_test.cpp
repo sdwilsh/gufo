@@ -663,6 +663,75 @@ bool SameBits(const std::vector<float>& a, const std::vector<float>& b) {
          std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
 }
 
+// Rollback points of a small verify chunk (MTP). The state and conv window
+// stored after row t of an n-row call must equal, bit for bit, the state after
+// t + 1 rows of an ordinary call, and the call itself must be unchanged.
+void TestCheckpoints() {
+  std::mt19937 rng(777);
+  const std::size_t sf = l::kKdaStateFloats;
+  const std::size_t cf = l::kKdaConvStateFloats;
+  const std::uint32_t kN = 6;
+  const auto s0 = Randn(rng, sf, 0.3F);
+  const auto c0 = Randn(rng, cf, 1.0F);
+  const auto in = MakeInputs(rng, kN);
+  Dev<float> dq(std::vector<float>(in.qkv.begin(), in.qkv.end()));
+  Dev<float> dg(in.g);
+  Dev<float> db(in.beta);
+  const auto run = [&](std::uint32_t rows, float* ckpt, std::vector<float>* out,
+                       std::vector<float>* state) {
+    Dev<float> ds(s0);
+    Dev<float> dout(static_cast<std::size_t>(kN) * kInner);
+    k::RecurrentSequence(ds.get(), dq.get(), kCh, dq.get() + kInner, kCh,
+                         dq.get() + 2 * kInner, kCh, dg.get(), db.get(),
+                         dout.get(), rows, nullptr, ckpt, sf);
+    Check(hipDeviceSynchronize(), "sync");
+    *out = dout.Get();
+    *state = ds.Get();
+  };
+  Dev<float> dckpt(sf * (kN - 1));
+  std::vector<float> o_plain, s_plain, o_ck, s_ck;
+  run(kN, nullptr, &o_plain, &s_plain);
+  run(kN, dckpt.get(), &o_ck, &s_ck);
+  ExactVerdict(SameBits(o_plain, o_ck) && SameBits(s_plain, s_ck),
+               "RecurrentSequence with rollback points == without");
+  const auto ck = dckpt.Get();
+  bool all = true;
+  for (std::uint32_t t = 0; t + 1 < kN; ++t) {
+    std::vector<float> o, st;
+    run(t + 1, nullptr, &o, &st);
+    all = all && std::memcmp(st.data(), ck.data() + t * sf, sf * 4) == 0;
+  }
+  ExactVerdict(all, "state rollback point t == state after t + 1 rows");
+
+  // Conv windows.
+  const auto proj = Randn(rng, static_cast<std::size_t>(kN) * kProj, 1.0F);
+  std::vector<float> w[3];
+  for (auto& x : w)
+    x = Randn(rng, kInner * 4, 0.5F);
+  Dev<float> dp(proj), dw0(w[0]), dw1(w[1]), dw2(w[2]);
+  Dev<float> dout(static_cast<std::size_t>(kN) * kCh);
+  Dev<float> dcc(cf * (kN - 1));
+  {
+    Dev<float> dcs(c0);
+    k::Conv3Checkpoint(dp.get(), dcs.get(), dcc.get(), cf, kN, nullptr);
+    k::Conv3Prefill(dp.get(), dw0.get(), dw1.get(), dw2.get(), dcs.get(),
+                    dout.get(), kN, nullptr);
+    Check(hipDeviceSynchronize(), "sync");
+  }
+  const auto cck = dcc.Get();
+  bool conv_ok = true;
+  for (std::uint32_t t = 0; t + 1 < kN; ++t) {
+    Dev<float> dcs(c0);
+    k::Conv3Prefill(dp.get(), dw0.get(), dw1.get(), dw2.get(), dcs.get(),
+                    dout.get(), t + 1, nullptr);
+    Check(hipDeviceSynchronize(), "sync");
+    const auto st = dcs.Get();
+    conv_ok =
+        conv_ok && std::memcmp(st.data(), cck.data() + t * cf, cf * 4) == 0;
+  }
+  ExactVerdict(conv_ok, "conv rollback point t == window after t + 1 rows");
+}
+
 void TestFusedDecode() {
   std::mt19937 rng(777);
   const auto wq = Randn(rng, kInner * 4, 0.5F);
@@ -934,6 +1003,7 @@ int main(int argc, char** argv) {
     TestHandoff();
     TestOutputNormGate();
     TestSnapshot();
+    TestCheckpoints();
     TestFusedDecode();
     if (bench) {
       BenchStages();

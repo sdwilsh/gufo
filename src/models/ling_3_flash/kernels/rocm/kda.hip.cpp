@@ -105,6 +105,34 @@ __global__ void ConvStateKernel(const float* __restrict__ proj,
   }
 }
 
+// Rollback checkpoints of the conv window for a small verify chunk: after
+// token t (t < n_tokens - 1) the window holds raw tokens t - 2..t, written to
+// `ckpt + t * ckpt_stride` in the live state's layout. Reads the state before
+// ConvStateKernel advances it (same stream, launched first).
+__global__ void ConvCheckpointKernel(const float* __restrict__ proj,
+                                     const float* __restrict__ state,
+                                     float* __restrict__ ckpt,
+                                     std::size_t ckpt_stride,
+                                     std::uint32_t n_tokens) {
+  const std::uint32_t gc = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gc >= kConvChannels) {
+    return;
+  }
+  const std::uint32_t stream = gc / kInner;
+  const std::uint32_t c = gc % kInner;
+  const float* st = state + static_cast<std::size_t>(stream) * 3 * kInner + c;
+  const float* col = proj + stream * kInner + c;
+  float* out = ckpt + static_cast<std::size_t>(stream) * 3 * kInner + c;
+  for (std::uint32_t t = 0; t + 1 < n_tokens; ++t) {
+    for (int p = 0; p < 3; ++p) {
+      const int idx = static_cast<int>(t) + 1 - 3 + p;
+      out[t * ckpt_stride + static_cast<std::size_t>(p) * kInner] =
+          idx >= 0 ? col[static_cast<std::size_t>(idx) * kKdaProjRows]
+                   : st[static_cast<std::size_t>(idx + 3) * kInner];
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Gate / beta prep, L2 norm, output norm-gate.
 // ---------------------------------------------------------------------------
@@ -327,8 +355,14 @@ struct RecurrentArgs {
   const float* beta;
   float* o;
   std::uint32_t ld_q, ld_k, ld_v, ld_g, ld_beta, ld_o;
+  /// Optional rollback checkpoints: when not null, the state after token t
+  /// (t < n_tokens - 1) is copied to `ckpt + t * ckpt_stride` (same [h][i][j]
+  /// layout as the live state). Pure extra stores: the arithmetic is the same.
+  float* ckpt;
+  std::size_t ckpt_stride;
 };
 
+template<bool kCheckpoint>
 __launch_bounds__(kTile) __global__
     void RecurrentKernel(float* __restrict__ state, RecurrentArgs a,
                          std::uint32_t n_tokens) {
@@ -414,6 +448,16 @@ __launch_bounds__(kTile) __global__
     }
     a.o[static_cast<std::size_t>(t) * a.ld_o + h * kD + j] =
         ((o0 + o1) + (o2 + o3)) * scale;
+    if constexpr (kCheckpoint) {
+      if (more) {
+        float* C = a.ckpt + static_cast<std::size_t>(t) * a.ckpt_stride +
+                   static_cast<std::size_t>(h) * kD * kD + j;
+#pragma unroll
+        for (std::uint32_t i = 0; i < kD; ++i) {
+          C[static_cast<std::size_t>(i) * kD] = col[i];
+        }
+      }
+    }
     if (more) {
       s_q[buf ^ 1][lane] = rq;
       s_k[buf ^ 1][lane] = rk;
@@ -701,6 +745,16 @@ void Conv3Prefill(const float* proj, const float* w_q, const float* w_k,
                                                            n_tokens);
 }
 
+void Conv3Checkpoint(const float* proj, const float* conv_state, float* ckpt,
+                     std::size_t ckpt_stride, std::uint32_t n_tokens,
+                     hipStream_t stream) {
+  if (n_tokens < 2) {
+    return;
+  }
+  ConvCheckpointKernel<<<kConvChannels / 256, 256, 0, stream>>>(
+      proj, conv_state, ckpt, ckpt_stride, n_tokens);
+}
+
 void Conv3Decode(const float* proj, const float* w_q, const float* w_k,
                  const float* w_v, float* conv_state, float* out,
                  hipStream_t stream) {
@@ -730,22 +784,29 @@ void L2NormHeads(float* x, std::uint32_t ld, std::uint32_t n_rows,
 void RecurrentDecode(float* state, const float* q, const float* k,
                      const float* v, const float* g, const float* beta,
                      float* o, hipStream_t stream) {
-  const RecurrentArgs a{q,      k,      v,      g,      beta,   o,
-                        kInner, kInner, kInner, kInner, kHeads, kInner};
-  RecurrentKernel<<<dim3(kD / kTile, kHeads), kTile, 0, stream>>>(state, a, 1);
+  const RecurrentArgs a{q,      k,      v,      g,      beta,   o,       kInner,
+                        kInner, kInner, kInner, kHeads, kInner, nullptr, 0};
+  RecurrentKernel<false>
+      <<<dim3(kD / kTile, kHeads), kTile, 0, stream>>>(state, a, 1);
 }
 
 void RecurrentSequence(float* state, const float* q, std::uint32_t ld_q,
                        const float* k, std::uint32_t ld_k, const float* v,
                        std::uint32_t ld_v, const float* g, const float* beta,
-                       float* o, std::uint32_t n_tokens, hipStream_t stream) {
+                       float* o, std::uint32_t n_tokens, hipStream_t stream,
+                       float* ckpt, std::size_t ckpt_stride) {
   if (n_tokens == 0) {
     return;
   }
-  const RecurrentArgs a{q,    k,    v,    g,      beta,   o,
-                        ld_q, ld_k, ld_v, kInner, kHeads, kInner};
-  RecurrentKernel<<<dim3(kD / kTile, kHeads), kTile, 0, stream>>>(state, a,
-                                                                  n_tokens);
+  const RecurrentArgs a{q,    k,    v,      g,      beta,   o,    ld_q,
+                        ld_k, ld_v, kInner, kHeads, kInner, ckpt, ckpt_stride};
+  if (ckpt != nullptr) {
+    RecurrentKernel<true>
+        <<<dim3(kD / kTile, kHeads), kTile, 0, stream>>>(state, a, n_tokens);
+  } else {
+    RecurrentKernel<false>
+        <<<dim3(kD / kTile, kHeads), kTile, 0, stream>>>(state, a, n_tokens);
+  }
 }
 
 void PrefillSequence(float* state, const float* q, std::uint32_t ld_q,
@@ -755,8 +816,8 @@ void PrefillSequence(float* state, const float* q, std::uint32_t ld_q,
   if (n_tokens == 0) {
     return;
   }
-  const RecurrentArgs a{q,    k,    v,    g,      beta,   o,
-                        ld_q, ld_k, ld_v, kInner, kHeads, kInner};
+  const RecurrentArgs a{q,    k,    v,      g,      beta,   o,       ld_q,
+                        ld_k, ld_v, kInner, kHeads, kInner, nullptr, 0};
   PrefillKernel<<<dim3(kD / kPfCols, kHeads), kPfThreads, 0, stream>>>(
       state, a, n_tokens);
 }
@@ -790,6 +851,11 @@ void OutputNormGateQuant(const float* o, const float* proj,
   const dense::QuantView v = dense::QuantLayout(quant, n_tokens, kInner);
   OutputNormGateQuantKernel<<<dim3(kHeads / 4, n_tokens), 128, 0, stream>>>(
       o, proj, ssm_norm, out, v.q, v.q2, v.d);
+}
+
+void CopyFloats(const float* src, float* dst, std::size_t floats,
+                hipStream_t stream) {
+  Copy(src, dst, floats, stream);
 }
 
 void SnapshotState(const float* kda_state, const float* kda_conv,

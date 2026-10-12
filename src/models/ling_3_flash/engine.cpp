@@ -1,14 +1,17 @@
 #include "src/models/ling_3_flash/engine.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/device_model.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/executor.hpp"
+#include "src/models/ling_3_flash/mtp_sampling.hpp"
 #include "src/models/ling_3_flash/weights.hpp"
 
 namespace gufo::models::ling_3_flash {
@@ -67,7 +70,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
                model_path.c_str(), SecondsSince(begin));
   m->device_ =
       rocm::DeviceModel::Upload(*m->weights_, *m->reader_, options.layer_first,
-                                options.layer_limit, error_msg);
+                                options.layer_limit, error_msg, options.mtp);
   if (!m->device_) {
     return nullptr;
   }
@@ -76,6 +79,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   exec.expanded_kv_bytes = options.expanded_kv_bytes;
   exec.max_context = options.max_context;
   exec.graphs = options.graphs;
+  exec.mtp = options.mtp;
   m->executor_ = rocm::Executor::Create(*m->device_, exec, error_msg);
   if (!m->executor_) {
     return nullptr;
@@ -138,11 +142,19 @@ std::size_t Model::ResidentBytes() const noexcept {
 std::size_t Model::ScratchBytes() const noexcept {
   return executor_->scratch_bytes();
 }
-std::size_t Model::SessionBytes(std::uint32_t context) noexcept {
-  return ling_3_flash::SessionBytes(context).Total();
+std::size_t Model::SessionBytes(std::uint32_t context, bool mtp) noexcept {
+  return ling_3_flash::SessionBytes(context, mtp).Total();
 }
 std::uint64_t Model::GraphReplays() const noexcept {
   return executor_->graph_replays();
+}
+
+std::uint64_t Model::CaptureInvalidations() const noexcept {
+  return executor_->capture_invalidations();
+}
+
+void Model::BreakCapturesForTest(std::uint32_t count) noexcept {
+  executor_->BreakCapturesForTest(count);
 }
 
 double Model::UploadSeconds() const noexcept {
@@ -157,6 +169,14 @@ Session::Session(std::shared_ptr<Model> model,
 
 Session::~Session() = default;
 
+std::uint32_t Session::ExpandedRowsValid() const noexcept {
+  return session_->expanded_rows_valid();
+}
+
+std::uint32_t Session::ExpandedStoreRows() const noexcept {
+  return session_->expanded_store_rows();
+}
+
 std::uint32_t Session::Position() const noexcept {
   return session_->position();
 }
@@ -166,9 +186,25 @@ std::size_t Session::AllocatedBytes() const noexcept {
 }
 
 void Session::Reset() {
+  Invalidate();
+  valid_ = session_->Reset();
+  reset_pending_ = !valid_;
+}
+
+void Session::Invalidate() noexcept {
   tokens_.clear();
   logits_.clear();
-  valid_ = session_->Reset();
+  pending_ = {};
+  // Controller state (successes, retry backoff, measured costs) must not leak
+  // into the next request, or seeded sampled replay would depend on history.
+  ResetDraftPolicy();
+  draft_position_ = 0;
+  // Host-side position and derived state only: position 0 drops every
+  // expanded K/V watermark, and the MTP rows no longer match any tokens.
+  session_->set_position(0);
+  session_->set_mtp_valid(false);
+  valid_ = true;
+  reset_pending_ = true;
 }
 
 std::int32_t Session::Argmax() const noexcept {
@@ -213,6 +249,17 @@ bool Session::Feed(std::span<const std::int32_t> tokens,
                    const FeedOptions& options, std::string* error_msg) {
   if (!valid_) {
     AssignError(error_msg, "session is invalid after an earlier failure");
+    return false;
+  }
+  if (reset_pending_) {
+    if (!session_->Reset(error_msg)) {
+      valid_ = false;
+      return false;
+    }
+    reset_pending_ = false;
+  }
+  if (pending_.active) {
+    AssignError(error_msg, "a verify step is waiting for Rollback()");
     return false;
   }
   if (tokens.empty()) {
@@ -309,20 +356,26 @@ bool Session::Feed(std::span<const std::int32_t> tokens,
 }
 
 std::size_t Session::SnapshotBytes() const noexcept {
-  return valid_ && !tokens_.empty() && !logits_.empty()
-             ? SnapshotPayloadBytes(static_cast<std::uint32_t>(tokens_.size()))
+  return valid_ && !pending_.active && !tokens_.empty() && !logits_.empty()
+             ? SnapshotPayloadBytes(static_cast<std::uint32_t>(tokens_.size()),
+                                    session_->mtp_enabled())
              : 0;
 }
 
 std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
     std::string* error_msg) const {
-  if (!valid_ || tokens_.empty() || logits_.size() != kVocab ||
-      tokens_.size() != session_->position()) {
+  if (!valid_ || pending_.active || tokens_.empty() ||
+      logits_.size() != kVocab || tokens_.size() != session_->position()) {
     AssignError(error_msg, "snapshot needs a valid, non-empty session");
     return nullptr;
   }
   const auto position = static_cast<std::uint32_t>(tokens_.size());
-  const SnapshotSections at = SnapshotLayout(position);
+  const bool mtp = session_->mtp_enabled() && session_->mtp_valid();
+  if (session_->mtp_enabled() && !mtp) {
+    AssignError(error_msg, "the session's MTP state is not valid");
+    return nullptr;
+  }
+  const SnapshotSections at = SnapshotLayout(position, mtp);
   std::unique_ptr<SessionSnapshot> s(new SessionSnapshot(position, at.total));
   std::uint8_t* base = s->data_.get();
   const SnapshotHeader header{
@@ -336,7 +389,7 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
       .kda_layers = kKdaLayers,
       .mla_layers = kMlaLayers,
       .mla_width = kMlaCacheWidth,
-      .reserved = 0,
+      .reserved = mtp ? kSnapshotHasMtp : 0U,
       .kda_state_floats = kKdaStateFloats,
       .kda_conv_floats = kKdaConvStateFloats,
       .payload_bytes = at.total};
@@ -344,11 +397,14 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
   std::memcpy(base + at.tokens, tokens_.data(),
               tokens_.size() * sizeof(std::int32_t));
   std::memcpy(base + at.logits, logits_.data(), logits_.size() * sizeof(float));
-  if (!model_->executor_->SaveSnapshot(*session_, position,
-                                       {.kda_state = base + at.kda_state,
-                                        .kda_conv = base + at.kda_conv,
-                                        .mla = base + at.mla},
-                                       error_msg)) {
+  if (!model_->executor_->SaveSnapshot(
+          *session_, position,
+          {.kda_state = base + at.kda_state,
+           .kda_conv = base + at.kda_conv,
+           .mla = base + at.mla,
+           .mtp_h = mtp ? base + at.mtp_h : nullptr,
+           .mtp = mtp ? base + at.mtp : nullptr},
+          error_msg)) {
     return nullptr;
   }
   return s;
@@ -373,17 +429,18 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
     AssignError(error_msg, "session snapshot format is not supported");
     return false;
   }
+  const bool has_mtp = (h.reserved & kSnapshotHasMtp) != 0;
   if (h.vocab != kVocab || h.kda_layers != kKdaLayers ||
       h.mla_layers != kMlaLayers || h.mla_width != kMlaCacheWidth ||
       h.kda_state_floats != kKdaStateFloats ||
       h.kda_conv_floats != kKdaConvStateFloats || h.position == 0 ||
-      h.position > session_->capacity() ||
-      h.payload_bytes != SnapshotPayloadBytes(h.position) ||
+      h.position > session_->capacity() || (h.reserved & ~kSnapshotHasMtp) ||
+      h.payload_bytes != SnapshotPayloadBytes(h.position, has_mtp) ||
       payload.size() != h.payload_bytes) {
     AssignError(error_msg, "session snapshot does not fit this session");
     return false;
   }
-  const SnapshotSections at = SnapshotLayout(h.position);
+  const SnapshotSections at = SnapshotLayout(h.position, has_mtp);
   const std::uint8_t* base = payload.data();
   std::vector<std::int32_t> tokens(h.position);
   std::memcpy(tokens.data(), base + at.tokens,
@@ -401,17 +458,22 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
     AssignError(error_msg, "session snapshot holds invalid tokens or logits");
     return false;
   }
-  if (!model_->executor_->RestoreSnapshot(*session_, h.position,
-                                          {.kda_state = base + at.kda_state,
-                                           .kda_conv = base + at.kda_conv,
-                                           .mla = base + at.mla},
-                                          error_msg)) {
+  if (!model_->executor_->RestoreSnapshot(
+          *session_, h.position,
+          {.kda_state = base + at.kda_state,
+           .kda_conv = base + at.kda_conv,
+           .mla = base + at.mla,
+           .mtp_h = has_mtp ? base + at.mtp_h : nullptr,
+           .mtp = has_mtp ? base + at.mtp : nullptr},
+          error_msg)) {
     valid_ = false;
     return false;
   }
+  pending_ = {};
   tokens_ = std::move(tokens);
   logits_ = std::move(logits);
   valid_ = true;
+  reset_pending_ = false;  // every recurrent state was overwritten
   return true;
 }
 
@@ -432,6 +494,315 @@ bool Session::ReadMlaCache(std::uint32_t il, std::uint32_t rows,
                            std::vector<std::uint16_t>* out,
                            std::string* error_msg) const {
   return model_->executor_->ReadMlaCache(*session_, il, rows, out, error_msg);
+}
+
+// ---- MTP -------------------------------------------------------------------
+
+bool Session::MtpActive() const noexcept {
+  return model_->HasMtp() && session_->mtp_enabled() && session_->mtp_valid() &&
+         valid_ && !tokens_.empty();
+}
+
+void Session::ResetDraftPolicy() noexcept {
+  draft_length_.Reset();
+}
+
+void Session::SetMaxDrafts(std::uint32_t drafts) noexcept {
+  draft_length_ = MtpLengthController(drafts);
+}
+
+bool Session::Verify(std::span<const std::int32_t> tokens,
+                     std::span<std::int32_t> argmax, std::vector<float>* rows,
+                     std::string* error_msg) {
+  const auto n = static_cast<std::uint32_t>(tokens.size());
+  if (!valid_ || pending_.active || tokens_.empty() || !MtpActive()) {
+    AssignError(error_msg, "verify needs a valid session with MTP state");
+    return false;
+  }
+  if (n < 2 || n > kMaxVerifyTokens || argmax.size() < n ||
+      session_->position() + n > session_->capacity()) {
+    AssignError(error_msg,
+                "verify chunk is outside 2..8 tokens or the context");
+    return false;
+  }
+  rocm::ForwardRequest request;
+  request.tokens = tokens;
+  request.rollback = true;
+  request.logits_from = 0;
+  request.argmax = argmax.first(n);
+  if (rows != nullptr) {
+    rows->resize(std::size_t{n} * kVocab);
+    request.logits = *rows;
+  }
+  const std::uint32_t first_pos = session_->position();
+  if (!model_->executor_->Forward(*session_, request, error_msg)) {
+    valid_ = false;
+    logits_.clear();
+    return false;
+  }
+  tokens_.insert(tokens_.end(), tokens.begin(), tokens.end());
+  logits_.clear();
+  pending_ = {.active = true,
+              .first_pos = first_pos,
+              .n = n,
+              .have_rows = rows != nullptr};
+  if (rows != nullptr && rows != &verify_rows_) {
+    verify_rows_ = *rows;
+  }
+  return true;
+}
+
+bool Session::Rollback(std::uint32_t keep, std::string* error_msg) {
+  if (!pending_.active || keep == 0 || keep > pending_.n) {
+    AssignError(error_msg, "rollback needs a pending verify and 1..n rows");
+    return false;
+  }
+  const PendingVerify v = pending_;
+  if (!model_->executor_->MtpRollback(*session_, v.first_pos, v.n, keep,
+                                      error_msg)) {
+    valid_ = false;
+    return false;
+  }
+  tokens_.resize(v.first_pos + keep);
+  logits_.resize(kVocab);
+  if (v.have_rows) {
+    std::copy_n(verify_rows_.begin() + std::size_t{keep - 1} * kVocab, kVocab,
+                logits_.begin());
+  } else if (!model_->executor_->ReadLogitRow(keep - 1, logits_, error_msg)) {
+    valid_ = false;
+    logits_.clear();
+    return false;
+  }
+  pending_ = {};
+  return true;
+}
+
+bool Session::Draft(std::int32_t token, bool chain, std::span<float> logits,
+                    std::int32_t* argmax, std::string* error_msg) {
+  if (!MtpActive() || pending_.active || (chain && draft_position_ == 0)) {
+    AssignError(error_msg, "draft needs a valid session with MTP state");
+    return false;
+  }
+  rocm::DraftRequest request;
+  request.token = token;
+  request.chain = chain;
+  request.position = chain ? draft_position_ + 1 : session_->position() - 1;
+  request.logits = logits;
+  if (!model_->executor_->MtpDraft(*session_, request, argmax, error_msg)) {
+    return false;
+  }
+  draft_position_ = request.position;
+  return true;
+}
+
+bool Session::DraftWithHidden(std::int32_t token, std::span<const float> h,
+                              std::uint32_t position, std::span<float> logits,
+                              std::span<float> h_next, std::int32_t* argmax,
+                              std::string* error_msg) {
+  rocm::DraftRequest request;
+  request.token = token;
+  request.position = position;
+  request.logits = logits;
+  request.h_host = h;
+  request.h_out = h_next;
+  return model_->executor_->MtpDraft(*session_, request, argmax, error_msg);
+}
+
+bool Session::ReadMtpCache(std::uint32_t rows, std::vector<std::uint16_t>* out,
+                           std::string* error_msg) const {
+  return model_->executor_->ReadMtpCache(*session_, rows, out, error_msg);
+}
+
+bool Session::ReadMtpHidden(std::vector<float>* out,
+                            std::string* error_msg) const {
+  return model_->executor_->ReadMtpHidden(*session_, out, error_msg);
+}
+
+bool Session::DecodeStep(std::size_t max_tokens,
+                         sampling::SamplerState& sampler, DecodeResult* result,
+                         std::string* error_msg, bool stop_at_eos) {
+  if (!valid_ || pending_.active) {
+    AssignError(error_msg,
+                "session needs a successful Sync after a failed operation");
+    return false;
+  }
+  if (result == nullptr || max_tokens == 0 || tokens_.empty() ||
+      logits_.size() != kVocab) {
+    AssignError(
+        error_msg,
+        "decode needs an output, a positive budget and a synced prompt");
+    return false;
+  }
+  *result = {};
+  const auto is_stop = [&](std::int32_t token) {
+    return stop_at_eos && model_->IsStopToken(token);
+  };
+  const std::size_t room = session_->capacity() - session_->position();
+  if (room == 0) {
+    result->stop = true;
+    return true;
+  }
+  const auto begin = std::chrono::steady_clock::now();
+  const auto cap = static_cast<std::uint32_t>(
+      std::min<std::size_t>({max_tokens, room, kMaxVerifyTokens}));
+  const bool sampled = sampler.config().uses_random_sampling();
+  const bool greedy_fast = sampler.config().temperature == 0.0F &&
+                           sampler.config().can_use_unmodified_argmax();
+  const auto anchor = static_cast<std::int32_t>(sampler.Sample(logits_));
+  if (is_stop(anchor)) {
+    result->stop = true;
+    return true;
+  }
+  std::uint32_t drafts =
+      MtpActive() && cap > 1
+          ? draft_length_.Choose(cap - 1, !sampled, session_->position())
+          : 0;
+  if (hooks_.fixed_drafts != 0 && cap > 1 && MtpActive()) {
+    drafts = std::min(hooks_.fixed_drafts, cap - 1);
+  }
+  const auto elapsed_ms = [&] {
+    return std::chrono::duration<float, std::milli>(
+               std::chrono::steady_clock::now() - begin)
+        .count();
+  };
+  if (drafts == 0) {
+    if (!Evaluate(anchor, error_msg)) {
+      return false;
+    }
+    sampler.Accept(static_cast<sampling::TokenId>(anchor));
+    result->tokens = {anchor};
+    if (MtpActive()) {
+      draft_length_.ObservePlainToken();
+      if (!sampled) {
+        draft_length_.ObserveCost(0, elapsed_ms());
+      }
+    }
+    return true;
+  }
+
+  // Draft chain. A sampled proposal uses its own stream, seeded from the
+  // request's RNG, so target verification keeps independent draws.
+  std::uint64_t draft_rng =
+      sampled ? sampling::NextRandom(sampler.mutable_rng_state()) : 0;
+  std::optional<sampling::SamplerState> draft_sampler;
+  if (sampled) {
+    draft_sampler = sampler.WithoutConstraint();
+    draft_sampler->Accept(static_cast<sampling::TokenId>(anchor));
+  }
+  std::vector<std::int32_t> chain{anchor};
+  std::vector<MtpProposal> proposals;
+  if (sampled && draft_logits_.size() != kVocab) {
+    draft_logits_.resize(kVocab);
+  }
+  for (std::uint32_t j = 0; j < drafts; ++j) {
+    std::int32_t index = -1;
+    if (hooks_.source && !sampled) {
+      chain.push_back(hooks_.source(chain));
+      continue;
+    }
+    if (!Draft(chain.back(), j > 0,
+               sampled ? std::span<float>(draft_logits_) : std::span<float>{},
+               &index, error_msg)) {
+      return false;  // the trunk state is untouched by draft steps
+    }
+    if (sampled) {
+      proposals.push_back(SampleMtpProposal(TopCandidates(draft_logits_),
+                                            *draft_sampler, &draft_rng));
+      index = static_cast<std::int32_t>(proposals.back().token);
+      draft_sampler->Accept(proposals.back().token);
+    }
+    chain.push_back(index);
+  }
+
+  // Verify [anchor, drafts] as one small-batch chunk.
+  const auto k = static_cast<std::uint32_t>(chain.size());
+  std::array<std::int32_t, kMaxVerifyTokens> argmax{};
+  std::vector<float>* rows = greedy_fast ? nullptr : &verify_rows_;
+  if (!Verify(chain, argmax, rows, error_msg)) {
+    return false;
+  }
+  const auto row_logits = [&](std::uint32_t row) {
+    return std::span<const float>(verify_rows_)
+        .subspan(std::size_t{row} * kVocab, kVocab);
+  };
+  sampler.Accept(static_cast<sampling::TokenId>(anchor));
+  std::uint32_t keep = 1;
+  std::optional<std::int32_t> correction;
+  // Sampling can throw between Verify() and Rollback(); the rejected rows
+  // would otherwise stay in the trunk state of a session that still looks
+  // valid, so the session is invalidated before the exception propagates.
+  try {
+    if (hooks_.after_verify) {
+      hooks_.after_verify();
+    }
+    while (keep < k) {
+      if (greedy_fast) {
+        const std::int32_t predicted = argmax[keep - 1];
+        if (predicted < 0) {
+          AssignError(error_msg,
+                      "logit distribution contains no finite values");
+          valid_ = false;
+          return false;
+        }
+        if (is_stop(predicted)) {
+          result->stop = true;
+          break;
+        }
+        if (predicted != chain[keep]) {
+          break;
+        }
+        sampler.Accept(static_cast<sampling::TokenId>(predicted));
+        ++keep;
+        continue;
+      }
+      if (sampled) {
+        const auto verified = VerifyMtpProposal(row_logits(keep - 1),
+                                                proposals[keep - 1], sampler);
+        const auto token = static_cast<std::int32_t>(verified.token);
+        if (is_stop(token)) {
+          result->stop = true;
+          break;
+        }
+        if (!verified.accepted) {
+          correction = token;
+          break;
+        }
+        sampler.Accept(static_cast<sampling::TokenId>(token));
+        ++keep;
+        continue;
+      }
+      const auto decision =
+          VerifyDraft(row_logits(keep - 1), chain[keep], sampler, is_stop);
+      if (decision != DraftDecision::kAccept) {
+        result->stop = decision == DraftDecision::kStop;
+        break;
+      }
+      ++keep;
+    }
+  } catch (...) {
+    pending_ = {};
+    valid_ = false;
+    throw;
+  }
+  if (!Rollback(keep, error_msg)) {
+    return false;
+  }
+  result->tokens.assign(chain.begin(), chain.begin() + keep);
+  ++stats_.cycles;
+  stats_.drafted += k - 1;
+  stats_.accepted += keep - 1;
+  // A target stop ends the request; it does not classify the remaining
+  // proposals as failed predictions.
+  draft_length_.Observe(keep - 1, result->stop ? keep - 1 : k - 1, !sampled,
+                        session_->position());
+  if (!sampled) {
+    draft_length_.ObserveCost(k - 1, elapsed_ms());
+  }
+  if (correction) {
+    // The residual draw is the next cycle's anchor; resampling would bias it.
+    sampler.DeferSample(static_cast<sampling::TokenId>(*correction));
+  }
+  return true;
 }
 
 // ---- SessionSnapshot -------------------------------------------------------
