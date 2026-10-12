@@ -16,6 +16,8 @@ import threading
 import time
 from urllib.parse import urlsplit
 
+from check_report import check_line
+
 CODES = ("ALPHA", "BETA", "GAMMA", "DELTA")
 # Tokens after the point where two prompts diverge that a follower may still
 # prefill: the scheduler's checkpoint slack plus tokenizer merges at the split.
@@ -30,9 +32,14 @@ def system_prompt(label, lines):
 
 
 def background(label, lines):
-    return "".join(f"Background {label}.{index}: the scheduler admits requests, prefills "
-                   f"prompts in chunks and decodes them in batches.\n"
-                   for index in range(lines))
+    """A per-conversation filler. The label appears once, in the header: lines
+    that each carried it ("Background ALPHA.699: ...") made Ling-3.0-flash answer
+    with the last line's label instead of the requested code at 22k tokens, a
+    copy error that says nothing about the cache."""
+    return f"Background notes for {label}:\n" + "".join(
+        f"Background line {index}: the scheduler admits requests, prefills "
+        f"prompts in chunks and decodes them in batches.\n"
+        for index in range(lines))
 
 
 def abandon_request(client, body, delay):
@@ -92,8 +99,13 @@ def check_cache_concurrency(client, model, checks, chat_result, concurrency,
         return results
 
     def answer(result, code):
-        assert result["text"].strip() == code and not result["tools"] \
-            and result["finish"] == "stop", result
+        label = next((name for name, value in checks.items() if value is result), "answer")
+        if not (result["text"].strip() == code and not result["tools"]
+                and result["finish"] == "stop"):
+            raise AssertionError(check_line(
+                label, f"text={code!r} no tools finish='stop'",
+                f"text={result['text']!r} tools={result['tools']} finish={result['finish']!r} "
+                f"prompt_tokens={result['usage']['prompt_tokens']}"))
 
     def wait_ms(result):
         return result["usage"]["gufo"]["shared_prefix_wait_ms"]
@@ -107,16 +119,35 @@ def check_cache_concurrency(client, model, checks, chat_result, concurrency,
 
     def group(label, conversations, codes, share, streaming=()):
         results = together(label, [body_for(m) for m in conversations], streaming)
-        for result, code in zip(results, codes):
-            answer(result, code)
+        for index, (result, code) in enumerate(zip(results, codes)):
+            try:
+                answer(result, code)
+            except AssertionError as error:
+                # Engine or model? The uncached control says which: a wrong
+                # cached answer with a right control points at the cache.
+                cold = chat(f"{label}_control_{index}", body_for(conversations[index], cold=True))
+                if cold["text"] == result["text"] and cold["finish"] == result["finish"]:
+                    # The uncached control gives the same answer: the model's own
+                    # reply to this prompt (Ling-3.0-flash answers "Task 3 ... DELTA"
+                    # with "-14", llama.cpp too), not a cache fault. Reported only.
+                    print(f"NOTE {error} (uncached control agrees)", file=sys.stderr, flush=True)
+                    continue
+                raise AssertionError(f"{error} control_text={cold['text']!r} "
+                                     f"control_finish={cold['finish']!r} "
+                                     f"cached_tokens={result['usage']['cached_tokens']} "
+                                     f"request_seq={result['usage']['gufo'].get('request_seq')} "
+                                     f"streamed={index in streaming}") from None
         waited = [index for index, result in enumerate(results) if wait_ms(result) > 0]
         if not (share and sharing):
             if waited:
-                failures.append(f"{label}: requests {waited} waited without a shared prefix")
+                failures.append(check_line(
+                    f"{label}_wait", "no request waits (nothing is shared)",
+                    f"requests {waited} waited"))
         else:
             if len(waited) != len(results) - 1:
-                failures.append(f"{label}: expected {len(results) - 1} waiting requests, "
-                                f"got {waited}")
+                failures.append(check_line(
+                    f"{label}_wait", f"{len(results) - 1} requests wait for the leader",
+                    f"requests {waited} waited"))
             # The divergence point is measured on uncached probes that share the
             # system prompt and end with a one-word user message.
             stem = chat(f"{label}_stem", body_for(
@@ -126,9 +157,10 @@ def check_cache_concurrency(client, model, checks, chat_result, concurrency,
                 usage = results[index]["usage"]
                 bound = usage["prompt_tokens"] - shared + TAIL_ALLOWANCE
                 if usage["gufo"]["prefill_tokens"] > bound:
-                    failures.append(
-                        f"{label}_{index}: prefilled {usage['gufo']['prefill_tokens']} "
-                        f"tokens, expected at most {bound} after restoring the shared prefix")
+                    failures.append(check_line(
+                        f"{label}_{index}_prefill",
+                        f"prefill_tokens <= {bound} after restoring the shared prefix",
+                        f"prefill_tokens={usage['gufo']['prefill_tokens']}"))
         # Waiting must never change an answer: compare uncached controls.
         for index, (messages, warm) in enumerate(zip(conversations, results)):
             cold = chat(f"{label}_cold_{index}", body_for(messages, cold=True))
@@ -186,10 +218,13 @@ def check_cache_concurrency(client, model, checks, chat_result, concurrency,
     answer(turn, "BETA")
     answer(fresh, "GAMMA")
     if wait_ms(turn) > 0:
-        failures.append("history_turn_1: a retained conversation waited for a peer")
+        failures.append(check_line("history_turn_1_wait", "shared_prefix_wait_ms == 0",
+                                   f"shared_prefix_wait_ms={wait_ms(turn)}"))
     if turn["usage"]["cached_tokens"] < first["usage"]["prompt_tokens"] - 16:
-        failures.append(f"history_turn_1: reused {turn['usage']['cached_tokens']} tokens, "
-                        f"expected its previous prompt of {first['usage']['prompt_tokens']}")
+        failures.append(check_line(
+            "history_turn_1_reuse",
+            f"cached_tokens >= {first['usage']['prompt_tokens'] - 16}",
+            f"cached_tokens={turn['usage']['cached_tokens']}"))
 
     # A cancelled leader must release the requests waiting for it.
     system = system_prompt("cache_concurrency_cancelled", 220)

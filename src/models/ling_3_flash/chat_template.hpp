@@ -47,6 +47,10 @@ struct ChatTemplateOptions {
   /// definitions). Pass them to LingTokenizer::Encode as literal ranges so
   /// that only the template's own markup can become control tokens.
   std::vector<std::pair<std::size_t, std::size_t>>* literal_spans{nullptr};
+  /// When set, receives the rendered byte offset where the final message's
+  /// markup begins, so a caller that may drop that message can tokenize only
+  /// the text before it instead of rendering the conversation again.
+  std::size_t* stable_prefix_bytes{nullptr};
 };
 
 /// Renders the pinned Bailing V3 template (see ArtifactTemplateSha256) with

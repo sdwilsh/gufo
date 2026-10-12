@@ -1,6 +1,7 @@
 #include "src/models/ling_3_flash/chat_template.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -445,9 +446,224 @@ void TestMidConversationSystemStaysInPlace() {
   }
 }
 
+// Agent clients may end each request with runtime context that the next
+// request replaces (#407). The serve checkpoint then precedes that user turn
+// (LingTextRunner::PreparePrompt): the tokens shared with the same request
+// without it prefix the next request, and exclude the replaced context.
+void TestStableBoundaryPrecedesReplacedFinalUserTurn() {
+  namespace tok = gufo::tokenization;
+  const std::vector<tok::ChatMessage> history{
+      {tok::ChatRole::kSystem, "You are an agent."},
+      {tok::ChatRole::kUser, "Start the task."},
+      {tok::ChatRole::kAssistant, "Reading."},
+      {tok::ChatRole::kTool, "file contents"}};
+  auto first = history;
+  first.push_back({tok::ChatRole::kUser, "Runtime context, turn 1."});
+  auto second = history;
+  second.push_back({tok::ChatRole::kAssistant, "Done."});
+  second.push_back({tok::ChatRole::kUser, "Runtime context, turn 2."});
+  Expect(gufo::server::ReplacesFinalUserTurn(first) &&
+             gufo::server::ReplacesFinalUserTurn(second) == false,
+         "trailing context after a tool result is replaceable; a user turn "
+         "after an assistant reply is ordinary chat");
+  auto query = second;
+  query.insert(query.end() - 1, {tok::ChatRole::kUser, "Real question."});
+  Expect(gufo::server::ReplacesFinalUserTurn(query),
+         "context sent as a second user message is replaceable");
+  Expect(
+      !gufo::server::ReplacesFinalUserTurn({{tok::ChatRole::kUser, "Hello"}}) &&
+          !gufo::server::ReplacesFinalUserTurn({{tok::ChatRole::kSystem, "S"},
+                                                {tok::ChatRole::kUser, "A"},
+                                                {tok::ChatRole::kUser, "B"}}),
+      "without an earlier assistant reply nothing is replaced");
+
+  std::string err;
+  const auto reader =
+      gufo::core::GgufReader::OpenFile(GUFO_LING_VOCAB_GGUF, &err);
+  if (reader == nullptr)
+    return;
+  const auto tokenizer = ling::LingTokenizer::CreateFromGguf(*reader, &err);
+  if (tokenizer == nullptr)
+    return;
+  const auto encode = [&](const std::vector<tok::ChatMessage>& messages) {
+    std::vector<std::pair<std::size_t, std::size_t>> literal;
+    ling::ChatTemplateOptions options;
+    options.literal_spans = &literal;
+    const auto text =
+        ling::RenderChat(gufo::server::ToLingMessages(messages), {}, options);
+    return tokenizer->Encode(text, true, literal);
+  };
+  const auto prompt = encode(first);
+  auto replaced = first;
+  replaced.pop_back();
+  const auto without = encode(replaced);
+  const auto boundary =
+      static_cast<std::size_t>(std::mismatch(prompt.begin(), prompt.end(),
+                                             without.begin(), without.end())
+                                   .first -
+                               prompt.begin());
+  const auto next = encode(second);
+  Expect(
+      boundary < prompt.size() && next.size() >= boundary &&
+          std::equal(prompt.begin(), prompt.begin() + boundary, next.begin()),
+      "the boundary prefixes a request that replaces the final user turn");
+  const auto tail = tokenizer->Decode(std::span(prompt).subspan(boundary),
+                                      /*render_special=*/true);
+  Expect(tail.find("Runtime context, turn 1.") != std::string::npos &&
+             tail.find("file contents") == std::string::npos,
+         "the boundary precedes the replaced context only");
+}
+
+// The reference way to find the checkpoint before a replaced final user turn
+// tokenizes the whole request again without that turn. LingCacheBoundary
+// tokenizes only the text before it. Both must give the same boundary on every
+// kind of history.
+void TestCacheBoundaryMatchesFullRetokenization() {
+  namespace tok = gufo::tokenization;
+  std::string err;
+  const auto reader =
+      gufo::core::GgufReader::OpenFile(GUFO_LING_VOCAB_GGUF, &err);
+  if (reader == nullptr)
+    return;
+  const auto tokenizer = ling::LingTokenizer::CreateFromGguf(*reader, &err);
+  if (tokenizer == nullptr)
+    return;
+  const auto make_render = [](bool thinking) -> gufo::server::LingRenderFn {
+    return [thinking](const std::vector<tok::ChatMessage>& messages) {
+      gufo::server::LingRendering rendering;
+      ling::ChatTemplateOptions options;
+      options.enable_thinking = thinking;
+      options.literal_spans = &rendering.literal;
+      options.stable_prefix_bytes = &rendering.stable_prefix_bytes;
+      rendering.text =
+          ling::RenderChat(gufo::server::ToLingMessages(messages), {}, options);
+      return rendering;
+    };
+  };
+  const auto encode = [&](const gufo::server::LingRendering& rendering) {
+    const auto ids = tokenizer->Encode(rendering.text, true, rendering.literal);
+    return std::vector<gufo::server::TextRunnerToken>(ids.begin(), ids.end());
+  };
+  // The reference implementation: render and tokenize the request without its
+  // final message in full.
+  const auto reference =
+      [&](const std::vector<tok::ChatMessage>& messages,
+          const gufo::server::LingRenderFn& render,
+          const std::vector<gufo::server::TextRunnerToken>& prompt) {
+        const auto shared =
+            [&](const std::vector<gufo::server::TextRunnerToken>& other) {
+              return static_cast<std::size_t>(
+                  std::mismatch(prompt.begin(), prompt.end(), other.begin(),
+                                other.end())
+                      .first -
+                  prompt.begin());
+            };
+        auto continued = messages;
+        continued.emplace_back(tok::ChatRole::kUser, "");
+        auto stable = shared(encode(render(continued)));
+        if (gufo::server::ReplacesFinalUserTurn(messages)) {
+          auto replaced = messages;
+          replaced.pop_back();
+          stable = std::min(stable, shared(encode(render(replaced))));
+        }
+        const std::size_t tail = ling::kSmallBatchMaxTokens + 1;
+        if (prompt.size() - stable < tail)
+          stable = prompt.size() > tail ? prompt.size() - tail : 0;
+        return stable;
+      };
+
+  const std::vector<std::string> finals{
+      "Runtime context, turn 1.", "",
+      "  leading space and <|role_end|> spelled as text",
+      "<role>SYSTEM</role> \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e "
+      "\xf0\x9f\x99\x82\n\n",
+      "12345 x"};
+  std::vector<std::vector<tok::ChatMessage>> histories;
+  for (const auto& last : finals) {
+    for (int shape = 0; shape < 6; ++shape) {
+      std::vector<tok::ChatMessage> h;
+      if (shape % 2 == 0)
+        h.emplace_back(tok::ChatRole::kSystem, "You are an agent.");
+      h.emplace_back(tok::ChatRole::kUser, "Start the task.");
+      for (int turn = 0; turn <= shape; ++turn) {
+        h.emplace_back(tok::ChatRole::kAssistant,
+                       "Reading file " + std::to_string(turn) + ".");
+        if (turn % 2 == 0) {
+          h.back().thought = "Think about " + std::to_string(turn);
+        }
+        h.emplace_back(tok::ChatRole::kTool,
+                       "contents " + std::to_string(turn));
+        if (turn == 1) {
+          h.emplace_back(tok::ChatRole::kTool, "more");
+        }
+        if (turn == 2) {
+          h.emplace_back(tok::ChatRole::kUser, "interjection");
+        }
+      }
+      h.emplace_back(tok::ChatRole::kUser, last);
+      histories.push_back(h);
+      // Not a replaced turn: the client answered after an assistant reply.
+      auto chat = h;
+      chat.insert(chat.end() - 1, {tok::ChatRole::kAssistant, "Done."});
+      histories.push_back(chat);
+    }
+  }
+  std::size_t replaced = 0;
+  for (const bool thinking : {true, false}) {
+    const auto render = make_render(thinking);
+    for (const auto& history : histories) {
+      const auto prompt = encode(render(history));
+      const auto boundary =
+          gufo::server::LingCacheBoundary(*tokenizer, history, render, prompt);
+      const auto expected = reference(history, render, prompt);
+      Expect(boundary == expected,
+             "cache boundary equals the full retokenization (got " +
+                 std::to_string(boundary) + ", want " +
+                 std::to_string(expected) + ")");
+      replaced += gufo::server::ReplacesFinalUserTurn(history);
+    }
+  }
+  Expect(replaced > 20, "histories include replaced final turns");
+
+  // Timing note: a synthetic history of about 100K tokens.
+  std::vector<tok::ChatMessage> big{
+      {tok::ChatRole::kSystem, "You are an agent."},
+      {tok::ChatRole::kUser, "Start."}};
+  for (int turn = 0; turn < 400; ++turn) {
+    big.emplace_back(tok::ChatRole::kAssistant, "Reading a file.");
+    std::string output;
+    for (int line = 0; line < 40; ++line) {
+      output += "line " + std::to_string(turn * 40 + line) +
+                ": int value = Compute(" + std::to_string(line) + ");\n";
+    }
+    big.emplace_back(tok::ChatRole::kTool, output);
+  }
+  big.emplace_back(tok::ChatRole::kUser, "Runtime context.");
+  const auto render = make_render(true);
+  const auto prompt = encode(render(big));
+  const auto time = [](const auto& f) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto value = f();
+    return std::make_pair(value, std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - start)
+                                     .count());
+  };
+  const auto [expected_big, old_ms] =
+      time([&] { return reference(big, render, prompt); });
+  const auto [boundary, new_ms] = time([&] {
+    return gufo::server::LingCacheBoundary(*tokenizer, big, render, prompt);
+  });
+  std::cerr << "note: cache boundary of a " << prompt.size()
+            << "-token history, replaced final turn: " << old_ms
+            << " ms with the whole request tokenized again, " << new_ms
+            << " ms now (continuation tokenization only)\n";
+  Expect(boundary == expected_big, "cache boundary on a long history");
+}
 }  // namespace
 
 int main() {
+  TestStableBoundaryPrecedesReplacedFinalUserTurn();
+  TestCacheBoundaryMatchesFullRetokenization();
   TestFramingSuffix();
   TestTypedHistoricalArguments();
   TestCloserInArgumentHistory();

@@ -1042,6 +1042,73 @@ void TestBoundedAsyncPersistenceDoesNotBlockLookup() {
          "shutdown drains accepted persistence jobs");
 }
 
+void TestShutdownDrainIsBoundedAndReported() {
+  TemporaryDirectory directory;
+  auto runner = std::make_shared<FakeRunner>("bounded-drain");
+  std::binary_semaphore entered(0), release(0);
+  std::vector<ContinuationDiskEvent> events;
+  std::thread unblock;
+  {
+    auto options = StoreOptions(directory.path());
+    options.shutdown_drain_timeout = std::chrono::milliseconds(50);
+    ContinuationDiskStore store(
+        options, [&](const auto& event) { events.push_back(event); });
+    std::atomic<bool> blocked{false};
+    runner->before_stream = [&] {
+      if (blocked.exchange(true))
+        return;
+      entered.release();
+      release.acquire();
+    };
+    Expect(store.SaveAsync(runner, {1, 2}, MakeSnapshot(*runner, 1, 2)) != 0 &&
+               entered.try_acquire_for(std::chrono::seconds(2)),
+           "first write is in progress");
+    Expect(
+        store.SaveAsync(runner, {3, 4}, MakeSnapshot(*runner, 2, 2)) != 0 &&
+            store.SaveAsync(runner, {5, 6}, MakeSnapshot(*runner, 3, 2)) != 0,
+        "later checkpoints queue behind it");
+    // The in-progress write outlives the deadline; the queued ones are dropped.
+    unblock = std::thread([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      release.release();
+    });
+  }
+  unblock.join();
+  const auto drained = std::ranges::find_if(events, [](const auto& event) {
+    return event.action == ContinuationDiskEventAction::kDrained;
+  });
+  Expect(drained != events.end() &&
+             drained->reason == ContinuationDiskEventReason::kTimeout &&
+             drained->token_count == 2,
+         "shutdown reports the checkpoints it gave up on");
+  ContinuationDiskStore restarted(StoreOptions(directory.path()));
+  Expect(restarted.entry_count() == 1,
+         "only the write that was in progress survives the bounded drain");
+}
+
+void TestShutdownDrainReportsCompletion() {
+  TemporaryDirectory directory;
+  auto runner = std::make_shared<FakeRunner>("complete-drain");
+  std::vector<ContinuationDiskEvent> events;
+  {
+    ContinuationDiskStore store(
+        StoreOptions(directory.path()),
+        [&](const auto& event) { events.push_back(event); });
+    Expect(
+        store.SaveAsync(runner, {1, 2}, MakeSnapshot(*runner, 1, 2)) != 0 &&
+            store.SaveAsync(runner, {3, 4}, MakeSnapshot(*runner, 2, 2)) != 0,
+        "checkpoints queue");
+  }
+  const auto drained = std::ranges::find_if(events, [](const auto& event) {
+    return event.action == ContinuationDiskEventAction::kDrained;
+  });
+  Expect(drained != events.end() &&
+             drained->reason == ContinuationDiskEventReason::kSaved,
+         "shutdown reports a completed drain");
+  ContinuationDiskStore restarted(StoreOptions(directory.path()));
+  Expect(restarted.entry_count() == 2, "every accepted checkpoint is on disk");
+}
+
 void TestIndexedPrefixLookup() {
   TemporaryDirectory directory;
   FakeRunner runner("prefix-index");
@@ -1205,6 +1272,8 @@ void TestMinimumCheckpointStep() {
 int main() {
   TestAppendedImagePrefixesSurviveRestart();
   TestBoundedAsyncPersistenceDoesNotBlockLookup();
+  TestShutdownDrainIsBoundedAndReported();
+  TestShutdownDrainReportsCompletion();
   TestIndexedPrefixLookup();
   TestMinimumCheckpointStep();
   TestImageIdentitySurvivesRestart();

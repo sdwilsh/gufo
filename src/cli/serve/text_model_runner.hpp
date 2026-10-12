@@ -116,6 +116,17 @@ struct TextRunnerCapabilities {
   /// Interrupted prefill rolls back to its entry frontier without consuming
   /// input, so cancellation need not wait for the whole pass.
   bool prefill_rollback{false};
+  /// Fewest prompt tokens that must follow a checkpoint the pool plans inside
+  /// one prompt (grid, shared-prefix and learned boundaries). A model whose
+  /// numerics depend on chunk size (Ling's small-batch family for 1..8-token
+  /// chunks) needs the tokens after a checkpoint to form a full-size chunk so
+  /// a restored run keeps the numerics of an uncached one. Zero places no
+  /// constraint beyond one remaining token.
+  std::size_t min_checkpoint_tail_tokens{0};
+  /// Prompts shorter than this are not retained as snapshots: for a runner
+  /// whose snapshot has a large fixed size (Ling: 75.5 MiB of recurrent state),
+  /// a handful of tokens costs more RAM than re-prefilling them saves.
+  std::size_t min_snapshot_tokens{0};
 };
 
 /// Model-owned compatibility identity for restart-safe snapshots.
@@ -200,6 +211,12 @@ struct TextDecodeStep {
   /// dispatch. A runner's advertised maximum is not evidence of batching.
   TextExecutionPlan execution_plan{};
   std::exception_ptr failure{};
+  /// Decode time of this request within a DecodeBatch call, set when the
+  /// runner times its lanes. It is the wall time of the steps the request took
+  /// part in: shared steps count in full, and steps of other requests that it
+  /// waited for do not. A serial DecodeStep reports its own cycle. When unset,
+  /// the whole call counts.
+  std::optional<double> decode_ms{};
 };
 
 /// Model-private state driven only through TextModelRunner work units.

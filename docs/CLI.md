@@ -105,10 +105,19 @@ seed. Speed depends on acceptance and verification cost.
 
 - `speculative` — `dflash2` for Qwen3.8-27B, `dspark` for DeepSeek V4 Flash,
   `mtp` for models with a supported MTP head, or `off`. HTTP serving
-  supports `dflash2`, `dspark`, and Flash-Next `mtp`.
+  supports `dflash2`, `dspark`, and `mtp` (Flash-Next, Ling-3.0-flash).
+  Ling-3.0-flash carries its MTP block (block 42) in the main GGUF, so
+  `--speculative mtp` needs no `--mtp-model` (it is refused there). Ling
+  defaults to MTP: `gufo serve llm` and `gufo bench` use it whenever the GGUF
+  carries the block and `--speculative` is not given (bench also needs greedy
+  sampling and `--min-draft-tokens 1` for the default; otherwise it runs AR).
+  A GGUF without the block runs AR and logs why. `--speculative off` selects AR
+  (costs 2.1 GiB less memory, decodes 1.1-1.5x slower). `gufo bench
+  --text-file FILE` measures MTP on real text. Other models default to AR.
 - `dflashModel` — path to the DFlash2 companion draft.
 - `dsparkModel` — path to the DSpark support GGUF.
-- `mtpModel` — path to the MTP draft model.
+- `mtpModel` — path to the MTP draft model (the Flash-Next sidecar, not used by
+  Ling-3.0-Flash).
 - `draftTokens` — maximum tokens drafted per step. Wider drafts go faster
   when the guesses are accepted and waste work when they are rejected.
 - `draftPolicy` (`"fixed"` / `"adaptive"`) — DFlash2 block-length policy;

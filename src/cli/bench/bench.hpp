@@ -21,8 +21,16 @@ struct BenchOptions {
   std::vector<std::size_t> n_depths{0};
   std::vector<std::size_t> concurrency{1};
   std::size_t repetitions{1};
+  /// Ling-3.0-flash tokens per forward pass; 0 = ling::kCliPrefillBatch.
+  std::size_t max_batch{0};
+  /// Ling-3.0-flash persistent expanded K/V budget in bytes
+  /// (ModelOptions::expanded_kv_bytes).
+  std::uint64_t expanded_kv_bytes{std::uint64_t{12} << 30};
   std::size_t validate_prefill_tokens{0};
   std::string speculative_backend{""};
+  /// True when --speculative was given (including "off"); otherwise Ling
+  /// selects MTP when its GGUF carries the block-42 weights.
+  bool speculative_explicit{false};
   std::string mtp_model_path;
   std::string dflash_model_path;
   std::string draft_policy;
@@ -31,7 +39,14 @@ struct BenchOptions {
   std::uint32_t min_draft_tokens{1};
   sampling::SamplingConfig sampling{.seed = 0};
   bool enable_yarn{false};
+  /// Ling-3.0-flash: context tokens come from this text file (tokenized, not
+  /// repeated) instead of pseudo-random tokens.
+  std::string text_file;
+  std::string output_format{"md"};
   bool verbose{false};
+  /// Ling-3.0-flash (-o jsonl): per-operation device-time records of one eager
+  /// decode run and one serialised prefill chunk per point.
+  bool op_profile{false};
 };
 
 /// Context a Flash-Next benchmark reserves for its largest workload: depth

@@ -80,7 +80,8 @@ class BenchConfig:
 
     @property
     def speculative(self) -> dict[str, Any]:
-        return self.data["speculative"]
+        """Draft-mode description; empty for models without a speculative mode."""
+        return self.data.get("speculative", {})
 
     @property
     def reference_speculative(self) -> list[str] | None:

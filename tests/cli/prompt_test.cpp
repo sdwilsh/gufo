@@ -6,6 +6,9 @@
 #include <span>
 #include <string>
 
+#include "src/core/model_config.hpp"
+#include "src/core/text_sampling_defaults.hpp"
+
 void TestDefaultOptions() {
   const std::array<const char*, 2> args = {"Hello", "world"};
   const auto opt = gufo::cli::ParsePromptOptions(args);
@@ -201,7 +204,33 @@ void TestSamplingAndReasoningFlags() {
   assert(opt->prompt_text == "Explicit prompt text");
 }
 
+void TestLingSamplingPreset() {
+  gufo::core::ModelConfig config;
+  config.architecture = "bailingmoe3";
+  const auto preset = gufo::sampling::TextPreset(config);
+  assert(preset == gufo::sampling::TextModelPreset::kLing3Flash);
+  const auto sampling = gufo::sampling::ResolveTextSampling(
+      preset, true, gufo::sampling::SamplingConfig{},
+      gufo::sampling::SamplingOverrides{});
+  // Vendor defaults, independent of thinking; per-field overrides still win.
+  for (const bool thinking : {true, false}) {
+    const auto vendor = gufo::sampling::ResolveTextSampling(
+        preset, thinking, gufo::sampling::SamplingConfig{},
+        gufo::sampling::SamplingOverrides{});
+    assert(vendor.temperature == 0.6F && vendor.top_p == 0.95F &&
+           vendor.top_k == 20);
+  }
+  gufo::sampling::SamplingConfig greedy;
+  gufo::sampling::SamplingOverrides supplied;
+  supplied.temperature = true;
+  const auto overridden =
+      gufo::sampling::ResolveTextSampling(preset, true, greedy, supplied);
+  assert(overridden.temperature == 0.0F && overridden.top_k == 20);
+  (void)sampling;
+}
+
 int main() {
+  TestLingSamplingPreset();
   TestDefaultOptions();
   TestExplicitFlags();
   TestSamplingAndReasoningFlags();

@@ -26,6 +26,10 @@ namespace gufo::models::qwen38_flash_next {
 class Model;
 }
 
+namespace gufo::models::ling_3_flash {
+class Model;
+}
+
 namespace gufo::tokenization {
 class QwenTokenizer;
 }
@@ -41,6 +45,9 @@ enum class TextSpeculativeBackend : std::uint8_t {
 
 struct TextSpeculativeConfig {
   TextSpeculativeBackend backend{TextSpeculativeBackend::kDisabled};
+  /// True when the caller made no explicit choice: a model with a default
+  /// speculative backend (Ling MTP) may select it. Other models ignore it.
+  bool model_default{false};
   std::string draft_model_path;
   std::uint32_t max_draft_tokens{7};
   std::uint32_t min_draft_tokens{1};
@@ -76,15 +83,18 @@ public:
   /// Loads weights from a GGUF file. Returns false and sets *error on failure.
   /// `enable_yarn` opts Flash-Next into static YaRN, required for (and only
   /// accepted with) a `max_context` above its native context.
+  /// `expanded_kv_bytes` is the Ling-3.0-flash persistent expanded K/V budget
+  /// (ModelOptions::expanded_kv_bytes); other models ignore it.
   bool load(const std::string& model_path, std::string* error,
             std::uint32_t max_context = 0, std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
-            const TextSpeculativeConfig& speculative_config = {},
+            TextSpeculativeConfig speculative_config = {},
             const TextDiskCacheConfig& disk_cache_config = {},
             const std::string& vision_model_path = {},
             TextRunnerRamCacheOptions ram_cache_config = {},
-            bool enable_yarn = false);
+            bool enable_yarn = false,
+            std::uint64_t expanded_kv_bytes = std::uint64_t{12} << 30);
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.
@@ -117,10 +127,24 @@ public:
             TextSpeculativeConfig speculative_config = {},
             TextDiskCacheConfig disk_cache_config = {},
             TextRunnerRamCacheOptions ram_cache_config = {});
+
+  /// Installs a previously loaded Ling-3.0-flash model with request-owned
+  /// sessions. Speculative decoding, images and the disk cache are
+  /// unsupported; a session continues only its own history.
+  bool load(std::shared_ptr<models::ling_3_flash::Model> model,
+            std::string* error, std::uint32_t max_context = 0,
+            std::size_t session_count = 1,
+            TextPrefillPolicy prefill_policy = {},
+            TextSchedulerPolicy scheduler_policy = {},
+            TextSpeculativeConfig speculative_config = {},
+            TextDiskCacheConfig disk_cache_config = {},
+            TextRunnerRamCacheOptions ram_cache_config = {});
 #endif
 
   /// Stable model identifier used in API responses.
   [[nodiscard]] std::string model_id() const override;
+  /// "dflash2", "dspark", "mtp" or "off": the speculative decoder in effect.
+  [[nodiscard]] std::string speculative_mode() const;
   [[nodiscard]] bool ready() const override;
   [[nodiscard]] bool device_lost() const override;
   [[nodiscard]] bool supports_images() const override;
@@ -132,6 +156,7 @@ public:
   [[nodiscard]] ReasoningOptions reasoning_defaults() const override;
   [[nodiscard]] InitialOutputState initial_output_state(
       const ChatRequest& request) const override;
+  [[nodiscard]] ToolCallSyntax tool_call_syntax() const override;
   void set_model_id(const std::string& model_id);
   void set_served_artifact(const std::string& model_path,
                            const std::string& build_info);
