@@ -1959,15 +1959,32 @@ ParsedGeneration ParseGeneration(
       // Declared tools are the contract only for tool_choice required/named;
       // under auto an unknown name still becomes a call so the client's
       // unknown-tool error path can answer it (vLLM would drop it).
+      QuoteTracker call_quotes;
+      call_quotes.Reset(parsed.text);
       const auto scan = models::ling_3_flash::ScanBailingToolCalls(
           text_from_tools, models::ling_3_flash::BailingTools(tools),
           end.model_stopped, choice == ChatRequest::ToolChoice::kAuto,
-          [&](std::size_t at) { return quotes.QuotedAt(marker + at); });
+          [&](std::size_t at) {
+            return call_quotes.QuotedAt(marker + at) ||
+                   (partial && call_quotes.UnclosedAt(marker + at));
+          },
+          partial,
+          // Argument bytes belong to the call, not to prose quotation: an
+          // unmatched backtick in a value must not quote the next call.
+          [&](std::size_t end) {
+            call_quotes.Reset(parsed.text, marker + end);
+          });
       for (const auto& call : scan.calls) {
         ParsedToolCall converted;
         converted.id = RandomId("call_");
         converted.name = call.name;
         converted.arguments = BailingArguments(call.arguments);
+        if (call.partial) {
+          converted.partial_arguments = ArgumentsPrefix(converted);
+          if (call.pending)
+            PartialStringArgument(converted, call.pending->first,
+                                  call.pending->second);
+        }
         parsed.tool_calls.push_back(std::move(converted));
       }
       // Prose between and after calls stays content. After a clean stop a
@@ -2116,7 +2133,8 @@ ParsedGeneration ParseStructuredGeneration(
       EarliestMarker(content, markers, quotes) == 0) {
     auto native = ParseGeneration(
         content, TextGenerationBackend::InitialOutputState::kContent, tools,
-        choice, enforce_required, markers, closers, quotes, syntax, end);
+        choice, enforce_required, markers, closers, quotes, syntax, end,
+        partial);
     native.reasoning_content = std::move(parsed.reasoning_content);
     return native;
   }
@@ -3279,7 +3297,6 @@ HttpResponse StreamingResponse(
                     if (!begin() || !filter.Push(piece))
                       return false;
                     return !filter.in_tools() || markers.size() > 2 ||
-                           syntax == ToolSyntax::kBailing ||
                            tools.Update(
                                StreamingGeneration(filter, request.chat,
                                                    initial_output_state,
@@ -4070,7 +4087,6 @@ HttpResponse CreateCompatibilityResponse(
                          if (!begin() || !filter.Push(piece))
                            return false;
                          return !filter.in_tools() || markers.size() > 2 ||
-                                syntax == ToolSyntax::kBailing ||
                                 tools.Update(StreamingGeneration(
                                                  filter, chat, initial, markers,
                                                  closers, quotes, false, syntax,
