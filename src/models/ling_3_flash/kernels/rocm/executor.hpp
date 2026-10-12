@@ -3,11 +3,17 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
+#include <map>
 #include <memory>
+#include <set>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "src/models/ling_3_flash/gpu_dump.hpp"
@@ -50,7 +56,23 @@ public:
 private:
   friend class Executor;
   Session() = default;
+  void DestroyGraphs() noexcept;
   SessionState state_;
+  /// Decode steps (1..8 tokens) captured as HIP graphs, keyed by (n << 4 |
+  /// first logits row): at most 44 keys per session (n tokens x n + 1 head
+  /// layouts), a few MB each. Graphs stay valid across Reset() (the state
+  /// pointers do not change) and are freed with the session. The nodes hold
+  /// this session's state pointers, so the graphs live and die with it; the
+  /// position-dependent values are read from device memory and need no graph
+  /// update.
+  std::map<std::uint32_t, hipGraphExec_t> graphs_;
+  std::set<std::uint32_t> warmed_;
+  /// Returns the persistent-store bytes to the executor's budget on release.
+  std::shared_ptr<std::atomic<std::uint64_t>> expanded_pool_;
+  std::uint64_t expanded_bytes_{0};
+  /// Recorded at the end of every forward pass on this session; snapshot
+  /// copies wait on it instead of trusting that the pass has been synchronized.
+  hipEvent_t forward_done_{nullptr};
 };
 
 /// Rollback copy of the recurrent state of a Session (device memory). The
@@ -83,6 +105,11 @@ struct ForwardRequest {
   std::span<float> logits;
   /// First token row whose logits are wanted (UINT32_MAX = last row only).
   std::uint32_t logits_from{UINT32_MAX};
+  /// Wants the per-block split in last_timing(): the step then runs eagerly
+  /// (a replayed graph is measured as a whole, with layer_ms and head_ms 0).
+  bool block_timing{false};
+  /// Merges per-operation device times of this step into the vector (eager).
+  std::vector<OpTiming>* op_profile{nullptr};
   GpuTensorSink* sink{nullptr};
 };
 
@@ -94,6 +121,16 @@ public:
     std::uint32_t max_batch{2048};  ///< Tokens per Forward.
     std::uint32_t max_context{4096};
     std::uint32_t logit_group{64};  ///< Output-head rows per launch.
+    /// Replay small-batch (n <= 8) steps as per-session HIP graphs. Tests turn
+    /// it off to compare against the eager launch sequence; the results are
+    /// bit-identical either way.
+    bool graphs{true};
+    /// Device bytes, shared by all sessions of the executor, for persistent
+    /// expanded K/V of the MLA layers (112 KiB per cached token). A session
+    /// takes whole 2048-token blocks first come first served up to its context;
+    /// rows beyond it are expanded per call with identical bits. 12 GiB covers
+    /// 109,000 tokens of one session; 0 disables the store.
+    std::uint64_t expanded_kv_bytes{std::uint64_t{12} << 30};
   };
   [[nodiscard]] static std::unique_ptr<Executor> Create(
       const DeviceModel& model, const Options& options,
@@ -137,6 +174,10 @@ public:
                                   std::vector<std::uint16_t>* out,
                                   std::string* error_msg = nullptr);
 
+  /// Graph replays so far (tests and the bench check the graph path ran).
+  [[nodiscard]] std::uint64_t graph_replays() const noexcept {
+    return graph_replays_;
+  }
   [[nodiscard]] const ForwardTiming& last_timing() const noexcept {
     return timing_;
   }
@@ -157,15 +198,30 @@ private:
   Executor(const DeviceModel& model, const Options& options);
   bool Init(std::string* error_msg);
 
+  /// One block. `fuse` (decode family only) selects the fused launches; with
+  /// `x_ready` the attention norm of this block (x and its quantised planes)
+  /// was already produced by the previous block's last launch, and `next` (the
+  /// next resident block, if any) gets its attention norm fused into this
+  /// block's last launch.
   bool Block(const Session& session, std::uint32_t il, std::uint32_t first_pos,
-             std::uint32_t n, GpuTensorSink* sink, std::string* error_msg);
+             std::uint32_t n, GpuTensorSink* sink, bool fuse, bool x_ready,
+             const DeviceLayer* next, std::string* error_msg);
   void Kda(const DeviceLayer& l, const Session& session, std::uint32_t il,
-           std::uint32_t n, GpuTensorSink* sink);
+           std::uint32_t n, bool fuse, GpuTensorSink* sink);
   void Mla(const DeviceLayer& l, const Session& session, std::uint32_t il,
-           std::uint32_t first_pos, std::uint32_t n, GpuTensorSink* sink);
-  void Ffn(const DeviceLayer& l, std::uint32_t il, std::uint32_t n,
+           std::uint32_t first_pos, std::uint32_t n, bool fuse,
            GpuTensorSink* sink);
+  void Ffn(const DeviceLayer& l, std::uint32_t il, std::uint32_t n, bool fuse,
+           const DeviceLayer* next, GpuTensorSink* sink);
   void Q8(const DeviceTensor& w, const float* x, float* y, std::uint32_t n);
+  /// Attributes the stream time since the previous mark to `label` (profile
+  /// steps only; a no-op otherwise). `bytes` is the traffic the op must read.
+  void Mark(const char* label, std::size_t bytes);
+  void FinishProfile(std::vector<OpTiming>* out);
+  /// Q8_0 GEMVs over the planes of the fused norm in `xq` (up to 3 weights).
+  void Q8Quantized(
+      std::initializer_list<std::pair<const DeviceTensor*, float*>> groups,
+      const void* quant, std::uint32_t n, std::uint32_t k);
   void DumpFloat(GpuTensorSink* sink, const char* name, int layer,
                  const float* device, std::uint32_t rows, std::uint32_t width);
   void DumpInt(GpuTensorSink* sink, const char* name, int layer,
@@ -175,14 +231,51 @@ private:
                     std::uint32_t first_pos, std::string* error_msg);
   bool Head(std::uint32_t n, std::uint32_t from, std::span<float> logits,
             std::string* error_msg);
+  /// Embedding, all blocks and (head_from < n) the output norm, logits GEMV
+  /// and argmax of rows [head_from, n) (at most logit_group of them), as
+  /// launches only: no host synchronisation, so it can be graph-captured.
+  bool Trunk(const Session& session, std::uint32_t n, std::uint32_t first_pos,
+             std::uint32_t head_from, bool events, GpuTensorSink* sink,
+             std::string* error_msg);
+  void HeadLaunch(std::uint32_t n, std::uint32_t from);
+  /// Small-batch (n <= 8, no sink) forward through a per-session graph.
+  bool ForwardGraph(Session& session, const ForwardRequest& request,
+                    std::uint32_t n, std::uint32_t first_pos,
+                    std::uint32_t from, bool* launched, std::string* error_msg);
+  bool FinishForward(Session& session, const ForwardRequest& request,
+                     std::uint32_t n, std::uint32_t from, std::uint32_t layers,
+                     bool graph, std::string* error_msg);
 
   const DeviceModel& model_;
   Options options_;
   hipStream_t stream_{nullptr};
   std::unique_ptr<Buffers> b_;
+  std::shared_ptr<std::atomic<std::uint64_t>> expanded_pool_;
   std::size_t scratch_total_{0};
   std::vector<hipEvent_t> events_;
   ForwardTiming timing_;
+  bool graphs_enabled_{true};
+  bool capture_invalidated_{false};
+  bool capturing_{false};  ///< Trunk() is being recorded into a graph
+  hipStream_t branch_stream_{nullptr};  ///< parallel branch inside a capture
+  hipEvent_t fork_event_{nullptr};
+  hipEvent_t join_event_{nullptr};
+  struct OpMark {
+    const char* label;
+    std::size_t bytes;
+  };
+  bool profiling_{false};
+  std::vector<OpMark> marks_;
+  std::vector<hipEvent_t>
+      mark_events_;  ///< [0] = start, [i + 1] after marks_[i]
+  std::uint64_t graph_replays_{0};
+  /// Pinned staging for the per-step host inputs of graph replays (tokens,
+  /// positions).
+  std::int32_t* staging_{nullptr};
+
+  /// Parts of the prefill MLA attention call (name, ms) recorded while an op
+  /// profile is requested; merged into the profile by FinishProfile().
+  std::vector<std::pair<const char*, double>> detail_ops_;
 };
 
 }  // namespace gufo::models::ling_3_flash::rocm

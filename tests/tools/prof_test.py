@@ -103,15 +103,35 @@ assert overlapping.busy_ns == 200.0
 assert overlapping.wall_ns == 200.0
 
 with tempfile.TemporaryDirectory() as directory:
-    args = argparse.Namespace(command=["false"], out=directory, tag="failed")
-    with patch.object(prof.shutil, "which", return_value="/fake/rocprofv3"), \
-         patch.object(prof.subprocess, "run",
-                      return_value=subprocess.CompletedProcess([], 23, "")):
-        try:
-            prof.cmd_run(args)
-        except SystemExit as error:
-            assert error.code == 23
-        else:
-            raise AssertionError("profiler hid the child command failure")
+    # A failing profiled command: the exit code is preserved and the END of
+    # the output (the exception line) reaches stdout even after long output.
+    fake = Path(directory) / "rocprofv3"
+    fake.write_text(
+        "#!/bin/sh\nfor i in $(seq 1 3000); do echo noise $i; done\n"
+        "echo 'ValueError: the real failure' >&2\nexit 23\n"
+    )
+    fake.chmod(0o755)
+    out_dir = Path(directory) / "out"
+    args = argparse.Namespace(command=["false"], out=str(out_dir), tag="failed")
+    import contextlib
+    import io
+    import os
+
+    captured = io.StringIO()
+    old_path = os.environ["PATH"]
+    os.environ["PATH"] = f"{directory}:{old_path}"
+    try:
+        with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                prof.cmd_run(args)
+            except SystemExit as error:
+                assert error.code == 23
+            else:
+                raise AssertionError("profiler hid the child command failure")
+    finally:
+        os.environ["PATH"] = old_path
+    assert "ValueError: the real failure" in captured.getvalue()
+    assert "exited 23" in captured.getvalue()
+    assert (out_dir / "failed.log").exists()
 
 print("Profiler tests passed.")

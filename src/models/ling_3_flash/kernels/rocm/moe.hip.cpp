@@ -7,10 +7,12 @@
 // batch selects, then a GEMV block reads one expert's rows once and dots them
 // against every token that picked it; activations stay F32, weights are
 // dequantised in registers.
-// Prefill: (token, slot) pairs are sorted by expert into <=TN-token tiles; a
-// 4-wave block stages a 64-row dequantised F16 weight tile and a TN-token F16
-// activation tile in LDS and runs v_wmma_f32_16x16x16_f16 with F32
-// accumulators.
+// Prefill: (token, slot) pairs are sorted by expert into <=TN-token tiles and
+// their activations rounded to F16 once (sorted order); a 4-wave block stages
+// a 64-row dequantised F16 weight tile and a TN-token F16 activation tile in
+// LDS and runs v_wmma_f32_16x16x16_f16 with F32 accumulators. The raw
+// quantised bytes of the next 128-wide K chunk are loaded while the current
+// one is multiplied.
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -43,10 +45,74 @@ __device__ __forceinline__ bool Better(float v, int i, float bv, int bi) {
   return v > bv || (v == bv && i < bi);
 }
 
-__global__ __launch_bounds__(256) void RouteKernel(const float* logits,
-                                                   const float* bias,
-                                                   std::int32_t* ids,
-                                                   float* weights) {
+struct DecodeEntry {
+  int expert;
+  int count;
+  int pair[8];  // token * 8 + slot, ascending
+};
+constexpr int kDecodeMaxEntries = 64;
+constexpr std::size_t kDecodeHeader = 16;
+
+// The expert plan of a decode call (distinct experts and which (token, slot)
+// pairs use them). Run by a block of at least 64 threads, all of which must
+// call it (it synchronises); only the first 64 do work.
+__device__ __forceinline__ void DecodePrepBody(const std::int32_t* ids,
+                                               std::uint32_t n_tokens,
+                                               std::uint8_t* scratch) {
+  __shared__ int e[64];
+  __shared__ int rank[64];
+  const int p = threadIdx.x;
+  const int n = static_cast<int>(n_tokens) * 8;
+  if (p < 64) {
+    e[p] =
+        p < n ? *reinterpret_cast<const volatile std::int32_t*>(ids + p) : -1;
+  }
+  __syncthreads();
+  const bool valid = p < n && e[p] >= 0 && e[p] < 512;
+  bool leader = valid;
+  for (int q = 0; q < p && leader; ++q) {
+    leader = e[q] != e[p];
+  }
+  if (p < 64) {
+    rank[p] = leader ? 1 : 0;
+  }
+  __syncthreads();
+  if (p == 0) {
+    int run = 0;
+    for (int q = 0; q < 64; ++q) {
+      const int f = rank[q];
+      rank[q] = run;
+      run += f;
+    }
+    *reinterpret_cast<int*>(scratch) = run;
+  }
+  __syncthreads();
+  if (leader) {
+    auto* entries = reinterpret_cast<DecodeEntry*>(scratch + kDecodeHeader);
+    DecodeEntry& en = entries[rank[p]];
+    en.expert = e[p];
+    int c = 0;
+    for (int q = p; q < n; ++q) {
+      if (e[q] == e[p]) {
+        en.pair[c++] = q;
+      }
+    }
+    en.count = c;
+  }
+}
+
+__global__ __launch_bounds__(64) void DecodePrepKernel(const std::int32_t* ids,
+                                                       std::uint32_t n_tokens,
+                                                       std::uint8_t* scratch) {
+  DecodePrepBody(ids, n_tokens, scratch);
+}
+
+// With `counter` (a zeroed word, left zeroed) the last block to finish also
+// builds the decode expert plan of all tokens into `scratch`, which saves the
+// separate DecodePrepKernel launch; the plan depends only on the ids.
+__global__ __launch_bounds__(256) void RouteKernel(
+    const float* logits, const float* bias, std::int32_t* ids, float* weights,
+    std::uint32_t* counter, std::uint8_t* scratch) {
   __shared__ float p[512];
   __shared__ float sel[512];
   __shared__ float gscore[8];
@@ -148,6 +214,22 @@ __global__ __launch_bounds__(256) void RouteKernel(const float* logits,
       weights[t * 8 + r] = p[chosen[r]] / denom * 2.5F;
     }
   }
+  if (counter != nullptr) {
+    __shared__ int last;
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+      last = atomicAdd(counter, 1U) + 1 == gridDim.x ? 1 : 0;
+    }
+    __syncthreads();
+    if (last != 0) {
+      __threadfence();
+      DecodePrepBody(ids, gridDim.x, scratch);
+      if (tid == 0) {
+        *counter = 0;
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -165,54 +247,6 @@ __device__ __forceinline__ float SwiGlu(float g, float u, float limit) {
 // ---------------------------------------------------------------------------
 // Decode
 // ---------------------------------------------------------------------------
-struct DecodeEntry {
-  int expert;
-  int count;
-  int pair[8];  // token * 8 + slot, ascending
-};
-constexpr int kDecodeMaxEntries = 64;
-constexpr std::size_t kDecodeHeader = 16;
-
-__global__ __launch_bounds__(64) void DecodePrepKernel(const std::int32_t* ids,
-                                                       std::uint32_t n_tokens,
-                                                       std::uint8_t* scratch) {
-  __shared__ int e[64];
-  __shared__ int rank[64];
-  const int p = threadIdx.x;
-  const int n = static_cast<int>(n_tokens) * 8;
-  e[p] = p < n ? ids[p] : -1;
-  __syncthreads();
-  const bool valid = p < n && e[p] >= 0 && e[p] < 512;
-  bool leader = valid;
-  for (int q = 0; q < p && leader; ++q) {
-    leader = e[q] != e[p];
-  }
-  rank[p] = leader ? 1 : 0;
-  __syncthreads();
-  if (p == 0) {
-    int run = 0;
-    for (int q = 0; q < 64; ++q) {
-      const int f = rank[q];
-      rank[q] = run;
-      run += f;
-    }
-    *reinterpret_cast<int*>(scratch) = run;
-  }
-  __syncthreads();
-  if (leader) {
-    auto* entries = reinterpret_cast<DecodeEntry*>(scratch + kDecodeHeader);
-    DecodeEntry& en = entries[rank[p]];
-    en.expert = e[p];
-    int c = 0;
-    for (int q = p; q < n; ++q) {
-      if (e[q] == e[p]) {
-        en.pair[c++] = q;
-      }
-    }
-    en.count = c;
-  }
-}
-
 __device__ __forceinline__ float Dot32(const float* w, const float* x) {
   float a = 0.0F;
 #pragma unroll
@@ -328,15 +362,17 @@ void LaunchDecode(const void* w0, const void* w1, bool gate_up, const float* x,
 void DecodeDispatch(const void* w0, const void* w1, bool gate_up,
                     WeightType type, const float* x, const std::int32_t* ids,
                     std::uint32_t n_tokens, float limit, float* out,
-                    void* scratch, hipStream_t stream) {
+                    void* scratch, bool prepare, hipStream_t stream) {
   if (n_tokens == 0) {
     return;
   }
   if (n_tokens > 8) {
     throw std::invalid_argument("ling moe decode: n_tokens must be 1..8");
   }
-  hipLaunchKernelGGL(DecodePrepKernel, dim3(1), dim3(64), 0, stream, ids,
-                     n_tokens, static_cast<std::uint8_t*>(scratch));
+  if (prepare) {
+    hipLaunchKernelGGL(DecodePrepKernel, dim3(1), dim3(64), 0, stream, ids,
+                       n_tokens, static_cast<std::uint8_t*>(scratch));
+  }
   switch (type) {
     case WeightType::kIQ4_XS:
       LaunchDecode<WeightType::kIQ4_XS>(w0, w1, gate_up, x, limit, out,
@@ -362,12 +398,22 @@ void DecodeDispatch(const void* w0, const void* w1, bool gate_up,
 // ---------------------------------------------------------------------------
 // Prefill
 // ---------------------------------------------------------------------------
-// Scratch: [0] tile_count, then sorted pairs, then tiles {expert,start,count}.
+// Scratch: [0] tile_count, [1] sorted pair count, then the sorted pairs, the
+// tiles {expert, start, count}, and (256-aligned) the F16 activations of the
+// sorted pairs, `[sorted position][k]`.
 constexpr std::size_t kPrefillHeader = 16;
 
 std::uint32_t TileBound(std::uint32_t n_tokens, std::uint32_t tn) {
   const std::uint32_t pairs = n_tokens * kUsed;
   return std::min(kExperts, pairs) + pairs / tn + 1;
+}
+
+/// Byte offset of the F16 activation area in the prefill scratch.
+std::size_t XsOffset(std::uint32_t n_tokens) {
+  const std::size_t pairs = std::size_t{n_tokens} * kUsed;
+  return (kPrefillHeader + 4 * pairs +
+          12 * std::size_t{TileBound(n_tokens, 16)} + 255) &
+         ~std::size_t{255};
 }
 
 __global__ __launch_bounds__(1024) void PrefillPrepKernel(
@@ -405,6 +451,7 @@ __global__ __launch_bounds__(1024) void PrefillPrepKernel(
       run += cnt[e];
     }
     header[0] = nt;
+    header[1] = run;
   }
   __syncthreads();
   for (std::uint32_t p = tid; p < pairs; p += 1024) {
@@ -412,6 +459,35 @@ __global__ __launch_bounds__(1024) void PrefillPrepKernel(
     if (e >= 0 && e < 512) {
       sorted[off[e] + atomicAdd(&cur[e], 1)] = static_cast<int>(p);
     }
+  }
+}
+
+/// xs16[s][:] = F16(row of the s-th sorted pair): token rows of x for the
+/// gate/up projection (x is `[token][2560]`), pair rows of the activation
+/// (`[token * 8 + slot][768]`) for the down projection.
+template<bool kGateUp>
+__global__ __launch_bounds__(256) void GatherActKernel(
+    const float* x, const std::uint8_t* scratch, std::uint32_t xs_off) {
+  constexpr std::uint32_t kK = kGateUp ? kHidden : kFf;
+  const int* header = reinterpret_cast<const int*>(scratch);
+  const int s = blockIdx.x;
+  if (s >= header[1]) {
+    return;
+  }
+  const int pr = (header + kPrefillHeader / 4)[s];
+  const float4* src = reinterpret_cast<const float4*>(
+      x + (kGateUp ? static_cast<std::size_t>(pr >> 3) * kHidden
+                   : static_cast<std::size_t>(pr) * kFf));
+  auto* dst = reinterpret_cast<uint2*>(
+      const_cast<std::uint8_t*>(scratch) + xs_off +
+      static_cast<std::size_t>(s) * kK * sizeof(_Float16));
+  for (std::uint32_t i = threadIdx.x; i < kK / 4; i += 256) {
+    const float4 v = src[i];
+    struct {
+      _Float16 h[4];
+    } hv{{static_cast<_Float16>(v.x), static_cast<_Float16>(v.y),
+          static_cast<_Float16>(v.z), static_cast<_Float16>(v.w)}};
+    dst[i] = __builtin_bit_cast(uint2, hv);
   }
 }
 
@@ -429,15 +505,294 @@ __device__ __forceinline__ v16h LoadFrag(const _Float16* p) {
 
 constexpr int kLdsStride = 136;  // 128 halves + 8 pad (row stride 272 bytes)
 
+/// 32 floats -> 32 F16 at dst (16-byte aligned).
+__device__ __forceinline__ void Store32(_Float16* dst, const float (&v)[32]) {
+#pragma unroll
+  for (int m = 0; m < 4; ++m) {
+    struct {
+      _Float16 v[8];
+    } hv;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      hv.v[j] = static_cast<_Float16>(v[m * 8 + j]);
+    }
+    *reinterpret_cast<uint4*>(dst + m * 8) = __builtin_bit_cast(uint4, hv);
+  }
+}
+
+__device__ __forceinline__ void LoadBytes(std::uint32_t& dst,
+                                          const std::uint8_t* src) {
+  __builtin_memcpy(&dst, src, 4);
+}
+__device__ __forceinline__ void LoadBytes(std::uint16_t& dst,
+                                          const std::uint8_t* src) {
+  __builtin_memcpy(&dst, src, 2);
+}
+/// Loads 4 * N bytes as N dwords (the compiler merges them into wide loads).
+template<int N>
+__device__ __forceinline__ void LoadBytes(std::uint32_t (&dst)[N],
+                                          const std::uint8_t* src) {
+#pragma unroll
+  for (int i = 0; i < N; ++i) {
+    std::uint32_t w;
+    __builtin_memcpy(&w, src + 4 * i, 4);
+    dst[i] = w;
+  }
+}
+
+__device__ __forceinline__ int Byte(std::uint32_t w, int b) {
+  return static_cast<int>((w >> (8 * b)) & 0xFFU);
+}
+
+// ---- per-type staging of one (row, 2 units) share of a 128-wide K chunk ----
+// A thread owns the two 32-element units s0, s0 + 1 of a row, where
+// s0 = 4 * cb + 2 * h (cb = chunk & 1 selects the half of the 256-element
+// super-block, h the thread of the row pair). Fetch pulls their raw bytes into
+// registers (so the loads can be issued a chunk ahead), Expand dequantises
+// them with exactly the arithmetic of Unit<T>::Dequant.
+template<WeightType T>
+struct Stage;
+
+constexpr std::uint32_t PackBytes(int a, int b, int c, int d) {
+  return (static_cast<std::uint32_t>(a) & 0xFFU) |
+         ((static_cast<std::uint32_t>(b) & 0xFFU) << 8) |
+         ((static_cast<std::uint32_t>(c) & 0xFFU) << 16) |
+         ((static_cast<std::uint32_t>(d) & 0xFFU) << 24);
+}
+
+/// Byte B of w as a float (the compiler selects v_cvt_f32_ubyteB: one
+/// instruction, no shifting).
+template<int B>
+__device__ __forceinline__ float UByte(std::uint32_t w) {
+  return static_cast<float>(static_cast<std::uint8_t>(w >> (8 * B)));
+}
+
+/// v[4 * i + b] = fma(byte b of w, scale, bias) for b = 0..3; the products
+/// are exact in F32 for every use below (<= 24 significant bits), so the
+/// result is exactly what scale * (byte - offset) gives, with one convert and
+/// one fused multiply-add per element.
+__device__ __forceinline__ void Fma4(float* v, std::uint32_t w, float scale,
+                                     float bias) {
+  v[0] = __builtin_fmaf(UByte<0>(w), scale, bias);
+  v[1] = __builtin_fmaf(UByte<1>(w), scale, bias);
+  v[2] = __builtin_fmaf(UByte<2>(w), scale, bias);
+  v[3] = __builtin_fmaf(UByte<3>(w), scale, bias);
+}
+
+__device__ __forceinline__ uint2 Iq4Lookup(std::uint32_t q) {
+  // The 16-entry int8 codebook (detail::kIq4Values) plus 127 (so every entry
+  // is an unsigned byte) as four dwords; v_perm selects eight entries at a
+  // time (low three nibble bits), the fourth bit blends the two halves.
+  constexpr std::uint32_t t0 = PackBytes(0, 23, 44, 62);
+  constexpr std::uint32_t t1 = PackBytes(78, 92, 105, 117);
+  constexpr std::uint32_t t2 = PackBytes(128, 140, 152, 165);
+  constexpr std::uint32_t t3 = PackBytes(180, 196, 216, 240);
+  const std::uint32_t qe = q;
+  const std::uint32_t qo = q >> 4;
+  const std::uint32_t e_lo = __builtin_amdgcn_perm(t1, t0, qe & 0x07070707U);
+  const std::uint32_t o_lo = __builtin_amdgcn_perm(t1, t0, qo & 0x07070707U);
+  const std::uint32_t e_hi = __builtin_amdgcn_perm(t3, t2, qe & 0x07070707U);
+  const std::uint32_t o_hi = __builtin_amdgcn_perm(t3, t2, qo & 0x07070707U);
+  const std::uint32_t me = 0x03020100U | ((qe & 0x08080808U) >> 1);
+  const std::uint32_t mo = 0x03020100U | ((qo & 0x08080808U) >> 1);
+  return make_uint2(__builtin_amdgcn_perm(e_hi, e_lo, me),
+                    __builtin_amdgcn_perm(o_hi, o_lo, mo));
+}
+
+template<>
+struct Stage<WeightType::kIQ4_XS> {
+  struct Raw {
+    std::uint32_t hd, sl;  // d | scales_h << 16, scales_l[4]
+    std::uint32_t q[8];    // qs of units s0, s0 + 1
+  };
+  __device__ __forceinline__ static void Fetch(const std::uint8_t* blk, int cb,
+                                               int h, Raw& r) {
+    const int s0 = cb * 4 + h * 2;
+    LoadBytes(r.hd, blk);
+    LoadBytes(r.sl, blk + 4);
+    LoadBytes(r.q, blk + 8 + 16 * s0);
+  }
+  __device__ __forceinline__ static void Expand(const Raw& r, int cb, int h,
+                                                _Float16* dst) {
+    const int s0 = cb * 4 + h * 2;
+    const float d = detail::HalfBits(static_cast<std::uint16_t>(r.hd));
+    const std::uint32_t sh = r.hd >> 16;
+#pragma unroll
+    for (int uu = 0; uu < 2; ++uu) {
+      const int s = s0 + uu;
+      const int ls = ((Byte(r.sl, s >> 1) >> (4 * (s & 1))) & 0xF) |
+                     (((sh >> (2 * s)) & 3) << 4);
+      const float dl = d * static_cast<float>(ls - 32);
+      const float bias = -127.0F * dl;  // table entries are stored + 127
+      float v[32];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const uint2 t = Iq4Lookup(r.q[uu * 4 + i]);
+        Fma4(v + 4 * i, t.x, dl, bias);
+        Fma4(v + 16 + 4 * i, t.y, dl, bias);
+      }
+      Store32(dst + uu * 32, v);
+    }
+  }
+};
+
+/// detail::ScaleMinK4 on the 12 packed scale bytes, without indexing the
+/// array dynamically (that would put it in scratch memory): `cb` (the half of
+/// the super-block) is uniform, `j` = 4 * cb + (0..3) varies per lane.
+__device__ __forceinline__ void ScaleMin(int cb, int j,
+                                         const std::uint32_t (&sc)[3], int* s,
+                                         int* m) {
+  const std::uint64_t lo = sc[0] | (std::uint64_t{sc[1]} << 32);
+  const auto b8 = [](std::uint64_t v, int i) {
+    return static_cast<int>((v >> (8 * i)) & 0xFFU);
+  };
+  if (cb == 0) {  // j < 4
+    *s = b8(lo, j) & 63;
+    *m = b8(lo, j + 4) & 63;
+  } else {  // j in 4..7: bytes j - 4 and j of lo, byte j + 4 of the top word
+    const int jj = j - 4;
+    const int t = static_cast<int>((sc[2] >> (8 * jj)) & 0xFFU);
+    *s = (t & 0xF) | ((b8(lo, jj) >> 6) << 4);
+    *m = (t >> 4) | ((b8(lo, j) >> 6) << 4);
+  }
+}
+
+template<>
+struct Stage<WeightType::kQ4_K> {
+  struct Raw {
+    std::uint32_t dd;     // d | dmin << 16
+    std::uint32_t sc[3];  // scales[12]
+    std::uint32_t q[8];   // qs[32 * g .. +32), g = s0 / 2
+  };
+  __device__ __forceinline__ static void Fetch(const std::uint8_t* blk, int cb,
+                                               int h, Raw& r) {
+    const int g = cb * 2 + h;
+    LoadBytes(r.dd, blk);
+    LoadBytes(r.sc, blk + 4);
+    LoadBytes(r.q, blk + 16 + 32 * g);
+  }
+  __device__ __forceinline__ static void Expand(const Raw& r, int cb, int h,
+                                                _Float16* dst) {
+    const int g = cb * 2 + h;
+    const float d = detail::HalfBits(static_cast<std::uint16_t>(r.dd));
+    const float dmin = detail::HalfBits(static_cast<std::uint16_t>(r.dd >> 16));
+#pragma unroll
+    for (int uu = 0; uu < 2; ++uu) {
+      int sc, m;
+      ScaleMin(cb, 2 * g + uu, r.sc, &sc, &m);
+      const float d1 = d * static_cast<float>(sc);
+      const float m1 = dmin * static_cast<float>(m);
+      float v[32];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        Fma4(v + 4 * i, (r.q[i] >> (4 * uu)) & 0x0F0F0F0FU, d1, -m1);
+      }
+      Store32(dst + uu * 32, v);
+    }
+  }
+};
+
+template<>
+struct Stage<WeightType::kQ5_K> {
+  struct Raw {
+    std::uint32_t dd;
+    std::uint32_t sc[3];
+    std::uint32_t qh[8];  // qh[32]
+    std::uint32_t q[8];
+  };
+  __device__ __forceinline__ static void Fetch(const std::uint8_t* blk, int cb,
+                                               int h, Raw& r) {
+    const int g = cb * 2 + h;
+    LoadBytes(r.dd, blk);
+    LoadBytes(r.sc, blk + 4);
+    LoadBytes(r.qh, blk + 16);
+    LoadBytes(r.q, blk + 48 + 32 * g);
+  }
+  __device__ __forceinline__ static void Expand(const Raw& r, int cb, int h,
+                                                _Float16* dst) {
+    const int g = cb * 2 + h;
+    const float d = detail::HalfBits(static_cast<std::uint16_t>(r.dd));
+    const float dmin = detail::HalfBits(static_cast<std::uint16_t>(r.dd >> 16));
+#pragma unroll
+    for (int uu = 0; uu < 2; ++uu) {
+      const int s = 2 * g + uu;
+      int sc, m;
+      ScaleMin(cb, s, r.sc, &sc, &m);
+      const float d1 = d * static_cast<float>(sc);
+      const float m1 = dmin * static_cast<float>(m);
+      float v[32];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const std::uint32_t q = ((r.q[i] >> (4 * uu)) & 0x0F0F0F0FU) |
+                                (((r.qh[i] >> s) & 0x01010101U) << 4);
+        Fma4(v + 4 * i, q, d1, -m1);
+      }
+      Store32(dst + uu * 32, v);
+    }
+  }
+};
+
+template<>
+struct Stage<WeightType::kQ6_K> {
+  struct Raw {
+    std::uint32_t ql[16];  // ql[64 * cb .. +64): units uu = 0, 1
+    std::uint32_t qh[8];   // qh[32 * cb .. +32)
+    std::uint32_t sc;      // scales[8 * cb + 4 * h .. +4)
+    std::uint32_t d;       // d (low 16 bits)
+  };
+  __device__ __forceinline__ static void Fetch(const std::uint8_t* blk, int cb,
+                                               int h, Raw& r) {
+    LoadBytes(r.ql, blk + 64 * cb);
+    LoadBytes(r.qh, blk + 128 + 32 * cb);
+    LoadBytes(r.sc, blk + 192 + 8 * cb + 4 * h);
+    std::uint16_t d16;
+    LoadBytes(d16, blk + 208);
+    r.d = d16;
+  }
+  __device__ __forceinline__ static void Expand(const Raw& r, int /*cb*/, int h,
+                                                _Float16* dst) {
+    const float d = detail::HalfBits(static_cast<std::uint16_t>(r.d));
+#pragma unroll
+    for (int uu = 0; uu < 2; ++uu) {
+      const float d0 =
+          d * static_cast<float>(static_cast<std::int8_t>(Byte(r.sc, 2 * uu)));
+      const float d1 =
+          d *
+          static_cast<float>(static_cast<std::int8_t>(Byte(r.sc, 2 * uu + 1)));
+      const int lo_shift = 4 * h;
+      const int hi_shift = 4 * h + 2 * uu;
+      float v[32];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const std::uint32_t q = ((r.ql[uu * 8 + i] >> lo_shift) & 0x0F0F0F0FU) |
+                                (((r.qh[i] >> hi_shift) & 0x03030303U) << 4);
+        // d0 for elements 0..15 (i < 4), d1 for 16..31; q is stored + 32.
+        const float dq = i < 4 ? d0 : d1;
+        Fma4(v + 4 * i, q, dq, -32.0F * dq);
+      }
+      Store32(dst + uu * 32, v);
+    }
+  }
+};
+
+/// One block = a 64-weight-row tile (gate/up: 32 gate + 32 up rows) of one
+/// expert and one tile of <= 16 * NF of that expert's tokens. K advances in
+/// 128-wide chunks staged through LDS (dequantised F16 weights, F16
+/// activations; two barriers per chunk, small LDS footprint so several blocks
+/// share a CU). The raw quantised bytes and activations of the next chunk are
+/// loaded before the WMMAs of the current one, to keep memory requests in
+/// flight. The accumulator chain of every output element runs over
+/// consecutive 16-wide K slices whatever NF is.
 template<WeightType T, bool kGateUp, int NF>
 __global__ __launch_bounds__(128) void PrefillKernel(
-    const std::uint8_t* w0, const std::uint8_t* w1, const float* x, float limit,
-    float* out, const std::uint8_t* scratch, std::uint32_t pairs) {
+    const std::uint8_t* w0, const std::uint8_t* w1, float limit, float* out,
+    const std::uint8_t* scratch, std::uint32_t pairs, std::uint32_t xs_off) {
   constexpr int kTn = 16 * NF;
   constexpr std::uint32_t kK = kGateUp ? kHidden : kFf;
   constexpr std::uint32_t kRows = kGateUp ? kFf : kHidden;
   constexpr std::size_t kRb = RowBytes<T>(kK);
-  using Block = typename Unit<T>::Block;
+  constexpr int kXU = kTn * 16 / 128;  // 16-byte activation units per thread
+  using St = Stage<T>;
   __shared__ __attribute__((aligned(16))) _Float16 ws[64 * kLdsStride];
   __shared__ __attribute__((aligned(16))) _Float16 xs[kTn * kLdsStride];
   __shared__ int pair_s[kTn];
@@ -460,7 +815,7 @@ __global__ __launch_bounds__(128) void PrefillKernel(
   if (tid < kTn) {
     pair_s[tid] = tid < count ? sorted[start + tid] : -1;
   }
-  // Dequant mapping: thread = (weight row, half of the 128-wide chunk).
+  // Weight staging: thread = (weight row, half of the 128-wide chunk).
   const int wrow = tid >> 1;
   const int h = tid & 1;
   const std::uint8_t* mat = w0;
@@ -473,56 +828,52 @@ __global__ __launch_bounds__(128) void PrefillKernel(
   }
   const std::uint8_t* rowp =
       mat + (static_cast<std::size_t>(expert) * kRows + row) * kRb;
-  __syncthreads();
-
-  v8f acc[NF];
+  // Activation staging: unit = (tile row, 8 consecutive K).
+  const _Float16* xrow[kXU];
+  int xdst[kXU];
+  bool xlive[kXU];
 #pragma unroll
-  for (int f = 0; f < NF; ++f) {
-    acc[f] = v8f{};
+  for (int i = 0; i < kXU; ++i) {
+    const int idx = tid + i * 128;
+    const int j = idx >> 4, u = idx & 15;
+    xlive[i] = j < count;
+    xrow[i] = reinterpret_cast<const _Float16*>(scratch + xs_off) +
+              static_cast<std::size_t>(start + (xlive[i] ? j : 0)) * kK + u * 8;
+    xdst[i] = j * kLdsStride + u * 8;
+  }
+  // Rows past the tile's token count stay zero.
+  for (int idx = tid; idx < kTn * kLdsStride; idx += 128) {
+    if (idx / kLdsStride >= count) {
+      xs[idx] = static_cast<_Float16>(0.0F);
+    }
   }
 
-  for (std::uint32_t chunk = 0; chunk < kK / 128; ++chunk) {
-    {
-      const Block& blk = reinterpret_cast<const Block*>(rowp)[chunk >> 1];
-      float tmp[32];
+  constexpr std::uint32_t kChunks = kK / 128;
+  // Raw bytes and activations of one 128-wide chunk, fetched ahead of use.
+  struct Fetched {
+    typename St::Raw raw;
+    uint4 xr[kXU];
+  };
+  const auto fetch = [&](std::uint32_t c, Fetched& f) {
+    St::Fetch(rowp + (c >> 1) * sizeof(typename Unit<T>::Block),
+              static_cast<int>(c & 1), h, f.raw);
 #pragma unroll
-      for (int uu = 0; uu < 2; ++uu) {
-        Unit<T>::Dequant(blk, static_cast<int>((chunk & 1) * 4 + h * 2 + uu),
-                         tmp);
+    for (int i = 0; i < kXU; ++i) {
+      f.xr[i] = xlive[i] ? *reinterpret_cast<const uint4*>(xrow[i] + c * 128)
+                         : make_uint4(0, 0, 0, 0);
+    }
+  };
+  const auto commit = [&](std::uint32_t c, const Fetched& f) {
+    St::Expand(f.raw, static_cast<int>(c & 1), h,
+               &ws[wrow * kLdsStride + h * 64]);
 #pragma unroll
-        for (int m = 0; m < 4; ++m) {
-          struct {
-            _Float16 v[8];
-          } hv;
-#pragma unroll
-          for (int j = 0; j < 8; ++j) {
-            hv.v[j] = static_cast<_Float16>(tmp[m * 8 + j]);
-          }
-          *reinterpret_cast<uint4*>(
-              &ws[wrow * kLdsStride + h * 64 + uu * 32 + m * 8]) =
-              __builtin_bit_cast(uint4, hv);
-        }
+    for (int i = 0; i < kXU; ++i) {
+      if (xlive[i]) {
+        *reinterpret_cast<uint4*>(&xs[xdst[i]]) = f.xr[i];
       }
     }
-    for (int idx = tid; idx < kTn * 32; idx += 128) {
-      const int j = idx >> 5, c4 = idx & 31;
-      float4 v = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
-      const int pr = pair_s[j];
-      if (pr >= 0) {
-        const float* src =
-            x +
-            (kGateUp ? static_cast<std::size_t>(pr >> 3) * kHidden
-                     : static_cast<std::size_t>(pr) * kFf) +
-            chunk * 128 + c4 * 4;
-        v = *reinterpret_cast<const float4*>(src);
-      }
-      _Float16* d = &xs[j * kLdsStride + c4 * 4];
-      d[0] = static_cast<_Float16>(v.x);
-      d[1] = static_cast<_Float16>(v.y);
-      d[2] = static_cast<_Float16>(v.z);
-      d[3] = static_cast<_Float16>(v.w);
-    }
-    __syncthreads();
+  };
+  const auto compute = [&](v8f(&acc)[NF]) {
 #pragma unroll
     for (int kk = 0; kk < 8; ++kk) {
       const v16h a =
@@ -534,11 +885,29 @@ __global__ __launch_bounds__(128) void PrefillKernel(
         acc[f] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc[f]);
       }
     }
+  };
+
+  v8f acc[NF];
+#pragma unroll
+  for (int f = 0; f < NF; ++f) {
+    acc[f] = v8f{};
+  }
+  // Raw bytes and activations of the next chunk are loaded before the WMMAs
+  // of the current one.
+  Fetched cur;
+  fetch(0, cur);
+  for (std::uint32_t c = 0; c < kChunks; ++c) {
+    commit(c, cur);
+    __syncthreads();
+    if (c + 1 < kChunks) {
+      fetch(c + 1, cur);
+    }
+    compute(acc);
     __syncthreads();
   }
 
   // Epilogue through LDS (aliases the weight tile): C[row][token].
-  float* cs = reinterpret_cast<float*>(ws);
+  float* cs = reinterpret_cast<float*>(&ws[0]);
   constexpr int kCs = kTn + 1;
 #pragma unroll
   for (int f = 0; f < NF; ++f) {
@@ -578,14 +947,19 @@ void LaunchPrefillTile(const void* w0, const void* w1, bool gate_up,
   const auto* w0p = static_cast<const std::uint8_t*>(w0);
   const auto* w1p = static_cast<const std::uint8_t*>(w1);
   const auto* sp = static_cast<const std::uint8_t*>(scratch);
+  const auto xs_off = static_cast<std::uint32_t>(XsOffset(n_tokens));
   if (gate_up) {
+    hipLaunchKernelGGL(GatherActKernel<true>, dim3(pairs), dim3(256), 0, stream,
+                       x, sp, xs_off);
     hipLaunchKernelGGL((PrefillKernel<T, true, NF>), dim3(kFf / 32, tiles),
-                       dim3(128), 0, stream, w0p, w1p, x, limit, out, sp,
-                       pairs);
+                       dim3(128), 0, stream, w0p, w1p, limit, out, sp, pairs,
+                       xs_off);
   } else {
+    hipLaunchKernelGGL(GatherActKernel<false>, dim3(pairs), dim3(256), 0,
+                       stream, x, sp, xs_off);
     hipLaunchKernelGGL((PrefillKernel<T, false, NF>), dim3(kHidden / 64, tiles),
-                       dim3(128), 0, stream, w0p, w1p, x, limit, out, sp,
-                       pairs);
+                       dim3(128), 0, stream, w0p, w1p, limit, out, sp, pairs,
+                       xs_off);
   }
 }
 
@@ -593,36 +967,34 @@ template<WeightType T>
 void LaunchPrefill(const void* w0, const void* w1, bool gate_up, const float* x,
                    float limit, float* out, std::uint32_t n_tokens,
                    std::uint32_t nf, void* scratch, hipStream_t stream) {
-  switch (nf) {
-    case 1:
-      LaunchPrefillTile<T, 1>(w0, w1, gate_up, x, limit, out, n_tokens, scratch,
-                              stream);
-      break;
-    case 2:
-      LaunchPrefillTile<T, 2>(w0, w1, gate_up, x, limit, out, n_tokens, scratch,
-                              stream);
-      break;
-    default:
-      LaunchPrefillTile<T, 4>(w0, w1, gate_up, x, limit, out, n_tokens, scratch,
-                              stream);
-      break;
+  if (nf == 1) {
+    LaunchPrefillTile<T, 1>(w0, w1, gate_up, x, limit, out, n_tokens, scratch,
+                            stream);
+  } else {
+    LaunchPrefillTile<T, 2>(w0, w1, gate_up, x, limit, out, n_tokens, scratch,
+                            stream);
   }
 }
 
-/// Token-tile fragments (16 tokens each): empty tiles waste matrix-core issue,
-/// so pick by the mean tokens per expert (n_tokens / 64).
+/// Token-tile fragments (16 tokens each): a tile wider than an expert's
+/// tokens wastes matrix-core issue, so pick by the mean tokens per expert
+/// (n_tokens / 64). gfx1151 (WS13 round 1): nf=1 wins at n = 64 and 512 (mean 1
+/// and 8), nf=2 at n = 2048 (mean 32); switch where the mean reaches one tile
+/// (16). The tile choice does not change any output bit.
 std::uint32_t PickFrags(std::uint32_t n_tokens) {
-  return n_tokens <= 512 ? 1 : (n_tokens <= 2048 ? 2 : 4);
+  return n_tokens <= 1024 ? 1 : 2;
 }
 
 void PrefillDispatch(const void* w0, const void* w1, bool gate_up,
                      WeightType type, const float* x, const std::int32_t* ids,
                      std::uint32_t n_tokens, float limit, float* out,
-                     void* scratch, hipStream_t stream) {
+                     void* scratch, std::uint32_t nf, hipStream_t stream) {
   if (n_tokens == 0) {
     return;
   }
-  const std::uint32_t nf = PickFrags(n_tokens);
+  if (nf == 0) {
+    nf = PickFrags(n_tokens);
+  }
   hipLaunchKernelGGL(PrefillPrepKernel, dim3(1), dim3(1024), 0, stream, ids,
                      n_tokens * kUsed, 16 * nf,
                      static_cast<std::uint8_t*>(scratch));
@@ -694,13 +1066,29 @@ void Route(const float* logits, const float* bias, std::int32_t* ids,
     return;
   }
   hipLaunchKernelGGL(RouteKernel, dim3(n_tokens), dim3(256), 0, stream, logits,
-                     bias, ids, weights);
+                     bias, ids, weights, static_cast<std::uint32_t*>(nullptr),
+                     static_cast<std::uint8_t*>(nullptr));
+}
+
+void RouteDecode(const float* logits, const float* bias, std::int32_t* ids,
+                 float* weights, std::uint32_t n_tokens, void* scratch,
+                 std::uint32_t* counter, hipStream_t stream) {
+  if (n_tokens == 0) {
+    return;
+  }
+  if (n_tokens > 8) {
+    throw std::invalid_argument("ling moe RouteDecode: n_tokens must be 1..8");
+  }
+  hipLaunchKernelGGL(RouteKernel, dim3(n_tokens), dim3(256), 0, stream, logits,
+                     bias, ids, weights, counter,
+                     static_cast<std::uint8_t*>(scratch));
 }
 
 std::size_t PrefillScratchBytes(std::uint32_t n_tokens) {
-  const std::size_t pairs = std::size_t{n_tokens} * kUsed;
-  // Sized for the narrowest tile (16 tokens), the largest tile count.
-  return kPrefillHeader + 4 * pairs + 12 * std::size_t{TileBound(n_tokens, 16)};
+  // Sized for the narrowest tile (16 tokens), the largest tile count, plus
+  // the F16 activations of the sorted pairs (up to 2560 wide).
+  return XsOffset(n_tokens) +
+         std::size_t{n_tokens} * kUsed * kHidden * sizeof(_Float16);
 }
 
 std::size_t DecodeScratchBytes() {
@@ -712,14 +1100,31 @@ void ExpertGateUpDecode(const void* gate, const void* up, WeightType type,
                         std::uint32_t n_tokens, float limit, float* act,
                         void* scratch, hipStream_t stream) {
   DecodeDispatch(gate, up, true, type, x, ids, n_tokens, limit, act, scratch,
-                 stream);
+                 true, stream);
 }
 
 void ExpertDownDecode(const void* down, WeightType type, const float* act,
                       const std::int32_t* ids, std::uint32_t n_tokens,
                       float* out, void* scratch, hipStream_t stream) {
   DecodeDispatch(down, down, false, type, act, ids, n_tokens, 0.0F, out,
-                 scratch, stream);
+                 scratch, true, stream);
+}
+
+void ExpertGateUpDecodePlanned(const void* gate, const void* up,
+                               WeightType type, const float* x,
+                               const std::int32_t* ids, std::uint32_t n_tokens,
+                               float limit, float* act, void* scratch,
+                               hipStream_t stream) {
+  DecodeDispatch(gate, up, true, type, x, ids, n_tokens, limit, act, scratch,
+                 false, stream);
+}
+
+void ExpertDownDecodePlanned(const void* down, WeightType type,
+                             const float* act, const std::int32_t* ids,
+                             std::uint32_t n_tokens, float* out, void* scratch,
+                             hipStream_t stream) {
+  DecodeDispatch(down, down, false, type, act, ids, n_tokens, 0.0F, out,
+                 scratch, false, stream);
 }
 
 void ExpertGateUpPrefill(const void* gate, const void* up, WeightType type,
@@ -727,14 +1132,31 @@ void ExpertGateUpPrefill(const void* gate, const void* up, WeightType type,
                          std::uint32_t n_tokens, float limit, float* act,
                          void* scratch, hipStream_t stream) {
   PrefillDispatch(gate, up, true, type, x, ids, n_tokens, limit, act, scratch,
-                  stream);
+                  0, stream);
+}
+
+void ExpertGateUpPrefillTile(const void* gate, const void* up, WeightType type,
+                             const float* x, const std::int32_t* ids,
+                             std::uint32_t n_tokens, float limit, float* act,
+                             void* scratch, std::uint32_t nf,
+                             hipStream_t stream) {
+  PrefillDispatch(gate, up, true, type, x, ids, n_tokens, limit, act, scratch,
+                  nf, stream);
 }
 
 void ExpertDownPrefill(const void* down, WeightType type, const float* act,
                        const std::int32_t* ids, std::uint32_t n_tokens,
                        float* out, void* scratch, hipStream_t stream) {
   PrefillDispatch(down, down, false, type, act, ids, n_tokens, 0.0F, out,
-                  scratch, stream);
+                  scratch, 0, stream);
+}
+
+void ExpertDownPrefillTile(const void* down, WeightType type, const float* act,
+                           const std::int32_t* ids, std::uint32_t n_tokens,
+                           float* out, void* scratch, std::uint32_t nf,
+                           hipStream_t stream) {
+  PrefillDispatch(down, down, false, type, act, ids, n_tokens, 0.0F, out,
+                  scratch, nf, stream);
 }
 
 void Combine(float* res, const float* expert_out, const float* weights,

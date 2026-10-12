@@ -1,6 +1,7 @@
-// Op tests of the Ling-3.0-flash MLA kernels (absorbed form) against scalar
-// host references computed in double, fixed seeds. Prints max abs / relative
-// errors (relative = max abs error / max |reference|). Exit 77 without a GPU.
+// Op tests of the Ling-3.0-flash MLA kernels (absorbed and non-absorbed)
+// against scalar host references computed in double, fixed seeds. Prints max
+// abs / relative errors (relative = max abs error / max |reference|). Exit 77
+// without a GPU.
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -290,7 +291,12 @@ void TestLatentNormRopeAndAppend() {
                                  __float2half(7.0F));
     Dev<__half> d_cache(sentinel);
     __half* layer1 = d_cache.get() + (std::size_t{capacity} * kW);
-    mla::CacheAppend(layer1, d_out.get(), first_pos, n, nullptr);
+    std::vector<std::int32_t> append_pos(n);
+    for (std::uint32_t t = 0; t < n; ++t) {
+      append_pos[t] = static_cast<std::int32_t>(first_pos + t);
+    }
+    Dev<std::int32_t> d_append_pos(append_pos);
+    mla::CacheAppend(layer1, d_out.get(), d_append_pos.get(), n, nullptr);
     CheckHip(hipDeviceSynchronize(), "sync");
     const auto cache = d_cache.Download();
     bool exact = true;
@@ -372,8 +378,11 @@ void TestDecode() {
     Dev<float> d_q(q);
     Dev<float> d_out(std::size_t{kH} * kLat);
     Dev<std::uint8_t> d_scratch(mla::DecodeScratchBytes(70000));
-    mla::DecodeAttention(d_q.get(), d_cache.get() + layer_elems, context,
-                         d_out.get(), d_scratch.get(), nullptr);
+    Dev<std::int32_t> d_position(
+        std::vector<std::int32_t>{static_cast<std::int32_t>(context - 1)});
+    mla::DecodeAttention(d_q.get(), d_cache.get() + layer_elems,
+                         d_position.get(), d_out.get(), d_scratch.get(),
+                         nullptr);
     CheckHip(hipDeviceSynchronize(), "sync");
     const auto got = d_out.Download();
     std::vector<double> want;
@@ -386,83 +395,6 @@ void TestDecode() {
   }
 }
 
-void TestPrefill() {
-  struct Case {
-    std::uint32_t n;
-    std::uint32_t first;
-  };
-  for (const Case c : {Case{1, 0}, Case{1, 1000}, Case{64, 0}, Case{64, 1000},
-                       Case{512, 0}, Case{512, 1000}}) {
-    const std::uint32_t total = c.first + c.n;
-    const std::vector<__half> cache = MakeCache(total, 41 + total);
-    const std::vector<float> q =
-        Normal(std::size_t{c.n} * kH * kW, 42 + c.n + c.first, 1.7F);
-    Dev<__half> d_cache(cache);
-    Dev<float> d_q(q);
-    Dev<float> d_out(std::size_t{c.n} * kH * kLat);
-    mla::PrefillAttention(d_q.get(), d_cache.get(), c.first, c.n, d_out.get(),
-                          nullptr, nullptr);
-    CheckHip(hipDeviceSynchronize(), "sync");
-    const auto got = d_out.Download();
-    // Every token for small chunks, a spread sample (incl. tile edges) else.
-    std::vector<std::uint32_t> tokens;
-    if (c.n <= 64) {
-      for (std::uint32_t t = 0; t < c.n; ++t) {
-        tokens.push_back(t);
-      }
-    } else {
-      for (const std::uint32_t t :
-           {0U, 1U, 15U, 16U, 17U, 100U, 255U, 256U, 301U, 480U, 510U, 511U}) {
-        tokens.push_back(t);
-      }
-    }
-    std::vector<Err> errs(tokens.size());
-    ParallelFor(tokens.size(), [&](std::size_t i) {
-      const std::uint32_t t = tokens[i];
-      std::vector<double> want;
-      HostAbsorbedAttention(&q[std::size_t{t} * kH * kW], cache.data(),
-                            c.first + t + 1, &want);
-      for (std::size_t j = 0; j < want.size(); ++j) {
-        errs[i].Add(got[(std::size_t{t} * kH * kLat) + j], want[j]);
-      }
-    });
-    Err err;
-    for (const Err& e : errs) {
-      err.max_abs = std::max(err.max_abs, e.max_abs);
-      err.max_ref = std::max(err.max_ref, e.max_ref);
-    }
-    Report("PrefillAttention T=" + std::to_string(c.n) +
-               " first_pos=" + std::to_string(c.first),
-           err, 1.5e-3);
-
-    if (c.n == 512) {
-      // Chunked prefill must equal the single launch (same tile sweep).
-      Dev<float> d_chunked(std::size_t{c.n} * kH * kLat);
-      for (std::uint32_t t0 = 0; t0 < c.n; t0 += 64) {
-        mla::PrefillAttention(d_q.get() + (std::size_t{t0} * kH * kW),
-                              d_cache.get(), c.first + t0, 64,
-                              d_chunked.get() + (std::size_t{t0} * kH * kLat),
-                              nullptr, nullptr);
-      }
-      CheckHip(hipDeviceSynchronize(), "sync");
-      const auto chunked = d_chunked.Download();
-      Err same;
-      for (std::size_t i = 0; i < got.size(); ++i) {
-        same.Add(chunked[i], got[i]);
-      }
-      std::printf(
-          "%-44s max_abs_diff=%.3e %s\n",
-          ("Prefill chunked(64) == single, first=" + std::to_string(c.first))
-              .c_str(),
-          same.max_abs, same.max_abs == 0.0 ? "PASS" : "FAIL");
-      g_failures += same.max_abs == 0.0 ? 0 : 1;
-    }
-  }
-}
-
-// Batch invariance: a token's attention output must not depend on how the
-// prompt was chunked or on whether it was computed by the prefill or the decode
-// kernel. Compared bit for bit over every split point and context length.
 std::size_t CountDiff(const float* a, const float* b, std::size_t n) {
   std::size_t d = 0;
   for (std::size_t i = 0; i < n; ++i)
@@ -470,67 +402,272 @@ std::size_t CountDiff(const float* a, const float* b, std::size_t n) {
   return d;
 }
 
-void TestAttentionBatchInvariance() {
-  constexpr std::size_t kTok = kH * kLat;
-  for (const std::uint32_t total : {106U, 97U, 160U, 33U, 300U}) {
-    const std::vector<__half> cache = MakeCache(total, 91 + total);
+// ---- non-absorbed prefill ---------------------------------------------------
+
+// k_b / v_b as the engine holds them: Q8_0 on the device plus the F16 expansion
+// weights built from them.
+struct NaWeights {
+  Q8Weights kb;
+  Q8Weights vb;
+  Dev<std::uint8_t> d_kb;
+  Dev<std::uint8_t> d_vb;
+  Dev<__half> d_w16;
+  explicit NaWeights(std::uint32_t seed)
+      : kb(MakeQ8(kLat, kNope, seed, 0.05F)),
+        vb(MakeQ8(kV, kLat, seed + 1, 0.05F)),
+        d_kb(kb.bytes),
+        d_vb(vb.bytes),
+        d_w16(mla::ExpansionWeightBytes() / sizeof(__half)) {
+    mla::BuildExpansionWeights(d_kb.get(), d_vb.get(), d_w16.get(), nullptr);
+    CheckHip(hipDeviceSynchronize(), "sync");
+  }
+};
+
+// Device non-absorbed prefill of `n` tokens at `first` from raw q
+// ([t][32][192], un-roped). Returns [t][32*128].
+std::vector<float> RunNa(NaWeights& w, __half* cache, std::uint32_t first,
+                         std::uint32_t n, Dev<std::uint8_t>& scratch,
+                         Dev<float>& d_qr, Dev<float>& d_out,
+                         const float* d_q_src, const float* d_gate,
+                         __half* store = nullptr, std::uint32_t rows = 0) {
+  std::vector<std::int32_t> pos(n);
+  for (std::uint32_t t = 0; t < n; ++t) {
+    pos[t] = static_cast<std::int32_t>(first + t);
+  }
+  Dev<std::int32_t> d_pos(pos);
+  mla::QPrepare(d_q_src, d_pos.get(), d_qr.get(), n, nullptr);
+  if (rows > 0) {
+    mla::ExpandRows(cache, w.d_w16.get(), store, rows, 0,
+                    std::min(first + n, rows), nullptr);
+  }
+  mla::PrefillAttentionNonAbsorbed(d_qr.get(), cache, w.d_w16.get(), store,
+                                   rows, d_gate, first, n, d_out.get(),
+                                   scratch.get(), nullptr);
+  CheckHip(hipDeviceSynchronize(), "sync");
+  return d_out.Download();
+}
+
+// Reference for one token: absorb q on the host, attend over the F16 cache in
+// double, expand with v_b. Equals the non-absorbed math before F16 rounding of
+// the expanded K/V. Returns [32][128].
+std::vector<double> HostNaToken(const NaWeights& w, const float* q_raw,
+                                std::int32_t pos, const __half* cache,
+                                std::uint32_t n_keys) {
+  std::vector<float> q_abs(std::size_t{kH} * kW);
+  for (std::uint32_t h = 0; h < kH; ++h) {
+    const float* qh = q_raw + (std::size_t{h} * kQH);
+    for (std::uint32_t c = 0; c < kLat; ++c) {
+      double acc = 0;
+      const float* k = &w.kb.dequant[((std::size_t{h} * kLat) + c) * kNope];
+      for (std::uint32_t d = 0; d < kNope; ++d) {
+        acc += static_cast<double>(qh[d]) * k[d];
+      }
+      q_abs[(std::size_t{h} * kW) + c] = static_cast<float>(acc);
+    }
+    std::vector<double> pe(kRopeDim);
+    std::vector<double> rot(kRopeDim);
+    for (std::uint32_t i = 0; i < kRopeDim; ++i) {
+      pe[i] = qh[kNope + i];
+    }
+    HostRope(pe.data(), rot.data(), pos);
+    for (std::uint32_t i = 0; i < kRopeDim; ++i) {
+      q_abs[(std::size_t{h} * kW) + kLat + i] = static_cast<float>(rot[i]);
+    }
+  }
+  std::vector<double> lat;
+  HostAbsorbedAttention(q_abs.data(), cache, n_keys, &lat);
+  std::vector<double> out(std::size_t{kH} * kV);
+  for (std::uint32_t h = 0; h < kH; ++h) {
+    for (std::uint32_t e = 0; e < kV; ++e) {
+      const float* v = &w.vb.dequant[((std::size_t{h} * kV) + e) * kLat];
+      double acc = 0;
+      for (std::uint32_t c = 0; c < kLat; ++c) {
+        acc += lat[(std::size_t{h} * kLat) + c] * v[c];
+      }
+      out[(std::size_t{h} * kV) + e] = acc;
+    }
+  }
+  return out;
+}
+
+void TestNonAbsorbedPrefill() {
+  NaWeights w(71);
+  struct Case {
+    std::uint32_t n;
+    std::uint32_t first;
+  };
+  for (const Case c :
+       {Case{9, 0}, Case{9, 1000}, Case{9, 65536}, Case{64, 0}, Case{64, 1000},
+        Case{64, 65536}, Case{512, 0}, Case{512, 1000}, Case{512, 65536},
+        Case{40, 4090}, Case{2048, 0}}) {
+    const std::uint32_t total = c.first + c.n;
+    const std::vector<__half> cache = MakeCache(total, 141 + total);
     const std::vector<float> q =
-        Normal(std::size_t{total} * kH * kW, 92 + total, 1.7F);
+        Normal(std::size_t{c.n} * kH * kQH, 142 + c.n + c.first, 1.7F);
+    const std::vector<float> gate = Normal(std::size_t{c.n} * kH, 143, 1.5F);
     Dev<__half> d_cache(cache);
     Dev<float> d_q(q);
-    Dev<float> d_one(std::size_t{total} * kTok);
-    Dev<float> d_two(std::size_t{total} * kTok);
-    mla::PrefillAttention(d_q.get(), d_cache.get(), 0, total, d_one.get(),
-                          nullptr, nullptr);
+    Dev<float> d_gate(gate);
+    Dev<float> d_qr(std::size_t{c.n} * kH * kQH);
+    Dev<float> d_out(std::size_t{c.n} * kH * kV);
+    Dev<std::uint8_t> d_scratch(mla::NonAbsorbedScratchBytes(c.n));
+    const auto got = RunNa(w, d_cache.get(), c.first, c.n, d_scratch, d_qr,
+                           d_out, d_q.get(), d_gate.get());
+    std::vector<std::uint32_t> tokens;
+    for (const std::uint32_t t :
+         {0U, 1U, 2U, c.n / 3, c.n / 2, c.n - 2, c.n - 1}) {
+      if (t < c.n && std::find(tokens.begin(), tokens.end(), t) == tokens.end())
+        tokens.push_back(t);
+    }
+    if (c.first < 2000) {
+      for (const std::uint32_t t : {15U, 16U, 17U, 31U, 32U, 33U, 63U, 64U}) {
+        if (t < c.n &&
+            std::find(tokens.begin(), tokens.end(), t) == tokens.end())
+          tokens.push_back(t);
+      }
+    }
+    std::vector<Err> errs(tokens.size());
+    ParallelFor(tokens.size(), [&](std::size_t i) {
+      const std::uint32_t t = tokens[i];
+      const auto want = HostNaToken(w, &q[std::size_t{t} * kH * kQH],
+                                    static_cast<std::int32_t>(c.first + t),
+                                    cache.data(), c.first + t + 1);
+      for (std::uint32_t h = 0; h < kH; ++h) {
+        const double sg = 1.0 / (1.0 + std::exp(-static_cast<double>(
+                                           gate[(std::size_t{t} * kH) + h])));
+        for (std::uint32_t e = 0; e < kV; ++e) {
+          errs[i].Add(got[(std::size_t{t} * kH * kV) + (h * kV) + e],
+                      want[(std::size_t{h} * kV) + e] * sg);
+        }
+      }
+    });
+    Err err;
+    for (const Err& e : errs) {
+      err.max_abs = std::max(err.max_abs, e.max_abs);
+      err.max_ref = std::max(err.max_ref, e.max_ref);
+    }
+    Report("NonAbsorbed prefill T=" + std::to_string(c.n) +
+               " first_pos=" + std::to_string(c.first),
+           err, 3e-3);
+  }
+}
+
+// Bitwise split invariance of the non-absorbed prefill: one chunk of the whole
+// run (transient expansion only) against two and three chunks, at every split
+// point (all points for short runs, a spread incl. tile / key-block edges for
+// long ones), from first positions that put chunk boundaries at odd and even
+// offsets of a 16-key tile. Every layout also changes where the expanded rows
+// live: none, 2048 or 4096 persistent rows (expanded incrementally like the
+// engine does), so the transient / persistent equivalence and the fold over
+// key blocks are covered together. The cache beyond a part's end holds the
+// other part's rows, so masked partner keys differ between the layouts (the
+// WMMA key-pair quirk).
+void TestNonAbsorbedInvariance() {
+  NaWeights w(81);
+  constexpr std::size_t kTok = kH * kV;
+  struct Case {
+    std::uint32_t base;
+    std::uint32_t total;
+    bool all;
+  };
+  constexpr std::uint32_t kStoreRows[3] = {0, 2048, 4096};
+  Dev<__half> stores[3] = {Dev<__half>(1),
+                           Dev<__half>(mla::ExpandedLayerBytes(2048) / 2),
+                           Dev<__half>(mla::ExpandedLayerBytes(4096) / 2)};
+  for (const Case c :
+       {Case{0, 106, true}, Case{0, 97, true}, Case{0, 160, true},
+        Case{0, 33, true}, Case{0, 300, true}, Case{1000, 97, true},
+        Case{2025, 70, true}, Case{4090, 40, true}, Case{0, 2100, false},
+        Case{3000, 300, false}, Case{0, 2048, false},
+        Case{4000, 2100, false}}) {
+    const std::uint32_t rows = c.base + c.total;
+    const std::vector<__half> cache = MakeCache(rows, 191 + rows);
+    const std::vector<float> q =
+        Normal(std::size_t{c.total} * kH * kQH, 192 + rows, 1.7F);
+    const std::vector<float> gate =
+        Normal(std::size_t{c.total} * kH, 193, 1.5F);
+    Dev<__half> d_cache(cache);
+    Dev<float> d_q(q);
+    Dev<float> d_gate(gate);
+    Dev<float> d_qr(std::size_t{c.total} * kH * kQH);
+    Dev<float> d_one(std::size_t{c.total} * kTok);
+    Dev<float> d_two(std::size_t{c.total} * kTok);
+    Dev<std::uint8_t> d_scratch(mla::NonAbsorbedScratchBytes(c.total));
+    const auto run = [&](Dev<float>& dst, std::uint32_t t0, std::uint32_t n,
+                         int cfg) {
+      std::vector<std::int32_t> pos(n);
+      for (std::uint32_t t = 0; t < n; ++t) {
+        pos[t] = static_cast<std::int32_t>(c.base + t0 + t);
+      }
+      Dev<std::int32_t> d_pos(pos);
+      mla::QPrepare(d_q.get() + (std::size_t{t0} * kH * kQH), d_pos.get(),
+                    d_qr.get() + (std::size_t{t0} * kH * kQH), n, nullptr);
+      if (kStoreRows[cfg] > 0) {
+        mla::ExpandRows(d_cache.get(), w.d_w16.get(), stores[cfg].get(),
+                        kStoreRows[cfg], t0 == 0 ? 0 : c.base + t0,
+                        c.base + t0 + n, nullptr);
+      }
+      mla::PrefillAttentionNonAbsorbed(
+          d_qr.get() + (std::size_t{t0} * kH * kQH), d_cache.get(),
+          w.d_w16.get(), stores[cfg].get(), kStoreRows[cfg],
+          d_gate.get() + (std::size_t{t0} * kH), c.base + t0, n,
+          dst.get() + (std::size_t{t0} * kTok), d_scratch.get(), nullptr);
+    };
+    run(d_one, 0, c.total, 0);
     CheckHip(hipDeviceSynchronize(), "sync");
     const auto one = d_one.Download();
-    std::size_t bad_splits = 0;
+    std::vector<std::uint32_t> splits;
+    if (c.all) {
+      for (std::uint32_t s = 1; s < c.total; ++s)
+        splits.push_back(s);
+    } else {
+      for (const std::uint32_t s :
+           {1U,    8U,    9U,    15U,   16U,   17U,   31U,   33U,
+            63U,   64U,   65U,   100U,  1000U, 2023U, 2024U, 2025U,
+            2047U, 2048U, 2049U, 2087U, 2088U, 2089U}) {
+        if (s < c.total)
+          splits.push_back(s);
+      }
+    }
+    std::size_t bad = 0;
     std::uint32_t first_bad = 0;
-    for (std::uint32_t s = 1; s < total; ++s) {
-      mla::PrefillAttention(d_q.get(), d_cache.get(), 0, s, d_two.get(),
-                            nullptr, nullptr);
-      mla::PrefillAttention(
-          d_q.get() + (std::size_t{s} * kH * kW), d_cache.get(), s, total - s,
-          d_two.get() + (std::size_t{s} * kTok), nullptr, nullptr);
+    for (std::size_t i = 0; i < splits.size(); ++i) {
+      const std::uint32_t s = splits[i];
+      const int cfg = static_cast<int>(i % 3);
+      run(d_two, 0, s, cfg);
+      run(d_two, s, c.total - s, cfg);
       CheckHip(hipDeviceSynchronize(), "sync");
       const auto two = d_two.Download();
       if (CountDiff(one.data(), two.data(), one.size()) != 0) {
-        if (bad_splits++ == 0)
+        if (bad++ == 0)
           first_bad = s;
       }
     }
-    std::printf("%-44s differing splits=%zu (first %u) %s\n",
-                ("Prefill split == single, N=" + std::to_string(total)).c_str(),
-                bad_splits, first_bad, bad_splits == 0 ? "PASS" : "FAIL");
-    g_failures += bad_splits == 0 ? 0 : 1;
-
-    // Decode of the last token of every context length vs prefill. Decode
-    // splits the key range in chunks of 256 and merges the partials, which
-    // reorders the sum, so the bits match only for a single split (<= 256).
-    Dev<std::uint8_t> d_scratch(mla::DecodeScratchBytes(total));
-    Dev<float> d_dec(kTok);
-    std::size_t bad_ctx = 0;
-    std::uint32_t first_ctx = 0;
-    for (std::uint32_t c = 1; c <= std::min(total, 256U); ++c) {
-      mla::PrefillAttention(d_q.get(), d_cache.get(), 0, c, d_two.get(),
-                            nullptr, nullptr);
-      mla::DecodeAttention(d_q.get() + (std::size_t{c - 1} * kH * kW),
-                           d_cache.get(), c, d_dec.get(), d_scratch.get(),
-                           nullptr);
-      CheckHip(hipDeviceSynchronize(), "sync");
-      const auto pre = d_two.Download();
-      const auto dec = d_dec.Download();
-      if (CountDiff(dec.data(), pre.data() + (std::size_t{c - 1} * kTok),
-                    kTok) != 0) {
-        if (bad_ctx++ == 0)
-          first_ctx = c;
+    // Three chunks (a, b, rest), store layouts rotating.
+    std::size_t bad3 = 0;
+    std::size_t tried3 = 0;
+    for (const std::uint32_t a : {9U, 16U, 33U, 100U}) {
+      for (const std::uint32_t b : {9U, 17U, 64U, 1000U}) {
+        if (a + b >= c.total)
+          continue;
+        const int cfg = static_cast<int>(tried3++ % 3);
+        run(d_two, 0, a, cfg);
+        run(d_two, a, b, cfg);
+        run(d_two, a + b, c.total - a - b, cfg);
+        CheckHip(hipDeviceSynchronize(), "sync");
+        const auto two = d_two.Download();
+        bad3 += CountDiff(one.data(), two.data(), one.size()) != 0;
       }
     }
-    std::printf(
-        "%-44s differing contexts=%zu (first %u) %s\n",
-        ("Decode == prefill last token, N=" + std::to_string(total)).c_str(),
-        bad_ctx, first_ctx, bad_ctx == 0 ? "PASS" : "FAIL");
-    g_failures += bad_ctx == 0 ? 0 : 1;
+    const std::string label =
+        "base=" + std::to_string(c.base) + " N=" + std::to_string(c.total);
+    std::printf("%-44s differing splits=%zu of %zu (first %u) %s\n",
+                ("NonAbsorbed split == single, " + label).c_str(), bad,
+                splits.size(), first_bad, bad == 0 ? "PASS" : "FAIL");
+    std::printf("%-44s differing layouts=%zu of %zu %s\n",
+                ("NonAbsorbed 3 chunks == single, " + label).c_str(), bad3,
+                tried3, bad3 == 0 ? "PASS" : "FAIL");
+    g_failures += (bad == 0 ? 0 : 1) + (bad3 == 0 ? 0 : 1);
   }
 }
 
@@ -600,31 +737,48 @@ void TestLayerCoreVsNonAbsorbed() {
   Dev<float> d_lat(std::size_t{total} * kH * kLat);
   Dev<float> d_out(std::size_t{total} * kH * kV);
   Dev<std::uint8_t> d_scratch(mla::DecodeScratchBytes(128));
+  // Non-absorbed prefill of the same 40-token chunk (engine path for n > 8).
+  Dev<__half> d_w16(mla::ExpansionWeightBytes() / sizeof(__half));
+  mla::BuildExpansionWeights(d_kb.get(), d_vb.get(), d_w16.get(), nullptr);
+  Dev<__half> d_cache_na(std::size_t{128} * kW);
+  const std::size_t last = n_pre;
+  Dev<float> d_qr(std::size_t{total} * kH * kQH);
+  Dev<float> d_out_na(std::size_t{total} * kH * kV);
+  Dev<std::uint8_t> d_scratch_na(mla::NonAbsorbedScratchBytes(n_pre));
 
   // Prefill chunk (tokens 0..39), then the decode token 40.
   mla::LatentNormRope(d_kv_a.get(), d_gamma.get(), d_pos.get(), d_kv.get(),
                       n_pre, nullptr);
-  mla::CacheAppend(d_cache.get(), d_kv.get(), 0, n_pre, nullptr);
-  mla::QAbsorb(d_q.get(), d_kb.get(), d_pos.get(), d_qabs.get(), n_pre,
-               nullptr);
-  mla::PrefillAttention(d_qabs.get(), d_cache.get(), 0, n_pre, d_lat.get(),
-                        nullptr, nullptr);
-  mla::VbUpProjGate(d_lat.get(), d_vb.get(), d_gate.get(), d_out.get(), n_pre,
-                    nullptr);
-  const std::size_t last = n_pre;
+  mla::CacheAppend(d_cache.get(), d_kv.get(), d_pos.get(), n_pre, nullptr);
   mla::LatentNormRope(d_kv_a.get() + (last * kW), d_gamma.get(),
                       d_pos.get() + last, d_kv.get() + (last * kW), 1, nullptr);
-  mla::CacheAppend(d_cache.get(), d_kv.get() + (last * kW), n_pre, 1, nullptr);
+  mla::CacheAppend(d_cache.get(), d_kv.get() + (last * kW), d_pos.get() + last,
+                   1, nullptr);
   mla::QAbsorb(d_q.get() + (last * kH * kQH), d_kb.get(), d_pos.get() + last,
                d_qabs.get() + (last * kH * kW), 1, nullptr);
-  mla::DecodeAttention(d_qabs.get() + (last * kH * kW), d_cache.get(), total,
-                       d_lat.get() + (last * kH * kLat), d_scratch.get(),
-                       nullptr);
+  mla::DecodeAttention(d_qabs.get() + (last * kH * kW), d_cache.get(),
+                       d_pos.get() + last, d_lat.get() + (last * kH * kLat),
+                       d_scratch.get(), nullptr);
   mla::VbUpProjGate(d_lat.get() + (last * kH * kLat), d_vb.get(),
                     d_gate.get() + (last * kH), d_out.get() + (last * kH * kV),
                     1, nullptr);
+  mla::CacheAppend(d_cache_na.get(), d_kv.get(), d_pos.get(), n_pre, nullptr);
+  mla::QPrepare(d_q.get(), d_pos.get(), d_qr.get(), n_pre, nullptr);
+  mla::PrefillAttentionNonAbsorbed(d_qr.get(), d_cache_na.get(), d_w16.get(),
+                                   nullptr, 0, d_gate.get(), 0, n_pre,
+                                   d_out_na.get(), d_scratch_na.get(), nullptr);
+  // Token 40 through the non-absorbed path too (n = 1 chunk at position 40).
+  mla::CacheAppend(d_cache_na.get(), d_kv.get() + (last * kW),
+                   d_pos.get() + last, 1, nullptr);
+  mla::QPrepare(d_q.get() + (last * kH * kQH), d_pos.get() + last,
+                d_qr.get() + (last * kH * kQH), 1, nullptr);
+  mla::PrefillAttentionNonAbsorbed(
+      d_qr.get() + (last * kH * kQH), d_cache_na.get(), d_w16.get(), nullptr, 0,
+      d_gate.get() + (last * kH), n_pre, 1, d_out_na.get() + (last * kH * kV),
+      d_scratch_na.get(), nullptr);
   CheckHip(hipDeviceSynchronize(), "sync");
   const auto got = d_out.Download();
+  const auto got_na = d_out_na.Download();
 
   // Host: cache rows as stored (F16-rounded), then expand per head.
   std::vector<std::vector<double>> latent(total);
@@ -665,8 +819,9 @@ void TestLayerCoreVsNonAbsorbed() {
     }
   });
 
-  Err err_prefill;
   Err err_decode;
+  Err err_na;
+  Err err_na_vs_abs;
   for (std::uint32_t t = 0; t < total; ++t) {
     for (std::uint32_t h = 0; h < kH; ++h) {
       const float* qh = &q[((std::size_t{t} * kH) + h) * kQH];
@@ -702,13 +857,19 @@ void TestLayerCoreVsNonAbsorbed() {
         for (std::uint32_t p = 0; p <= t; ++p) {
           acc += s[p] / sum * v_exp[((p * kH) + h) * kV + d];
         }
-        (t < n_pre ? err_prefill : err_decode)
-            .Add(got[(std::size_t{t} * kH * kV) + (h * kV) + d], acc * sg);
+        const std::size_t at = (std::size_t{t} * kH * kV) + (h * kV) + d;
+        if (t == n_pre) {
+          err_decode.Add(got[at], acc * sg);
+          err_na_vs_abs.Add(got_na[at], got[at]);
+        }
+        err_na.Add(got_na[at], acc * sg);
       }
     }
   }
-  Report("Layer core absorbed(prefill) vs non-absorbed", err_prefill, 1e-3);
   Report("Layer core absorbed(decode) vs non-absorbed", err_decode, 1e-3);
+  Report("Layer core non-absorbed GPU vs host", err_na, 3e-3);
+  Report("Layer core non-absorbed vs absorbed decode (GPU)", err_na_vs_abs,
+         3e-3);
 }
 
 }  // namespace
@@ -728,8 +889,8 @@ int main() {
     TestQAbsorb();
     TestVbUpProjGate();
     TestDecode();
-    TestPrefill();
-    TestAttentionBatchInvariance();
+    TestNonAbsorbedPrefill();
+    TestNonAbsorbedInvariance();
     TestLayerCoreVsNonAbsorbed();
   } catch (const std::exception& e) {
     std::cerr << "error: " << e.what() << "\n";
