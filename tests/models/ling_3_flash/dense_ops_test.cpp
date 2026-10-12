@@ -330,6 +330,89 @@ void TestF32Router() {
   }
 }
 
+// F16 -> Q8_0 re-encoding of the MTP draft head: ggml's reference rounding
+// (d = absmax / 127 stored as F16, q = round(x / d)), checked per block against
+// the F16 source, and the Q8_0 GEMV against the F16 GEMV on the same weights.
+void TestQuantizeF16ToQ8(std::uint32_t rows, std::uint32_t k) {
+  std::vector<std::uint16_t> wh(std::size_t{rows} * k);
+  {
+    std::normal_distribution<float> d(0.0F, 0.05F);
+    for (std::size_t i = 0; i < wh.size(); ++i) {
+      // Mix scales and a few all-zero blocks.
+      const std::size_t b = i / 32;
+      const float scale = b % 17 == 0 ? 0.0F : (b % 5 == 0 ? 20.0F : 1.0F);
+      wh[i] = HalfBits(scale * d(g_rng));
+    }
+  }
+  Dev<std::uint16_t> dw(wh);
+  const std::size_t bytes = std::size_t{rows} * (k / 32) * 34;
+  Dev<std::uint8_t> dq(bytes);
+  HIP_OK(hipMemset(dq.p, 0xA5, bytes));
+  dn::QuantizeF16ToQ8_0(reinterpret_cast<const __half*>(dw.p), dq.p, rows, k,
+                        nullptr);
+  HIP_OK(hipDeviceSynchronize());
+  const auto q = dq.Get();
+  std::size_t bad = 0, off_by_one = 0;
+  for (std::size_t b = 0; b < wh.size() / 32; ++b) {
+    float v[32];
+    float amax = 0;
+    for (int i = 0; i < 32; ++i) {
+      _Float16 h;
+      std::memcpy(&h, &wh[b * 32 + i], 2);
+      v[i] = static_cast<float>(h);
+      amax = std::max(amax, std::fabs(v[i]));
+    }
+    const float d = amax / 127.0F;
+    const float id = d != 0.0F ? 1.0F / d : 0.0F;
+    std::uint16_t db;
+    std::memcpy(&db, &q[b * 34], 2);
+    if (db != HalfBits(d)) {
+      ++bad;
+      continue;
+    }
+    for (int i = 0; i < 32; ++i) {
+      const int want = static_cast<int>(std::lroundf(v[i] * id));
+      const int got = static_cast<std::int8_t>(q[b * 34 + 2 + i]);
+      if (got != want) {
+        // 1/d may round differently on the device (fast-math reciprocal).
+        const int diff = got > want ? got - want : want - got;
+        if (diff == 1)
+          ++off_by_one;
+        else
+          ++bad;
+      }
+    }
+  }
+  std::printf("%-4s QuantizeF16ToQ8_0 %ux%u: %zu bad, %zu off-by-one of %zu\n",
+              bad == 0 && off_by_one * 1000 < wh.size() ? "PASS" : "FAIL", rows,
+              k, bad, off_by_one, wh.size());
+  if (bad != 0 || off_by_one * 1000 >= wh.size())
+    ++g_failures;
+
+  // GEMV agreement with the F16 head on the same weights.
+  constexpr std::uint32_t kTok = 1;
+  const auto x = Randn(std::size_t{kTok} * k);
+  Dev<float> dx(x), y16(std::size_t{kTok} * rows), y8(std::size_t{kTok} * rows);
+  Dev<std::uint8_t> scratch(std::max(
+      dn::ScratchBytes(WeightType::kQ8_0, kTok, k), 2 * std::size_t{kTok} * k));
+  dn::GemvF16(reinterpret_cast<const __half*>(dw.p), dx.p, y16.p, kTok, k, rows,
+              scratch.p, nullptr);
+  dn::GemvQ8_0(dq.p, dx.p, y8.p, kTok, k, rows, scratch.p, nullptr);
+  HIP_OK(hipDeviceSynchronize());
+  const auto a = y16.Get(), b = y8.Get();
+  double num = 0, den = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    num += (double{a[i]} - b[i]) * (double{a[i]} - b[i]);
+    den += double{a[i]} * a[i];
+  }
+  const double rel = std::sqrt(num / std::max(den, 1e-30));
+  std::printf(
+      "%-4s GemvQ8_0 on re-encoded head vs GemvF16 %ux%u: rel L2 %.3g\n",
+      rel < 1e-2 ? "PASS" : "FAIL", rows, k, rel);
+  if (rel >= 1e-2)
+    ++g_failures;
+}
+
 void TestF16(std::uint32_t rows, std::uint32_t k) {
   std::vector<std::uint16_t> wh(std::size_t{rows} * k);
   {
@@ -920,6 +1003,8 @@ int main(int argc, char** argv) {
   TestF32Router();
   TestF16(157184, 2560);
   TestF16(4097, 2560);
+  TestQuantizeF16ToQ8(157184, 2560);
+  TestQuantizeF16ToQ8(33, 2560);
   TestEmbed();
   TestRmsNorm(5, 2560, 1, true, false);
   TestRmsNorm(3, 2560, 1, false, true);

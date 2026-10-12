@@ -248,6 +248,37 @@ int Execute(const Args& args, Report& report,
           total_drafted > 0 && (total_accepted > 0 || !full), std::move(o));
   }
 
+  // ---- draft head ----------------------------------------------------------
+  // The draft step scores with a Q8_0 copy of the output head (the default
+  // above); the F16 head must give the same committed tokens and end state
+  // (only the drafts, hence the acceptance, may differ).
+  {
+    auto s_ar = fresh();
+    Run ar;
+    if (!s_ar || !GenerateAr(*model, *s_ar, greedy, prompts[0], G, layers, &ar,
+                             &error)) {
+      return fail_with("autoregressive run");
+    }
+    auto o = json::Value::object();
+    bool all = model->MtpDraftHeadQ8();
+    o["default_is_q8"] = all;
+    model->SetMtpDraftHeadQ8(false);
+    auto s16 = fresh();
+    Run f16;
+    const bool ran = s16 && GenerateMtp(*model, *s16, greedy, prompts[0], G, 7,
+                                        layers, &f16, &error);
+    model->SetMtpDraftHeadQ8(true);
+    if (!ran) {
+      return fail_with("F16 draft head run");
+    }
+    const Diff d = Compare(f16.end, ar.end);
+    o["drafted"] = U(f16.stats.drafted);
+    o["accepted"] = U(f16.stats.accepted);
+    all = all && ar.tokens == f16.tokens && session_tool::Exact(d) &&
+          f16.stats.drafted > 0;
+    check("draft_head_f16_equals_ar", all, std::move(o));
+  }
+
   // ---- forced acceptance patterns ------------------------------------------
   // With a draft source that replays the autoregressive continuation (and
   // corrupts it at chosen depths), every cycle accepts all, some or none of

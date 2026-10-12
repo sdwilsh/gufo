@@ -91,6 +91,12 @@ if (ENGINE_ENABLE_HIP)
       LABELS "ling_3_flash;hip;gpu;gfx1151;model" SKIP_RETURN_CODE 77
       TIMEOUT 1800)
   endif()
+  # Draft-head A/B (F16 vs Q8_0) on real text: acceptance and draft step time;
+  # needs --corpus files, so it has no CTest entry.
+  add_executable(ling_3_flash_mtp_head_ab EXCLUDE_FROM_ALL mtp_head_ab.cpp)
+  target_link_libraries(ling_3_flash_mtp_head_ab PRIVATE gufo_ling_3_flash
+    hip::host)
+  list(APPEND LING_MODEL_BINARIES ling_3_flash_mtp_head_ab)
   add_custom_target(ling_3_flash_model_tests DEPENDS ${LING_MODEL_BINARIES})
 endif()
 
