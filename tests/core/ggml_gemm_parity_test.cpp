@@ -303,6 +303,40 @@ int main() {
     std::printf("F16: PASS\n");
   }
 
+  // (3b) IQ4_XS: dispatch matches the canonical routines, and Dot agrees with
+  // the dequantized row (two super-blocks, finite fp16 scales).
+  {
+    constexpr std::size_t k = 512;
+    std::vector<std::uint8_t> packed =
+        RandomPackedBytes(rng, RowBytes(gufo::core::GgmlType::kIQ4_XS, k));
+    for (std::size_t b = 0; b < k / 256; ++b) {
+      const std::uint16_t d = 0x3000;  // fp16(0.125), finite
+      std::memcpy(packed.data() + b * sizeof(gufo::quant::block_iq4_xs), &d,
+                  sizeof(d));
+    }
+    const auto x = RandomFloats(rng, k);
+    std::vector<float> got(k), ref(k);
+    gufo::quant::Dequantize(gufo::core::GgmlType::kIQ4_XS, packed.data(),
+                            got.data(), k);
+    gufo::quant::DequantizeIQ4_XS(packed.data(), ref.data(), k);
+    double expected = 0.0;
+    bool same = true;
+    for (std::size_t i = 0; i < k; ++i) {
+      same = same && SameBits(got[i], ref[i]);
+      expected += static_cast<double>(ref[i]) * x[i];
+    }
+    const float dot =
+        gufo::quant::Dot(gufo::core::GgmlType::kIQ4_XS, packed.data(), x, k);
+    if (!gufo::quant::IsSupported(gufo::core::GgmlType::kIQ4_XS) || !same ||
+        !AllFinite(got.data(), k) || AllEquals(got.data(), 0.0F, k) ||
+        std::fabs(dot - expected) > 1e-3 * (1.0 + std::fabs(expected))) {
+      std::printf("IQ4_XS: FAIL (same=%d dot=%.6f expected=%.6f)\n", same, dot,
+                  expected);
+      return 1;
+    }
+    std::printf("IQ4_XS: PASS\n");
+  }
+
   // (4) IsSupported boundaries.
   if (!gufo::quant::IsSupported(gufo::core::GgmlType::kF32) ||
       !gufo::quant::IsSupported(gufo::core::GgmlType::kQ8_K) ||
