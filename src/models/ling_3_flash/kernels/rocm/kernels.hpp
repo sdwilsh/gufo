@@ -67,8 +67,9 @@ void GemmQ8_0Strided(const void* w, const float* x, float* y,
 /// (0..kGemmShapes - 1: 128x128, 64x64, 32x128, 16x128 tokens x rows). Every
 /// shape returns the same bits as the default dispatch (GemmQ8_0Strided).
 inline constexpr int kGemmShapes = 4;
-/// The shape the default dispatch picks for (n_tokens, rows).
-int GemmShapeFor(std::uint32_t n_tokens, std::uint32_t rows);
+/// The shape the default dispatch picks for (n_tokens, rows) on a device with
+/// `wgps` work-group processors (0 = the current device).
+int GemmShapeFor(std::uint32_t n_tokens, std::uint32_t rows, int wgps = 0);
 void GemmQ8_0Shape(const void* w, const float* x, float* y,
                    std::uint32_t n_tokens, std::uint32_t k, std::uint32_t rows,
                    std::uint32_t ldy, int shape, void* scratch,
@@ -330,8 +331,9 @@ void BuildExpansionWeights(const void* k_b, const void* v_b, __half* w16,
 /// (>= 64 MiB) and the fold state.
 std::size_t NonAbsorbedScratchBytes(std::uint32_t max_batch);
 /// Persistent expanded K/V of one layer for rows [0, rows) (a multiple of
-/// 2048): per head k_nope `[row][128]` then V^T `[128][row]` (keys permuted in
-/// each 16-key group), F16, ExpandedLayerBytes(rows) = rows * 16 KiB.
+/// 2048): per head k_nope `[row][128]` then V^T in 16-key tiles
+/// `[row / 16][128][16]` (keys permuted in each tile), F16,
+/// ExpandedLayerBytes(rows) = rows * 16 KiB.
 std::size_t ExpandedLayerBytes(std::uint32_t rows);
 /// Expands cache rows [start, min(end, rows)) into the persistent store. The
 /// result is a pure function of the cache row (same bits as the transient

@@ -73,6 +73,28 @@ inline constexpr Moe kMoe[] = {
      0x47bd34ec2cdc5038ULL},
     {"", 0, 0}};
 
+// Non-absorbed MLA prefill (mla_ops_test TestNonAbsorbedParentDigest) as of
+// the parent of WS31 (V^T stored row-strided, every tile of a partially live
+// query wave on the pair-isolated P.V path). WS31 changes only where the
+// expanded values live and which lanes vote for that path, so the output bits
+// are the same. Keys: (first position, tokens, persistent store rows).
+struct MlaPrefill {
+  unsigned first, n, store_rows;
+  unsigned long long digest;
+};
+inline constexpr MlaPrefill kMlaPrefill[] = {
+    {0, 9, 0, 0xee5cdfa8018c746cULL},
+    {0, 16, 2048, 0xebb8ab402439fb45ULL},
+    {1000, 37, 2048, 0x66cec3a359f5cd7bULL},
+    {2040, 16, 4096, 0xde954fd02d105dfcULL},
+    {2047, 100, 0, 0xcf4b012635097ad5ULL},
+    {4090, 100, 4096, 0xf630f8429e94a078ULL},
+    {5000, 130, 8192, 0x6b60fa804f6d78baULL},
+    {6100, 300, 4096, 0x5e186bea2e7dd599ULL},
+    {16384, 16, 18432, 0x28c1b741f6d47c09ULL},
+    {16384, 64, 0, 0xd2e01b4044c69407ULL},
+    {0, 0, 0, 0}};
+
 }  // namespace parent_digests
 
 #endif  // GUFO_TESTS_MODELS_LING_3_FLASH_PARENT_DIGESTS_HPP_
