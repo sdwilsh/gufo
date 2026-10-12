@@ -535,6 +535,8 @@ public:
     step.draft_rounds = 1;
     step.draft_tokens = count + 1;
     step.draft_accepted_tokens = count;
+    step.lookup_tokens = 1;
+    step.lookup_accepted_tokens = 1;
     return step;
   }
 
@@ -1016,6 +1018,14 @@ void TestMultiTokenDecodePublishesDraftMetricsAndDisablesPrefixReuse() {
   Expect(first.draft_rounds == 2 && first.draft_tokens == 7 &&
              first.draft_accepted_tokens == 5,
          "multi-token decode reports accumulated draft statistics");
+  Expect(first.lookup_tokens == 2 && first.lookup_accepted_tokens == 2,
+         "prompt-lookup copies are summed over the rounds");
+  Expect(gufo::server::GenerationLogDetails(first).find(
+             " lookup_accepted=2 lookup_proposed=2") != std::string::npos,
+         "the request log carries the copied counts");
+  Expect(gufo::server::GenerationLogDetails({}).find(" lookup_") ==
+             std::string::npos,
+         "a request without prompt-lookup copies logs none");
   Expect(!first.cache_hit,
          "multi-token state starts without continuation reuse");
   control->WaitForInvalidations(1);

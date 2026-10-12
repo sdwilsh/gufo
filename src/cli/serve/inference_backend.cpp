@@ -3409,6 +3409,9 @@ public:
       step.draft_rounds = after.cycles - before[i].cycles;
       step.draft_tokens = after.drafted - before[i].drafted;
       step.draft_accepted_tokens = after.accepted - before[i].accepted;
+      step.lookup_tokens = after.copied - before[i].copied;
+      step.lookup_accepted_tokens =
+          after.copied_accepted - before[i].copied_accepted;
       step.execution_plan = {.kind = lane.width > 1
                                          ? TextExecutionPlanKind::kBatched
                                          : TextExecutionPlanKind::kSerial,
@@ -3467,6 +3470,9 @@ public:
     step.draft_rounds = after.cycles - before.cycles;
     step.draft_tokens = after.drafted - before.drafted;
     step.draft_accepted_tokens = after.accepted - before.accepted;
+    step.lookup_tokens = after.copied - before.copied;
+    step.lookup_accepted_tokens =
+        after.copied_accepted - before.copied_accepted;
     return step;
   }
 
