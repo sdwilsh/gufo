@@ -98,6 +98,20 @@ void Session::DestroyGraphs() noexcept {
 }
 
 Session::~Session() {
+  // A background snapshot copy still reads the cache rows freed below. After a
+  // device loss a copy may be wedged in a HIP call, and then this wait (and a
+  // shutdown that destroys sessions) waits with it; nothing is leaked or timed
+  // out on purpose, so rows are never freed under a running copy.
+  for (;;) {
+    try {
+      AwaitRowHolds(0);
+      break;
+    } catch (...) {
+      // condition_variable::wait failed (resources): a destructor must not
+      // throw, and the rows must not be freed under a running copy. Retry.
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
   DestroyGraphs();
   if (forward_done_ != nullptr) {
     (void)hipEventDestroy(forward_done_);
@@ -1238,6 +1252,9 @@ bool Executor::Forward(Session& session, const ForwardRequest& r,
   launch_ = {};
   const auto n = static_cast<std::uint32_t>(r.tokens.size());
   const std::uint32_t first_pos = session.position();
+  // Rows below a held snapshot copy are never rewritten while it runs; a
+  // forward at or past them (every decode and prefill step) does not wait.
+  session.AwaitRowHolds(first_pos);
   const auto fail = [&](const std::string& message) {
     if (error != nullptr) {
       *error = message;
@@ -1386,6 +1403,7 @@ bool Executor::ForwardBatch(std::span<BatchSegment> segments,
       s.error = "batch segment has no session";
       continue;
     }
+    s.session->AwaitRowHolds(s.session->position());
     if (std::any_of(
             segments.begin(), segments.begin() + i,
             [&](const BatchSegment& o) { return o.session == s.session; })) {
@@ -1665,6 +1683,7 @@ bool Executor::MtpDraft(Session& session, const DraftRequest& r,
       (!r.logits.empty() && r.logits.size() < kVocabRows)) {
     return fail("MTP draft request is out of range");
   }
+  session.AwaitRowHolds(r.position + 1);  // MTP row `position`
   const DeviceMtp& m = *model_.mtp();
   Buffers& b = *b_;
   step_start_ = std::chrono::steady_clock::now();
@@ -1783,6 +1802,7 @@ bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
         (!d.logits.empty() && d.logits.size() < kVocabRows)) {
       return fail("MTP draft batch request is out of range");
     }
+    d.session->AwaitRowHolds(d.position + 1);  // MTP row `position`
   }
   const DeviceMtp& m = *model_.mtp();
   Buffers& b = *b_;
@@ -1939,6 +1959,7 @@ bool Executor::RunBlock(Session& session, std::uint32_t il,
     }
     return false;
   };
+  session.AwaitRowHolds(first_pos);
   if (il < first_layer() || il >= first_layer() + layer_count()) {
     return fail("block " + std::to_string(il) + " is not resident");
   }
