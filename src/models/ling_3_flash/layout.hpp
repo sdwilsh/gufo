@@ -23,6 +23,19 @@ struct OpTiming {
   double bytes{0.0};
 };
 
+/// Host cost of the last forward step or MTP draft step beside its device
+/// span: how much of a step is launch issue, device work and host waiting
+/// (launch-overhead profiling; measured on every step, steady clock).
+struct LaunchTiming {
+  /// Step entry until the last launch of the trunk (forward: inputs, every
+  /// block, before the output head) or of the whole draft step was issued; a
+  /// replayed graph is one launch.
+  double issue_ms{0.0};
+  double wall_ms{0.0};    ///< Step entry until the host saw it complete.
+  double device_ms{0.0};  ///< First to last launch on the device (events).
+  bool graph{false};      ///< The forward replayed a captured graph.
+};
+
 // ---- Trunk geometry -------------------------------------------------------
 inline constexpr std::uint32_t kBlockCount = 43;   ///< Trunk plus MTP block.
 inline constexpr std::uint32_t kTrunkLayers = 42;  ///< Blocks 0..41.

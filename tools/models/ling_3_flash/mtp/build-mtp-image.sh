@@ -1,6 +1,6 @@
 #!/bin/sh
 # usage (from workspace root, after building build/gpu-test and build/release):
-#   tools/models/ling_3_flash/mtp/build-mtp-image.sh [tag] [oracle-dir] [novel-oracle-dir]
+#   tools/models/ling_3_flash/mtp/build-mtp-image.sh [tag] [oracle-dir] [novel-oracle-dir] [peak-binary]
 # Stages the gpu-test binaries (standard + MTP tests), build/release/gufo, the suite drivers,
 # the oracles and the real-text corpora into build/ling-mtp-image-ctx and builds the image
 # locally. Never pushes.
@@ -8,6 +8,7 @@ set -eu
 tag=${1:-localhost/gufo-ling-ws22}
 oracle=${2:-/tmp/b2-oracle}
 novel=${3:-artifacts/ling-3-flash/oracle-novel}
+peak=${4:-artifacts/ling-3-flash/container/gfx1151_peak}
 here=$(cd "$(dirname "$0")" && pwd); int="$here/../int"; ctx=build/ling-mtp-image-ctx
 B=build/gpu-test/tests/models/ling_3_flash
 rm -rf "$ctx"; mkdir -p "$ctx/tests" "$ctx/suites" "$ctx/oracle" "$ctx/oracle-novel" "$ctx/floor" \
@@ -26,7 +27,7 @@ cp -L "$oracle/greedy.jsonl" "$oracle/kl_base.bin" "$ctx/oracle/"; cp -rL "$orac
 cp -L "$novel/greedy.jsonl" "$novel/kl_base.bin" "$ctx/oracle-novel/"
 python3 "$here/make_corpus.py" . "$ctx/corpus" "$novel/input_text.txt"
 cp "$int/run-suite" "$ctx/run-suite"
-cp build/release/gufo "$ctx/gufo"
+cp build/release/gufo "$ctx/gufo"; cp "$peak" "$ctx/gfx1151_peak"; cp tools/prof/prof.py "$ctx/prof.py"
 cp "$here/ling-mtp-suite" "$int/ling-int-suite" "$int/ling-int-bench" "$int/ling-serve-suite" tools/models/ling_3_flash/cache/ling-cache-suite "$ctx/"
 cp -r tests/functional "$ctx/functional"; rm -rf "$ctx/functional/__pycache__"
 cp flake.lock "$ctx/flake.lock"

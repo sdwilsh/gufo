@@ -513,7 +513,8 @@ void Session::SetMaxDrafts(std::uint32_t drafts) noexcept {
 
 bool Session::Verify(std::span<const std::int32_t> tokens,
                      std::span<std::int32_t> argmax, std::vector<float>* rows,
-                     std::string* error_msg) {
+                     std::string* error_msg,
+                     std::vector<OpTiming>* op_profile) {
   const auto n = static_cast<std::uint32_t>(tokens.size());
   if (!valid_ || pending_.active || tokens_.empty() || !MtpActive()) {
     AssignError(error_msg, "verify needs a valid session with MTP state");
@@ -530,6 +531,7 @@ bool Session::Verify(std::span<const std::int32_t> tokens,
   request.rollback = true;
   request.logits_from = 0;
   request.argmax = argmax.first(n);
+  request.op_profile = op_profile;
   if (rows != nullptr) {
     rows->resize(std::size_t{n} * kVocab);
     request.logits = *rows;
@@ -578,7 +580,8 @@ bool Session::Rollback(std::uint32_t keep, std::string* error_msg) {
 }
 
 bool Session::Draft(std::int32_t token, bool chain, std::span<float> logits,
-                    std::int32_t* argmax, std::string* error_msg) {
+                    std::int32_t* argmax, std::string* error_msg,
+                    std::vector<OpTiming>* op_profile) {
   if (!MtpActive() || pending_.active || (chain && draft_position_ == 0)) {
     AssignError(error_msg, "draft needs a valid session with MTP state");
     return false;
@@ -588,11 +591,16 @@ bool Session::Draft(std::int32_t token, bool chain, std::span<float> logits,
   request.chain = chain;
   request.position = chain ? draft_position_ + 1 : session_->position() - 1;
   request.logits = logits;
+  request.op_profile = op_profile;
   if (!model_->executor_->MtpDraft(*session_, request, argmax, error_msg)) {
     return false;
   }
   draft_position_ = request.position;
   return true;
+}
+
+LaunchTiming Session::LastLaunchTiming() const noexcept {
+  return model_->executor_->last_launch();
 }
 
 bool Session::DraftWithHidden(std::int32_t token, std::span<const float> h,
