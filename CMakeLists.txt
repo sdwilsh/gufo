@@ -248,6 +248,7 @@ add_library(gufo_http STATIC
   src/cli/serve/websocket.cpp
   src/cli/serve/asr_websocket.cpp
   src/cli/serve/tts_websocket.cpp
+  src/cli/serve/bailing_tool_calls.cpp
   src/cli/serve/openai_chat.cpp
 )
 target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21)
@@ -416,14 +417,25 @@ if (BUILD_TESTING)
 
   add_executable(openai_chat_test
     tests/cli/openai_chat_test.cpp
+    src/cli/serve/bailing_tool_calls.cpp
     src/cli/serve/logging.cpp
     src/cli/serve/openai_chat.cpp
     src/models/deepseek_v4_flash/chat_template.cpp
+    src/models/ling_3_flash/chat_template.cpp
   )
   target_link_libraries(openai_chat_test PRIVATE gufo_core)
   add_test(NAME openai_chat_test COMMAND openai_chat_test)
   set_tests_properties(openai_chat_test PROPERTIES
     LABELS "cpu;server;api;openai;streaming;tools")
+
+  add_executable(bailing_tool_calls_test
+    tests/cli/bailing_tool_calls_test.cpp
+    src/cli/serve/bailing_tool_calls.cpp
+  )
+  target_link_libraries(bailing_tool_calls_test PRIVATE gufo_core)
+  add_test(NAME bailing_tool_calls_test COMMAND bailing_tool_calls_test)
+  set_tests_properties(bailing_tool_calls_test PROPERTIES
+    LABELS "cpu;server;api;tools;ling")
 
   add_executable(quote_tracker_test tests/cli/quote_tracker_test.cpp)
   target_link_libraries(quote_tracker_test PRIVATE gufo_core)

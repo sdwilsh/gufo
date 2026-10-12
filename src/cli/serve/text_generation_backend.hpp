@@ -166,6 +166,12 @@ public:
     kCancelled,
   };
 
+  /// Dialect of tool calls the loaded model writes. kDefault models are
+  enum class ToolCallSyntax : std::uint8_t {
+    kDefault,
+    kBailing,
+  };
+
   enum class InitialOutputState : std::uint8_t {
     kAuto,
     kReasoning,
@@ -305,6 +311,9 @@ public:
   [[nodiscard]] virtual InitialOutputState initial_output_state(
       const ChatRequest&) const {
     return InitialOutputState::kAuto;
+  }
+  [[nodiscard]] virtual ToolCallSyntax tool_call_syntax() const {
+    return ToolCallSyntax::kDefault;
   }
 
   virtual Result complete(
