@@ -24,3 +24,9 @@ target_compile_definitions(ling_3_flash_chat_template_test PRIVATE
   GUFO_LING_VOCAB_GGUF="${LING_FIXTURES}/ling-vocab.gguf.fixture"
   GUFO_LING_CHAT_TEMPLATE="${LING_FIXTURES}/chat_template.jinja"
   GUFO_LING_CHAT_GOLDENS="${LING_FIXTURES}/chat_template_goldens.json")
+
+if (ENGINE_ENABLE_HIP)
+  # --- WS4a: kda ---
+  add_ling_3_flash_test(kda_ops gufo_ling_3_flash "hip;gpu;gfx1151")
+  # --- end WS4a ---
+endif()
