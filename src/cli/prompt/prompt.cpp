@@ -28,6 +28,8 @@
 #include <hip/hip_runtime.h>
 
 #include "src/core/speculative/speculative_verifier.hpp"
+#include "src/models/ling_3_flash/chat_template.hpp"
+#include "src/models/ling_3_flash/engine.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
@@ -246,6 +248,10 @@ void PrintModelLoadTime(std::chrono::steady_clock::time_point start,
   output << '\n';
 }
 
+bool IsLing3Flash(const core::GgufReader& reader) {
+  return reader.GetMetadataString("general.architecture") == "bailingmoe3";
+}
+
 bool IsDeepSeekV4Flash(const core::GgufReader& reader) {
   return reader.GetMetadataString("general.architecture") == "deepseek4";
 }
@@ -299,6 +305,8 @@ void ResolvePromptSampling(const core::GgufReader& reader, PromptOptions* opt) {
     preset = sampling::TextModelPreset::kDeepSeekV4Flash;
   } else if (artifact_architecture == "qwen4exp") {
     preset = sampling::TextModelPreset::kQwen38;
+  } else if (artifact_architecture == "bailingmoe3") {
+    preset = sampling::TextModelPreset::kLing3Flash;
   } else if (const auto config = reader.ExtractModelConfig()) {
     preset = sampling::TextPreset(*config);
   }
@@ -727,6 +735,180 @@ int GenerateFlashNextResponse(const PromptOptions& opt,
   return 0;
 }
 
+std::shared_ptr<models::ling_3_flash::Model> LoadLingModel(
+    const PromptOptions& opt, const core::GgufReader& reader,
+    std::chrono::steady_clock::time_point load_start) {
+  std::string error;
+  if (opt.force_cpu) {
+    std::cerr << "Ling-3.0-flash is supported only by the ROCm backend\n";
+    return nullptr;
+  }
+  if (!opt.speculative_backend.empty()) {
+    std::cerr << "Ling-3.0-flash does not support --speculative "
+              << opt.speculative_backend
+              << " in prompt/chat (MTP runs in `gufo serve` and `gufo "
+                 "bench`); use --speculative off\n";
+    return nullptr;
+  }
+  if (opt.use_chat_template &&
+      !models::ling_3_flash::ValidateGgufTemplate(reader, &error)) {
+    std::cerr << "Unsupported Ling-3.0-flash chat template: " << error << '\n';
+    return nullptr;
+  }
+  auto model = models::ling_3_flash::Model::Load(
+      opt.model_path,
+      {.max_context = kDefaultContext,
+       .max_batch = models::ling_3_flash::kCliPrefillBatch},
+      &error);
+  PrintModelLoadTime(load_start, model != nullptr);
+  if (!model)
+    std::cerr << "Ling-3.0-flash load failed: " << error << '\n';
+  return model;
+}
+
+models::ling_3_flash::ChatTemplateOptions LingChatOptions(
+    const PromptOptions& opt) {
+  models::ling_3_flash::ChatTemplateOptions options;
+  // The Bailing V3 template only knows thinking on/off; effort and
+  // preserve-thinking have no representation.
+  options.enable_thinking = PromptReasoningOptions(opt).enabled;
+  return options;
+}
+
+int GenerateLingResponse(const PromptOptions& opt,
+                         const models::ling_3_flash::Model& model,
+                         models::ling_3_flash::Session& session,
+                         std::span<const std::int32_t> prompt,
+                         std::string* reply = nullptr) {
+  if (prompt.empty() || prompt.size() >= kDefaultContext ||
+      opt.max_tokens > kDefaultContext - prompt.size()) {
+    std::cerr << "Ling-3.0-flash prompt and output exceed the 4096-token CLI "
+                 "context\n";
+    return 1;
+  }
+  std::string error;
+  if (!session.Sync(prompt, &error)) {
+    std::cerr << "Ling-3.0-flash prefill failed: " << error << '\n';
+    return 1;
+  }
+  const std::vector<sampling::TokenId> history(prompt.begin(), prompt.end());
+  sampling::SamplerState sampler(opt.sampling, history);
+  std::vector<tokenization::TokenId> generated;
+  const auto start = std::chrono::steady_clock::now();
+  while (generated.size() < opt.max_tokens) {
+    const auto logits = session.Logits();
+    if (logits.empty()) {
+      std::cerr << "Ling-3.0-flash has no logits to sample\n";
+      return 1;
+    }
+    const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
+    if (model.IsStopToken(token))
+      break;
+    sampler.Accept(static_cast<sampling::TokenId>(token));
+    const auto piece = model.TokenText(token);
+    std::cout << piece << std::flush;
+    if (reply)
+      reply->append(piece);
+    generated.push_back(static_cast<tokenization::TokenId>(token));
+    // A reusable chat session owns the whole emitted prefix.
+    if ((reply != nullptr || generated.size() < opt.max_tokens) &&
+        !session.Evaluate(token, &error)) {
+      std::cerr << "\nLing-3.0-flash decode failed: " << error << '\n';
+      return 1;
+    }
+  }
+  std::cout << '\n';
+  if (opt.verbose) {
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
+    std::cerr << "Generated " << generated.size() << " tokens ("
+              << generated.size() / seconds << " tok/s)\n";
+    PrintTokenTrace(generated);
+  }
+  return 0;
+}
+
+models::ling_3_flash::ChatMessage LingMessage(std::string role,
+                                              std::string content) {
+  return {.role = std::move(role),
+          .content = std::move(content),
+          .reasoning_content = {},
+          .tool_calls = {}};
+}
+
+int RunLingPrompt(const PromptOptions& opt, const core::GgufReader& reader,
+                  std::chrono::steady_clock::time_point load_start) {
+  auto model = LoadLingModel(opt, reader, load_start);
+  if (!model)
+    return 1;
+  std::string error;
+  auto session = model->CreateSession(kDefaultContext, &error);
+  if (!session) {
+    std::cerr << "Ling-3.0-flash session creation failed: " << error << '\n';
+    return 1;
+  }
+  try {
+    std::vector<std::int32_t> prompt;
+    if (opt.use_chat_template) {
+      std::vector<models::ling_3_flash::ChatMessage> messages;
+      if (!opt.system_prompt.empty())
+        messages.push_back(LingMessage("system", opt.system_prompt));
+      messages.push_back(LingMessage("user", opt.prompt_text));
+      prompt = model->Tokenize(
+          models::ling_3_flash::RenderChat(messages, {}, LingChatOptions(opt)));
+    } else {
+      prompt = model->Tokenize(opt.prompt_text);
+    }
+    return GenerateLingResponse(opt, *model, *session, prompt);
+  } catch (const std::exception& e) {
+    std::cerr << e.what() << '\n';
+    return 1;
+  }
+}
+
+int RunLingChat(const PromptOptions& opt, const core::GgufReader& reader,
+                std::chrono::steady_clock::time_point load_start) {
+  auto model = LoadLingModel(opt, reader, load_start);
+  if (!model)
+    return 1;
+  std::string error;
+  auto session = model->CreateSession(kDefaultContext, &error);
+  if (!session) {
+    std::cerr << "Ling-3.0-flash session creation failed: " << error << '\n';
+    return 1;
+  }
+  std::cout << "=== Gufo Interactive Chat (Ling-3.0-flash) ===\n"
+            << "Type 'exit' or Ctrl+D to quit.\n\n";
+  std::vector<models::ling_3_flash::ChatMessage> history;
+  if (!opt.system_prompt.empty())
+    history.push_back(LingMessage("system", opt.system_prompt));
+  std::string user_input;
+  while (true) {
+    std::cout << ">>> User: " << std::flush;
+    if (!std::getline(std::cin, user_input) || user_input == "exit" ||
+        user_input == "quit")
+      break;
+    if (user_input.empty())
+      continue;
+    history.push_back(LingMessage("user", user_input));
+    std::string reply;
+    std::cout << "<<< Assistant: ";
+    try {
+      const auto prompt = model->Tokenize(
+          models::ling_3_flash::RenderChat(history, {}, LingChatOptions(opt)));
+      if (GenerateLingResponse(opt, *model, *session, prompt, &reply) != 0)
+        return 1;
+    } catch (const std::exception& e) {
+      std::cerr << "Generation failed: " << e.what() << '\n';
+      return 1;
+    }
+    std::cout << '\n';
+    history.push_back(LingMessage("assistant", reply));
+  }
+  return 0;
+}
+
 std::unique_ptr<speculative::SpeculativeVerifier> CreateQwenVerifier(
     const PromptOptions& opt, hip::QwenGpuExecutor& executor) {
   std::string err;
@@ -1003,9 +1185,16 @@ int RunPrompt(std::span<const char* const> args) {
     }
     return RunDeepSeekPrompt(opt, *reader, model_load_start);
   }
+  if (IsLing3Flash(*reader)) {
+    if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
+      std::cerr << "Ling-3.0-flash does not support image input\n";
+      return 2;
+    }
+    return RunLingPrompt(opt, *reader, model_load_start);
+  }
 #else
-  if (IsDeepSeekV4Flash(*reader)) {
-    std::cerr << "DeepSeek V4 Flash requires ENGINE_ENABLE_HIP=ON\n";
+  if (IsDeepSeekV4Flash(*reader) || IsLing3Flash(*reader)) {
+    std::cerr << "This model requires ENGINE_ENABLE_HIP=ON\n";
     PrintModelLoadTime(model_load_start, false);
     return 1;
   }
@@ -1226,9 +1415,16 @@ int RunChat(std::span<const char* const> args) {
     }
     return RunDeepSeekChat(opt, *reader, model_load_start);
   }
+  if (IsLing3Flash(*reader)) {
+    if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
+      std::cerr << "Ling-3.0-flash does not support image input\n";
+      return 2;
+    }
+    return RunLingChat(opt, *reader, model_load_start);
+  }
 #else
-  if (IsDeepSeekV4Flash(*reader)) {
-    std::cerr << "DeepSeek V4 Flash requires ENGINE_ENABLE_HIP=ON\n";
+  if (IsDeepSeekV4Flash(*reader) || IsLing3Flash(*reader)) {
+    std::cerr << "This model requires ENGINE_ENABLE_HIP=ON\n";
     return 1;
   }
 #endif

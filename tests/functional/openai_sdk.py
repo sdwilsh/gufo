@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 import openai
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient, DefaultHttpxClient, OpenAI
 from openai.types import Completion, CompletionChoice
+from check_report import describe, failure_lines
 from metrics import CaseComplete, Recorder
 from tool_reasoning import check_reasoning_separator, check_tool_reasoning, response_result
 from tool_streaming import check_tool_streaming
@@ -303,6 +304,28 @@ def image_content(color):
     }
 
 
+SAMPLING_QUESTION = "Name three animals and describe each in one sentence."
+# Ling-3.0-flash retains no prompt snapshot below 128 tokens: its fixed-size
+# recurrent state costs more RAM than re-prefilling a short prompt saves, and
+# that state cannot be cut back from the decoded frontier. The cached-replay
+# checks need a retained prompt, so the Ling preset asks the same question
+# behind this context.
+SAMPLING_CONTEXT = (
+    "You are helping a teacher prepare a short handout for a primary-school nature "
+    "club. The club meets every Thursday afternoon in the school garden, where the "
+    "children watch birds, look for insects under stones and keep a notebook of "
+    "everything they find. The teacher wants the handout to be friendly, accurate "
+    "and easy to read aloud, with plain words and no jargon. Each entry should say "
+    "where the animal lives and one thing that makes it special, so the children can "
+    "remember it on their next walk. Keep the tone warm and curious, and avoid "
+    "anything frightening. The handout will be printed on a single page together "
+    "with a few drawings made by the children themselves.\n\n")
+
+
+def sampling_prompt(preset):
+    return (SAMPLING_CONTEXT if preset == "ling3" else "") + SAMPLING_QUESTION
+
+
 def check_sampling_defaults(client, model, checks, preset, overrides, vision=False,
                             server_thinking=None):
     """Omission and explicit presets must replay within each execution mode."""
@@ -357,8 +380,7 @@ def check_sampling_defaults(client, model, checks, preset, overrides, vision=Fal
             expected["seed"] = 73
         request = {
             "model": model, "seed": 73, "max_completion_tokens": 8,
-            "messages": [{"role": "user", "content":
-                          "Name three animals and describe each in one sentence."}],
+            "messages": [{"role": "user", "content": sampling_prompt(preset)}],
             "extra_body": {"cache_prompt": False, "chat_template_kwargs": {
                 "enable_thinking": thinking}},
         }
@@ -597,7 +619,18 @@ def check_sampling_ranges(client, model, checks):
         checks[f"range_{endpoint}_sampled_zero"] = response.to_dict()
 
 
-def check_batches(client, model, checks, width, vision=False, speculative="off"):
+# Shortest prompt a runner retains as a reusable snapshot (Ling: 128 tokens,
+# TextRunnerCapabilities::min_snapshot_tokens); shorter prompts are never
+# cache hits, so cases asserting a hit must exceed it.
+MIN_RETAINED_PROMPT_TOKENS = {"qwen38": 0, "deepseek4": 0, "ling3": 128}
+# Neutral system context (about 190 tokens) that lifts a short case above it.
+RETAINED_PROMPT_CONTEXT = "You are a precise assistant.\n" + "".join(
+    f"Reference note {index}: the build uses CMake presets and every model "
+    f"package owns its tests and numerical contracts.\n" for index in range(8))
+
+
+def check_batches(client, model, checks, width, vision=False, speculative="off",
+                  min_retained_prompt_tokens=0):
     """Different endpoints/samplers/grammars share a physical batch without state leakage."""
     cases = []
     values = []
@@ -629,6 +662,9 @@ def check_batches(client, model, checks, width, vision=False, speculative="off")
             content = body["messages"][0]["content"]
             body["messages"][0]["content"] = [
                 image_content("red"), {"type": "text", "text": content}]
+        if min_retained_prompt_tokens:
+            # The replay below must restore the prompt.
+            body["messages"].insert(0, {"role": "system", "content": RETAINED_PROMPT_CONTEXT})
         # Cache all prompts before measuring concurrency, so short prefills cannot
         # turn the intended physical batch into sequential requests.
         chat_result(client, {**body, "max_completion_tokens": 1})
@@ -1320,7 +1356,7 @@ def check_strict_tools(client, model, checks):
     assert all(result["usage"]["prompt_tokens_details"]["cached_tokens"] > 0
                for result in concurrent), concurrent
     record("strict_tool_concurrent_replay", concurrent)
-    for limit in (2, 12):
+    for limit in (2, 6):
         partial = chat_result(client, {**sampled, "max_completion_tokens": limit}, True)
         assert partial["finish"] == "length" and not partial["tools"], partial
         # Native DeepSeek calls may begin with ordinary whitespace. No partial
@@ -1436,7 +1472,7 @@ def check_native_tools(client, model, checks, vision=False):
     signature(followup)
     assert followup.usage.input_tokens_details.cached_tokens > 0, followup
     record("responses_tool_history_cache", followup.to_dict())
-    for limit in (1, 12):
+    for limit in (1, 6):
         with client.responses.create(
                 **{**base, "max_output_tokens": limit}, stream=True) as stream:
             events = list(stream)
@@ -1838,7 +1874,9 @@ def check_auto_tools(client, model, checks, vision=False):
         "extra_body": {"presence_penalty": 0}}, True)
     signature(thought)
     record("auto_chat_thinking_high", thought)
-    for limit in (2, 12):
+    # Ling's compact call markup completes within 12 tokens. Six tokens stop
+    # inside the call for every supported format.
+    for limit in (2, 6):
         result = chat_result(client, {**common, "max_completion_tokens": limit}, True)
         assert result["finish"] == "length" and not result["tools"], result
         record(f"auto_chat_limit{limit}", result)
@@ -2572,7 +2610,7 @@ def main():
     parser.add_argument("--suite", choices=("all", *SDK_SUITES), default="all")
     parser.add_argument("--vision", action="store_true",
                         help="Add image checks; the server needs its matching --mmproj")
-    parser.add_argument("--sampling-preset", choices=("qwen38", "deepseek4"),
+    parser.add_argument("--sampling-preset", choices=("qwen38", "deepseek4", "ling3"),
                         help="Expected text defaults; required for all/sampling-defaults")
     parser.add_argument("--sampling-overrides", type=json.loads, default={},
                         help="JSON object of explicit server sampling CLI values")
@@ -2741,9 +2779,13 @@ def main():
             except CaseComplete:
                 report["suites"][name] = {"status": "passed", "through_case": args.through_case}
             except Exception as error:
-                report["suites"][name] = {"status": "failed", "error": str(error),
+                lines = failure_lines(error, next(reversed(checks), None))
+                report["suites"][name] = {"status": "failed", "error": describe(error),
+                                          "failed_checks": lines,
                                           "traceback": traceback.format_exc()}
-                print(f"FAIL {name}: {error}", file=sys.stderr, flush=True)
+                print(f"FAIL {name}: {describe(error)}", file=sys.stderr, flush=True)
+                for line in lines:
+                    print(line, file=sys.stderr, flush=True)
             except KeyboardInterrupt:
                 report["status"] = "interrupted"
                 checks.save()

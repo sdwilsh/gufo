@@ -4,6 +4,8 @@ from copy import deepcopy
 import re
 import sys
 
+from check_report import check_line
+
 
 def host_available_bytes(meminfo):
     match = re.search(r"^MemAvailable:\s+(\d+) kB$", meminfo, re.MULTILINE)
@@ -80,8 +82,9 @@ def check_cache_rotation(client, model, checks, chat_result):
             total, reused = result["usage"]["prompt_tokens"], result["usage"]["cached_tokens"]
             assert total >= 2048, result
             if turn and reused < conversation["total"] - 16:
-                failures.append(f"{code} turn {turn}: returning to a conversation lost its "
-                                f"checkpoint: cached={reused}, previous={conversation['total']}")
+                failures.append(check_line(
+                    f"rotation_{code}_turn_{turn}", f"cached >= {conversation['total'] - 16}",
+                    f"cached={reused} (returning to a conversation lost its checkpoint)"))
             conversation.update(total=total, body=body, result=result)
             messages.append({"role": "assistant", "content": result["text"]})
 
@@ -102,7 +105,9 @@ def check_cache_rotation(client, model, checks, chat_result):
     body, returned = chat("rotation_main_return", messages)
     answer(returned, "BETA")
     if returned["usage"]["cached_tokens"] < main["usage"]["prompt_tokens"] - 16:
-        failures.append("small unrelated requests discarded the main conversation")
+        failures.append(check_line(
+            "rotation_main_return", f"cached >= {main['usage']['prompt_tokens'] - 16}",
+            f"cached={returned['usage']['cached_tokens']} (small requests discarded it)"))
     controls = [("main", body, returned)] + [
         (conversation["code"], conversation["body"], conversation["result"])
         for conversation in conversations]

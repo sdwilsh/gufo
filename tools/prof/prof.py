@@ -45,6 +45,18 @@ from dataclasses import dataclass, field
 
 # Kernel-name substring -> pipeline stage. First match wins, so order matters.
 STAGE_MAPS: dict[str, list[tuple[str, str]]] = {
+    # Ling-3.0-flash: roll up by kernel namespace so renamed kernels stay in
+    # their stage (kda = linear-attention blocks, mla = latent attention).
+    "ling": [
+        ("rocm::kda::", "kda"),
+        ("rocm::mla::", "mla"),
+        ("rocm::moe::", "moe"),
+        ("rocm::dense::", "dense/linear"),
+        ("Cijk", "gemm: hipblaslt"),
+        ("hipblas", "gemm: hipblas"),
+        ("fillBuffer", "runtime: fill"),
+        ("copyBuffer", "runtime: copy"),
+    ],
     "h3": [
         ("WmmaAttention", "attention"),
         ("ShortAttention", "attention"),
@@ -422,6 +434,16 @@ def cmd_show(args: argparse.Namespace) -> int:
                     "wall_ms": prof.wall_ns / 1e6,
                     "dispatches": prof.dispatches,
                     "invalid_dispatches": prof.invalid_dispatches,
+                    "passes": [
+                        {
+                            "start_ms": p.start_ns / 1e6,
+                            "dispatches": p.dispatches,
+                            "kernel_ms": p.kernel_ns / 1e6,
+                            "span_ms": p.span_ns / 1e6,
+                        }
+                        for p in prof.passes
+                        if p.kernel_ns >= 5e6
+                    ],
                     "kernels": {
                         n: {"calls": s.calls, "ms": s.ns / 1e6, "shape": s.shape}
                         for n, s in prof.kernels.items()

@@ -2412,7 +2412,14 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
     metrics["cache_common_prefix_tokens"] = result.cache_common_prefix_tokens;
     metrics["cache_checkpoint_tokens"] = result.cache_checkpoint_tokens;
   }
+  metrics["request_seq"] = result.request_seq;
+  metrics["previous_prompt_tokens"] = result.previous_prompt_tokens;
+  metrics["previous_common_prefix_tokens"] =
+      result.previous_common_prefix_tokens;
   json::Value overlaps = json::Value::object();
+  for (const auto& [seq, common] : result.recent_prefix_overlaps)
+    overlaps[std::to_string(seq)] = common;
+  metrics["recent_prefix_overlaps"] = std::move(overlaps);
   metrics["cache_restore_bytes"] = result.cache_restore_bytes;
   metrics["cache_snapshot_bytes"] = result.cache_snapshot_bytes;
   metrics["cache_disk_queued_bytes"] = result.cache_disk_queued_bytes;

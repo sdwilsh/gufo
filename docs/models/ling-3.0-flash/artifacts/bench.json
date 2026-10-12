@@ -1,0 +1,104 @@
+{
+  "schema": "gufo-model-bench/1",
+  "category": "llm",
+  "model": {
+    "id": "Ling-3.0-flash",
+    "docs": "ling-3.0-flash",
+    "label": "Ling-3.0-flash Q4_K_S"
+  },
+  "files": {
+    "gguf": "first shard of Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf"
+  },
+  "variants": {
+    "default": {
+      "label": "Q4_K_S",
+      "requires": [
+        "gguf"
+      ]
+    }
+  },
+  "sampling": {
+    "temperature": 0,
+    "seed": 1
+  },
+  "tables": {
+    "single-ar": {
+      "title": "Single user, autoregressive",
+      "per_variant": false,
+      "prompt_tokens": 2048,
+      "output_tokens": 128,
+      "depths": [
+        0,
+        4096,
+        16384,
+        65536
+      ],
+      "context": 67776,
+      "depth_tolerance": 0.005,
+      "prefix": {
+        "generator": "synthetic-paragraphs",
+        "seed": 1
+      },
+      "repetitions": 1,
+      "metric": "tok/s",
+      "better": "higher"
+    },
+    "loading": {
+      "title": "Loading time",
+      "per_variant": false,
+      "context": 262144,
+      "sessions": 1,
+      "repetitions": 1,
+      "metric": "seconds",
+      "better": "lower",
+      "rows": "variants"
+    },
+    "memory": {
+      "title": "Memory occupation",
+      "per_variant": false,
+      "context": 66000,
+      "workloads": [
+        {
+          "id": "pp2048 + tg128",
+          "depth": 0,
+          "prompt_tokens": 2048,
+          "output_tokens": 128
+        }
+      ],
+      "metric": "GiB",
+      "better": "lower",
+      "mode": "ar"
+    }
+  },
+  "gufo": {
+    "serve": [],
+    "llm": [
+      "--think",
+      "off",
+      "--speculative",
+      "off",
+      "--max-pending-per-client",
+      "8"
+    ],
+    "readiness": "/ready"
+  },
+  "reference": {
+    "name": "llama.cpp",
+    "server": "llama-server",
+    "args": [
+      "-ngl",
+      "999",
+      "-fa",
+      "on",
+      "--cache-reuse",
+      "0",
+      "--jinja",
+      "--reasoning",
+      "off",
+      "--cache-ram",
+      "0"
+    ],
+    "endpoint_profile": "openai",
+    "readiness": "/health"
+  }
+}

@@ -109,11 +109,14 @@ def check_cache_edits(client, model, checks, chat_result):
             common = detail["cache_common_prefix_tokens"]
             assert common * 10 >= prompt * 9, evidence
             assert detail["cache_checkpoint_tokens"] > common, evidence
-            failures.append(f"{label}: unchanged prefix was not reused: {evidence}")
+            failures.append(check_line(f"{label}_reuse", "unchanged prefix is reused",
+                                       f"cached_tokens=0 {evidence}"))
         else:
             assert detail["cache_hit"] and prefilled < prompt, evidence
             if reused * 2 < prompt:
-                failures.append(f"{label}: less than half the prompt was reused: {evidence}")
+                failures.append(check_line(f"{label}_reuse",
+                                           f"cached_tokens >= {(prompt + 1) // 2} of {prompt}",
+                                           f"cached_tokens={reused} {evidence}"))
         checks[label + "_evidence"] = evidence
 
         # Bypass lookup after measuring the edit: cold controls can replace
