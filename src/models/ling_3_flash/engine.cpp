@@ -142,6 +142,14 @@ std::size_t Model::ResidentBytes() const noexcept {
 std::size_t Model::ScratchBytes() const noexcept {
   return executor_->scratch_bytes();
 }
+void Model::SetMtpDraftHeadQ8(bool q8) noexcept {
+  executor_->SetMtpDraftHeadQ8(q8);
+}
+
+bool Model::MtpDraftHeadQ8() const noexcept {
+  return executor_->MtpDraftHeadQ8();
+}
+
 std::size_t Model::SessionBytes(std::uint32_t context, bool mtp) noexcept {
   return ling_3_flash::SessionBytes(context, mtp).Total();
 }

@@ -136,7 +136,10 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  std::vector<std::vector<float>> gpu_logits;
+  // The reference comparison validates the draft block with the trunk's F16
+  // head; the production Q8_0 draft head is checked against it below.
+  model->SetMtpDraftHeadQ8(false);
+  std::vector<std::vector<float>> gpu_logits, gpu_h;
   for (std::uint32_t step = 0; step < kMtpSyntheticSteps; ++step) {
     std::vector<float> logits(l3::kVocab);
     std::vector<float> h_next(l3::kHidden);
@@ -173,6 +176,47 @@ int main(int argc, char** argv) {
            tag + ": top-1 equals the reference (margin " +
                std::to_string(margin) + ")");
     gpu_logits.push_back(std::move(logits));
+    gpu_h.push_back(std::move(h_next));
+  }
+
+  // Draft head: the Q8_0 copy of the output head (the production default).
+  // Hidden states do not depend on the head (bit-identical h_next); logits
+  // differ by the weights' Q8_0 rounding only, and the top-1 may differ only
+  // inside that error.
+  model->SetMtpDraftHeadQ8(true);
+  Expect(model->MtpDraftHeadQ8(), "the Q8_0 draft head is selectable");
+  for (std::uint32_t step = 0; step < kMtpSyntheticSteps; ++step) {
+    std::vector<float> logits(l3::kVocab);
+    std::vector<float> h_next(l3::kHidden);
+    std::int32_t argmax = -1;
+    if (!session->DraftWithHidden(MtpSyntheticToken(step),
+                                  MtpSyntheticHidden(step, l3::kHidden), step,
+                                  logits, h_next, &argmax, &error)) {
+      std::printf("q8 draft step %u failed: %s\n", step, error.c_str());
+      return 1;
+    }
+    const std::string tag = "q8 head step " + std::to_string(step);
+    Expect(
+        std::ranges::all_of(logits, [](float v) { return std::isfinite(v); }),
+        tag + ": logits are finite");
+    Expect(argmax == HostArgmax(logits),
+           tag + ": device argmax equals the host argmax");
+    Expect(h_next == gpu_h[step], tag + ": h_next is bit-identical");
+    const double rel = RelL2(logits, gpu_logits[step]);
+    double max_abs = 0.0;
+    for (std::size_t i = 0; i < logits.size(); ++i) {
+      max_abs =
+          std::max<double>(max_abs, std::fabs(logits[i] - gpu_logits[step][i]));
+    }
+    std::printf("       q8 vs f16 head: logits rel L2 %.3g, max abs %.3g\n",
+                rel, max_abs);
+    Expect(rel < 1.5e-2, tag + ": logits match the F16 head");
+    auto top = gpu_logits[step];
+    std::partial_sort(top.begin(), top.begin() + 2, top.end(),
+                      std::greater<float>());
+    Expect(HostArgmax(gpu_logits[step]) == argmax ||
+               static_cast<double>(top[0]) - top[1] <= 2.0 * max_abs,
+           tag + ": top-1 equals the F16 head's outside its error");
   }
 
   // Golden numbers (the same file the CPU test writes).
