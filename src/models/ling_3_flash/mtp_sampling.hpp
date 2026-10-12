@@ -5,6 +5,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -139,6 +140,72 @@ inline MtpVerification VerifyMtpProposal(std::span<const float> logits,
               std::span(proposal.probabilities).first(proposal.size),
               sampler.mutable_rng_state()),
           false};
+}
+
+/// Draft side of a sampled cycle. The proposals use their own stream, seeded
+/// with one draw of the request's RNG so target verification keeps
+/// independent draws, and an unconstrained copy of the request's sampler that
+/// follows the chain (anchor, then each proposal) for the penalty history.
+class MtpProposer {
+public:
+  MtpProposer(sampling::SamplerState& sampler, sampling::TokenId anchor)
+      : rng_(sampling::NextRandom(sampler.mutable_rng_state())),
+        draft_(sampler.WithoutConstraint()) {
+    draft_.Accept(anchor);
+  }
+
+  /// Draws the next draft token from the draft block's logits row.
+  sampling::TokenId Propose(std::span<const float> draft_logits) {
+    proposals_.push_back(
+        SampleMtpProposal(TopCandidates(draft_logits), draft_, &rng_));
+    draft_.Accept(proposals_.back().token);
+    return proposals_.back().token;
+  }
+
+  [[nodiscard]] std::span<const MtpProposal> proposals() const noexcept {
+    return proposals_;
+  }
+
+private:
+  std::uint64_t rng_;
+  sampling::SamplerState draft_;
+  std::vector<MtpProposal> proposals_;
+};
+
+struct SampledVerification {
+  /// Committed chain tokens (anchor included).
+  std::uint32_t keep{1};
+  /// The target sample after the kept tokens is a stop token.
+  bool stop{false};
+  /// Residual draw after the first rejection: the next cycle's anchor.
+  std::optional<sampling::TokenId> correction;
+};
+
+/// Target side of a sampled cycle over [anchor, proposals]: row_logits(j) are
+/// the target logits after chain token j, and `sampler` has accepted the
+/// anchor. Accepted proposals enter the sampler's history in order before the
+/// next row's p is computed; a rejected proposal never does.
+template<typename RowLogits, typename IsStop>
+SampledVerification VerifySampledChain(RowLogits&& row_logits,
+                                       std::span<const MtpProposal> proposals,
+                                       sampling::SamplerState& sampler,
+                                       IsStop&& is_stop) {
+  SampledVerification out;
+  while (out.keep <= proposals.size()) {
+    const auto verified = VerifyMtpProposal(row_logits(out.keep - 1),
+                                            proposals[out.keep - 1], sampler);
+    if (is_stop(verified.token)) {
+      out.stop = true;
+      break;
+    }
+    if (!verified.accepted) {
+      out.correction = verified.token;
+      break;
+    }
+    sampler.Accept(verified.token);
+    ++out.keep;
+  }
+  return out;
 }
 
 /// The draft is deterministic, so an exact target sample decides acceptance.
