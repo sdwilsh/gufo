@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <functional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -23,13 +24,16 @@ namespace gufo::server {
 /// template has no developer role. Server-authored framing (response_format
 /// instructions) follows the message content like the Qwen and DeepSeek
 /// templates render it; as message data it is never promoted to control
-/// tokens.
+/// tokens. Ling-3.0-flash reads text only: an image in any message (a user
+/// turn or a tool result) is refused as invalid input, never dropped.
 [[nodiscard]] inline std::vector<models::ling_3_flash::ChatMessage>
 ToLingMessages(const std::vector<tokenization::ChatMessage>& messages) {
   namespace ling = models::ling_3_flash;
   std::vector<ling::ChatMessage> converted_messages;
   converted_messages.reserve(messages.size());
   for (const auto& message : messages) {
+    if (!message.images.empty())
+      throw std::invalid_argument("model does not support image input");
     std::string role;
     switch (message.role) {
       case tokenization::ChatRole::kDeveloper:
