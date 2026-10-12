@@ -27,6 +27,52 @@ void Expect(bool ok, const char* what) {
 }  // namespace
 
 int main() {
+  // Batched cycles (MtpCohortController): the calibrated prior and measured
+  // costs decide between drafting and the batched AR step (width 0).
+  {
+    l3::MtpLengthController perfect(7);
+    for (int i = 0; i < 40; ++i) {
+      perfect.Observe(3, 3, true, 0);
+    }
+    l3::MtpLengthController poor(7);
+    for (int i = 0; i < 40; ++i) {
+      poor.Observe(0, 1, true, 0);
+    }
+    const l3::MtpCohortController fresh;
+    const std::array<l3::MtpCohortController::Row, 2> good = {
+        {{&perfect, 3}, {&perfect, 3}}};
+    const std::array<l3::MtpCohortController::Row, 2> bad = {
+        {{&poor, 3}, {&poor, 3}}};
+    Expect(fresh.Choose(good, 2, 0, 8, 0) >= 1,
+           "cohort: accepted drafts beat batched AR on the prior");
+    Expect(fresh.Choose(bad, 2, 0, 8, 0) == 0,
+           "cohort: rejected drafts keep the batched AR step");
+    Expect(fresh.Choose(good, 2, 0, 8, 0) <= 3, "cohort: width within budget");
+    // Measured: width 1 costs three AR steps; drafting must stop paying.
+    l3::MtpCohortController measured;
+    for (int i = 0; i < 4; ++i) {
+      measured.Observe(2, 0, 0, 35.0F);
+      measured.Observe(2, 0, 1, 105.0F);
+      measured.Observe(2, 0, 2, 140.0F);
+      measured.Observe(2, 0, 3, 175.0F);
+    }
+    // 16 cycles observed: no exploration step; width 0 scores best
+    // (2 / 35 against 4 / 105, 6 / 140 and 8 / 175 tokens per ms).
+    Expect(measured.Choose(good, 2, 0, 8, 0) == 0,
+           "cohort: measured costs override the prior");
+    // Two greedy lanes beside 4 rows of other lanes fit width 1 in one
+    // 8-row forward; width 3 needs a second forward, and when that is what
+    // the measurements favour it is chosen (the cycle then splits).
+    l3::MtpCohortController split;
+    for (int i = 0; i < 4; ++i) {
+      split.Observe(4, 0, 0, 50.0F);
+      split.Observe(4, 0, 1, 200.0F);
+      split.Observe(4, 0, 2, 200.0F);
+      split.Observe(4, 0, 3, 60.0F);
+    }
+    Expect(split.Choose(good, 4, 4, 8, 0) == 3,
+           "cohort: a wider width across two verify forwards can win");
+  }
   // Perfect acceptance: drafts are used and the depth grows toward the limit.
   {
     l3::MtpLengthController c(7);
