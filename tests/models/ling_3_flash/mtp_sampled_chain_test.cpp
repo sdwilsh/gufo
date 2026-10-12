@@ -11,7 +11,11 @@
 // the randomized PIT values must be U(0, 1) (Kolmogorov-Smirnov), the stop and
 // top-1 counts must match their exact expectations, and no committed token may
 // have p = 0 (sampled_distribution.hpp). Plain autoregressive sampling runs
-// through the same checks as a control of the statistics.
+// through the same checks as a control of the statistics. Prompt-lookup copies
+// (prompt_lookup.hpp) run through the same checks as point-mass proposals
+// (CopyProposal, q = 1): copies that are a deterministic function of the
+// context, and the real index with its copy controller in front of the MTP
+// drafts, as Session::DecodeStep drives them.
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -23,6 +27,7 @@
 #include "src/core/sampling.hpp"
 #include "src/models/ling_3_flash/mtp.hpp"
 #include "src/models/ling_3_flash/mtp_sampling.hpp"
+#include "src/models/ling_3_flash/prompt_lookup.hpp"
 #include "tests/models/ling_3_flash/sampled_distribution.hpp"
 
 namespace l3 = gufo::models::ling_3_flash;
@@ -107,13 +112,22 @@ enum class Mode {
   kAutoregressive,
   kVaryingDrafts,
   kController,
-  kUnrelatedDrafts
+  kUnrelatedDrafts,
+  /// Copies that are a deterministic function of the context (the draft
+  /// model's argmax), varying counts.
+  kCopies,
+  /// The prompt-lookup index and copy controller before the MTP drafts.
+  kLookup,
+  /// Plain sampling on the lookup mode's prompt (its control).
+  kAutoregressiveRepetitive
 };
 
 struct DraftStats {
   std::uint64_t cycles{0};
   std::uint64_t drafted{0};
   std::uint64_t accepted{0};
+  std::uint64_t copied{0};
+  std::uint64_t copied_accepted{0};
 };
 
 /// One request as the server runs it: the pool's sampler accepts committed
@@ -126,6 +140,9 @@ Sequence Generate(const sampling::SamplingConfig& config,
   sampling::SamplerState pool(config, history);
   std::vector<std::int32_t> context(prompt.begin(), prompt.end());
   l3::MtpLengthController controller;
+  l3::MtpLengthController copy_controller =
+      l3::MtpLengthController::ForCopies();
+  l3::PromptLookup lookup(3);
   Sequence out;
   std::uint64_t cycle = 0;
   while (out.tokens.size() < length) {
@@ -139,14 +156,45 @@ Sequence Generate(const sampling::SamplingConfig& config,
       break;
     }
     std::uint32_t drafts = 0;
-    if (mode == Mode::kVaryingDrafts || mode == Mode::kUnrelatedDrafts) {
+    if (mode == Mode::kVaryingDrafts || mode == Mode::kUnrelatedDrafts ||
+        mode == Mode::kCopies) {
       drafts = static_cast<std::uint32_t>(
           Mix(static_cast<std::uint64_t>(config.seed) * 131 + cycle) % 8);
-    } else if (mode == Mode::kController) {
+    } else if (mode == Mode::kController || mode == Mode::kLookup) {
       drafts = controller.Choose(7, false, 0);
     }
     drafts =
         std::min<std::uint32_t>(drafts, static_cast<std::uint32_t>(budget - 1));
+    // Prompt-lookup copies: chain tokens and their point-mass proposals.
+    std::vector<std::int32_t> copy_chain;
+    if (drafts != 0 && mode == Mode::kCopies) {
+      copy_chain = {static_cast<std::int32_t>(anchor)};
+      for (std::uint32_t j = 0; j < drafts; ++j) {
+        auto with = context;
+        with.insert(with.end(), copy_chain.begin(), copy_chain.end());
+        const auto draft = Draft(with, generated + copy_chain.size());
+        copy_chain.push_back(static_cast<std::int32_t>(
+            std::max_element(draft.begin(), draft.end()) - draft.begin()));
+      }
+    } else if (budget > 1 && mode == Mode::kLookup) {
+      lookup.Extend(context);
+      const std::int32_t pending = static_cast<std::int32_t>(anchor);
+      const auto match = lookup.Find(context, std::span(&pending, 1));
+      if (match.length != 0) {
+        const auto available = static_cast<std::uint32_t>(
+            std::min<std::size_t>(budget - 1, context.size() - match.start));
+        const std::uint32_t copies =
+            copy_controller.Choose(available, false, 0);
+        if (copies != 0) {
+          copy_chain = {pending};
+          copy_chain.insert(
+              copy_chain.end(),
+              context.begin() + static_cast<long>(match.start),
+              context.begin() + static_cast<long>(match.start + copies));
+          drafts = copies;
+        }
+      }
+    }
     ++cycle;
     std::vector<std::int32_t> committed;
     bool stop = false;
@@ -154,6 +202,39 @@ Sequence Generate(const sampling::SamplingConfig& config,
       working.Accept(anchor);
       committed = {static_cast<std::int32_t>(anchor)};
       controller.ObservePlainToken();
+      copy_controller.ObservePlainToken();
+    } else if (!copy_chain.empty()) {
+      // No proposer stream is drawn for copies.
+      std::vector<l3::MtpProposal> proposals;
+      std::vector<std::vector<float>> rows;
+      for (std::size_t j = 1; j < copy_chain.size(); ++j) {
+        proposals.push_back(
+            l3::CopyProposal(static_cast<sampling::TokenId>(copy_chain[j])));
+      }
+      for (std::size_t j = 0; j < copy_chain.size(); ++j) {
+        auto with = context;
+        with.insert(with.end(), copy_chain.begin(), copy_chain.begin() + j + 1);
+        rows.push_back(Target(with, generated + j + 1));
+      }
+      working.Accept(anchor);
+      const auto verified = l3::VerifySampledChain(
+          [&](std::uint32_t row) { return std::span<const float>(rows[row]); },
+          proposals, working, IsStop);
+      committed.assign(copy_chain.begin(), copy_chain.begin() + verified.keep);
+      stop = verified.stop;
+      if (verified.correction) {
+        working.DeferSample(*verified.correction);
+      }
+      copy_controller.Observe(verified.keep - 1,
+                              stop ? verified.keep - 1 : drafts, false, 0);
+      controller.ObservePlainToken();
+      if (stats != nullptr) {
+        ++stats->cycles;
+        stats->drafted += drafts;
+        stats->accepted += verified.keep - 1;
+        stats->copied += drafts;
+        stats->copied_accepted += verified.keep - 1;
+      }
     } else {
       l3::MtpProposer proposer(working, anchor);
       std::vector<std::int32_t> chain{static_cast<std::int32_t>(anchor)};
@@ -182,6 +263,7 @@ Sequence Generate(const sampling::SamplingConfig& config,
       }
       controller.Observe(verified.keep - 1, stop ? verified.keep - 1 : drafts,
                          false, 0);
+      copy_controller.ObservePlainToken();
       if (stats != nullptr) {
         ++stats->cycles;
         stats->drafted += drafts;
@@ -243,6 +325,12 @@ int main(int argc, char** argv) {
   constexpr std::size_t kLength = 10;
   const std::array<std::int32_t, 12> prompt{17, 4, 99, 23, 4, 150,
                                             61, 8, 4,  77, 5, 42};
+  // A prompt of a small repeated alphabet: the lookup mode finds matches in it
+  // (the target's most likely tokens are those low ids).
+  std::array<std::int32_t, 36> repetitive{};
+  for (std::size_t i = 0; i < repetitive.size(); ++i) {
+    repetitive[i] = static_cast<std::int32_t>(2 + (i * i + i / 5) % 6);
+  }
   struct Case {
     const char* name;
     sampling::SamplingConfig config;
@@ -272,13 +360,18 @@ int main(int argc, char** argv) {
   constexpr double kAlpha = 1e-4;
   constexpr double kMaxZ = 4.5;
   for (const auto& c : cases) {
-    for (const Mode mode : {Mode::kAutoregressive, Mode::kVaryingDrafts,
-                            Mode::kController, Mode::kUnrelatedDrafts}) {
+    for (const Mode mode :
+         {Mode::kAutoregressive, Mode::kVaryingDrafts, Mode::kController,
+          Mode::kUnrelatedDrafts, Mode::kCopies, Mode::kLookup,
+          Mode::kAutoregressiveRepetitive}) {
       const char* mode_name =
           mode == Mode::kAutoregressive  ? "ar"
           : mode == Mode::kVaryingDrafts ? "mtp_varying_drafts"
           : mode == Mode::kController    ? "mtp_controller"
-                                         : "mtp_unrelated_drafts";
+          : mode == Mode::kCopies        ? "lookup_point_mass_copies"
+          : mode == Mode::kLookup        ? "lookup_index_and_controller"
+          : mode == Mode::kAutoregressiveRepetitive ? "ar_repetitive_prompt"
+                                                    : "mtp_unrelated_drafts";
       Evidence e;
       DraftStats stats;
       std::mt19937_64 rng(12345);
@@ -290,20 +383,26 @@ int main(int argc, char** argv) {
         // task): the xorshift stream starts from a sparse state.
         config.seed = static_cast<std::int64_t>(
             1000 + 100000 * static_cast<std::size_t>(mode) + n);
-        const auto s = Generate(config, prompt, kLength, mode, &stats);
+        const std::span<const std::int32_t> text =
+            mode == Mode::kLookup || mode == Mode::kAutoregressiveRepetitive
+                ? std::span<const std::int32_t>(repetitive)
+                : std::span<const std::int32_t>(prompt);
+        const auto s = Generate(config, text, kLength, mode, &stats);
         stopped += s.stopped ? 1 : 0;
         tokens += s.tokens.size();
-        Score(c.config, prompt, s, rng, &e);
+        Score(c.config, text, s, rng, &e);
       }
       const auto ks = KsUniform(e.pit);
       std::printf(
           "       %s/%s: %zu pit values, KS D=%.4f p=%.3g, stops %zu "
           "(z=%.2f), top-1 z=%.2f, impossible %zu, mean length %.2f, "
-          "drafted %llu accepted %llu\n",
+          "drafted %llu accepted %llu (copied %llu accepted %llu)\n",
           c.name, mode_name, ks.n, ks.d, ks.p, stopped, e.stops.z(), e.top.z(),
           e.impossible, static_cast<double>(tokens) / sequences,
           static_cast<unsigned long long>(stats.drafted),
-          static_cast<unsigned long long>(stats.accepted));
+          static_cast<unsigned long long>(stats.accepted),
+          static_cast<unsigned long long>(stats.copied),
+          static_cast<unsigned long long>(stats.copied_accepted));
       const std::string label = std::string(c.name) + "/" + mode_name;
       Expect(e.impossible == 0, label + ": no committed token has p = 0");
       Expect(ks.p >= kAlpha, label + ": PIT values are uniform");
@@ -314,7 +413,15 @@ int main(int argc, char** argv) {
       if (mode == Mode::kUnrelatedDrafts) {
         Expect(stats.drafted > 0 && stats.accepted * 10 < stats.drafted,
                label + ": drafts are proposed and mostly rejected");
-      } else if (mode != Mode::kAutoregressive) {
+      } else if (mode == Mode::kCopies) {
+        Expect(stats.accepted > 0 && stats.accepted < stats.drafted,
+               label + ": copies are accepted and rejected");
+      } else if (mode == Mode::kLookup) {
+        // The synthetic target does not repeat itself, so copies are rarely
+        // right here; the distribution checks are what this mode is for.
+        Expect(stats.copied > 0, label + ": copies are proposed");
+      } else if (mode != Mode::kAutoregressive &&
+                 mode != Mode::kAutoregressiveRepetitive) {
         Expect(stats.accepted > stats.drafted / 10 &&
                    stats.accepted < stats.drafted,
                label + ": drafts are accepted and rejected");

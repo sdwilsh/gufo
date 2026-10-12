@@ -104,6 +104,21 @@ inline MtpProposal SampleMtpProposal(const MtpCandidateLogits& candidates,
   return proposal;
 }
 
+/// A prompt-lookup copy as a proposal: the point mass on the copied token
+/// (q(x) = 1). The copy depends on the committed tokens alone, so the generic
+/// rule stays exact: x is accepted with probability min(1, p(x) / 1) = p(x),
+/// and a rejection draws from norm(max(p - q, 0)), which is p without x. It
+/// has no draft logits and uses no draw of the request's proposal stream.
+inline MtpProposal CopyProposal(sampling::TokenId token) {
+  MtpProposal proposal;
+  proposal.ids[0] = token;
+  proposal.probabilities[0] = 1.0F;
+  proposal.size = 1;
+  proposal.token = token;
+  proposal.probability = 1.0F;
+  return proposal;
+}
+
 struct MtpVerification {
   sampling::TokenId token;
   bool accepted;

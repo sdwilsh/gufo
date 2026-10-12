@@ -102,7 +102,12 @@ seed. Speed depends on acceptance and verification cost.
   defaults to MTP: `gufo serve llm` and `gufo bench` use it whenever the GGUF
   carries the block and `--speculative` is not given (bench also needs greedy
   sampling and `--min-draft-tokens 1` for the default; otherwise it runs AR).
-  A GGUF without the block runs AR and logs why. `--speculative off` selects AR
+  A GGUF without the block runs AR and logs why. With MTP, Ling also copies
+  repeated passages: when the context ends in 12 or more tokens that occurred
+  earlier in the prompt or reply (code edits, tool-output echoes, quotes), the
+  tokens that followed are verified as the draft without running the drafter
+  (up to 7 per step; greedy output is unchanged, sampled output keeps the
+  target distribution). `--speculative off` selects AR
   (costs 2.1 GiB less memory, decodes 1.1-1.5x slower). `gufo bench
   --text-file FILE` measures MTP on real text. Other models default to AR.
 - `dflashModel` — path to the DFlash2 companion draft.

@@ -1,6 +1,15 @@
 // Full-model MTP (multi-token prediction) speculative decoding checks for
 // Ling-3.0-flash on the GPU (mtp.hpp). Needs the model loaded with the MTP
 // block (this tool always passes --mtp). Checks:
+//   * lookup_*: prompt-lookup drafts (prompt_lookup.hpp). On repetitive
+//     prompts (a code block echoed with an edit, a quoted paragraph) and on
+//     prose, greedy decoding with lookup is token-identical to greedy AR and
+//     to MTP without lookup, with a bitwise-identical final state; copies must
+//     have been proposed (and, on the full trunk, accepted) on the repetitive
+//     prompts; seeded sampled runs with lookup reproduce themselves, also
+//     from a restored snapshot (the index is rebuilt from the restored
+//     tokens); the grammar-constrained greedy and sampled runs below also run
+//     with lookup.
 //   * greedy_equals_ar_*: greedy speculative decoding (several prompts, draft
 //     limits 1, 3 and 7) is token-identical to greedy autoregressive decoding,
 //     and the final KDA state, conv windows, MLA cache rows and logits are
@@ -42,6 +51,7 @@
 //            [--max-batch N] [--timeout-seconds S] [--hold-seconds S]
 
 #include <array>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <random>
@@ -90,6 +100,7 @@ struct Run {
   std::vector<std::uint16_t> mtp_rows;
   std::vector<float> mtp_hidden;
   l3::Session::DraftStats stats;
+  double ms{0.0};  ///< Wall time of the decode loop (a hint on a debug GPU).
 };
 
 bool Finish(l3::Session& s, std::uint32_t layers, Run* out,
@@ -110,6 +121,12 @@ bool GenerateAr(l3::Model& model, l3::Session& s,
     return false;
   }
   sampling::SamplerState sampler(config);
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto stamp = [&] {
+    out->ms = std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+  };
   for (std::uint32_t i = 0; i < count; ++i) {
     const auto token = static_cast<std::int32_t>(sampler.Sample(s.Logits()));
     if (model.IsStopToken(token)) {
@@ -121,6 +138,7 @@ bool GenerateAr(l3::Model& model, l3::Session& s,
       return false;
     }
   }
+  stamp();
   return Finish(s, layers, out, error);
 }
 
@@ -141,6 +159,7 @@ bool GenerateMtp(l3::Model& model, l3::Session& s,
   }
   s.SetDraftHooks(std::move(hooks));
   sampling::SamplerState sampler(config);
+  const auto t0 = std::chrono::steady_clock::now();
   while (out->tokens.size() < count) {
     const std::size_t budget =
         std::min<std::size_t>(l3::kMaxVerifyTokens, count - out->tokens.size());
@@ -158,6 +177,9 @@ bool GenerateMtp(l3::Model& model, l3::Session& s,
       break;
     }
   }
+  out->ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
   return Finish(s, layers, out, error);
 }
 
@@ -255,6 +277,138 @@ int Execute(const Args& args, Report& report,
           total_drafted > 0 && (total_accepted > 0 || !full), std::move(o));
   }
 
+  // ---- prompt lookup --------------------------------------------------------
+  // Repetitive prompts: a code block echoed with an edit, and a quoted
+  // paragraph. The truncated trunk (--layers) loops on garbage, so its lookup
+  // minimum is lowered to make copies likely there; the full trunk uses the
+  // default of 12.
+  std::vector<std::vector<std::int32_t>> echoes;
+  {
+    const std::string code = kPrompts[1];
+    const std::string prose = session_tool::kText;
+    echoes.push_back(model->Tokenize("Original file:\n" + code +
+                                     "\nEdited file (rename n to m):\n" +
+                                     code.substr(0, code.size() * 3 / 4)));
+    auto quote = model->Tokenize("Quote: " + prose + "\nAs quoted: " +
+                                 prose.substr(0, prose.size() / 2));
+    if (quote.size() > ctx - 2 * G - 8) {
+      quote.resize(ctx - 2 * G - 8);
+    }
+    echoes.push_back(std::move(quote));
+  }
+  {
+    const bool full = model->LayerCount() == l3::kTrunkLayers;
+    std::uint64_t copied_total = 0;
+    std::uint64_t copied_accepted_total = 0;
+    const std::vector<const std::vector<std::int32_t>*> lookup_prompts = {
+        &echoes[0], &echoes[1], &prompts[0]};
+    for (std::size_t p = 0; p < lookup_prompts.size(); ++p) {
+      const auto& prompt = *lookup_prompts[p];
+      auto s_ar = fresh();
+      Run ar;
+      if (!s_ar ||
+          !GenerateAr(*model, *s_ar, greedy, prompt, G, layers, &ar, &error)) {
+        return fail_with("lookup autoregressive run");
+      }
+      l3::Session::DraftHooks off;
+      off.no_lookup = true;
+      l3::Session::DraftHooks on;
+      on.lookup_min_match = full ? 0 : 4;
+      auto s_off = fresh();
+      auto s_on = fresh();
+      Run mtp_off, mtp_on;
+      if (!s_off || !s_on ||
+          !GenerateMtp(*model, *s_off, greedy, prompt, G, 7, layers, &mtp_off,
+                       &error, true, off) ||
+          !GenerateMtp(*model, *s_on, greedy, prompt, G, 7, layers, &mtp_on,
+                       &error, true, on)) {
+        return fail_with("lookup speculative runs");
+      }
+      const Diff d = Compare(mtp_on.end, ar.end);
+      auto o = json::Value::object();
+      o["prompt_tokens"] = U(prompt.size());
+      o["cycles"] = U(mtp_on.stats.cycles);
+      o["drafted"] = U(mtp_on.stats.drafted);
+      o["accepted"] = U(mtp_on.stats.accepted);
+      o["copied"] = U(mtp_on.stats.copied);
+      o["copied_accepted"] = U(mtp_on.stats.copied_accepted);
+      o["no_lookup_copied"] = U(mtp_off.stats.copied);
+      o["ar_ms"] = ar.ms;
+      o["mtp_no_lookup_ms"] = mtp_off.ms;
+      o["mtp_lookup_ms"] = mtp_on.ms;
+      o["tokens_equal_ar"] = ar.tokens == mtp_on.tokens;
+      o["tokens_equal_no_lookup"] = mtp_off.tokens == mtp_on.tokens;
+      o["final_state"] = ToJson(d);
+      const bool repetitive = p < 2;
+      copied_total += repetitive ? mtp_on.stats.copied : 0;
+      copied_accepted_total += repetitive ? mtp_on.stats.copied_accepted : 0;
+      check("lookup_equals_ar_p" + std::to_string(p),
+            ar.tokens == mtp_on.tokens && mtp_off.tokens == mtp_on.tokens &&
+                ar.tokens.size() == G && session_tool::Exact(d) &&
+                mtp_off.stats.copied == 0 && SameState(mtp_off, mtp_on) &&
+                mtp_on.mtp_rows == mtp_off.mtp_rows &&
+                mtp_on.mtp_hidden == mtp_off.mtp_hidden,
+            std::move(o));
+    }
+    auto o = json::Value::object();
+    o["copied"] = U(copied_total);
+    o["copied_accepted"] = U(copied_accepted_total);
+    o["full_trunk"] = full;
+    // A truncated trunk's anchors seldom continue the echo; forced copies
+    // above cover the copy path there.
+    check("lookup_copies_proposed_on_repetitive_prompts",
+          !full || (copied_total > 0 && copied_accepted_total > 0),
+          std::move(o));
+
+    // Sampled: copies are point-mass proposals. A seeded run reproduces
+    // itself, also on a session restored from a snapshot (the index is rebuilt
+    // from the restored tokens), and the committed tokens differ from a run
+    // without lookup only through the distribution-preserving draws.
+    sampling::SamplingConfig sampled;
+    sampled.temperature = 0.8F;
+    sampled.top_p = 0.95F;
+    sampled.top_k = 40;
+    sampled.seed = 777;
+    l3::Session::DraftHooks on;
+    on.lookup_min_match = full ? 0 : 4;
+    const auto& prompt = echoes[0];
+    auto s1 = fresh();
+    auto s2 = fresh();
+    Run a, b;
+    if (!s1 || !s2 ||
+        !GenerateMtp(*model, *s1, sampled, prompt, G, 7, layers, &a, &error,
+                     true, on) ||
+        !GenerateMtp(*model, *s2, sampled, prompt, G, 7, layers, &b, &error,
+                     true, on)) {
+      return fail_with("lookup sampled runs");
+    }
+    auto o2 = json::Value::object();
+    o2["cycles"] = U(a.stats.cycles);
+    o2["drafted"] = U(a.stats.drafted);
+    o2["copied"] = U(a.stats.copied);
+    o2["copied_accepted"] = U(a.stats.copied_accepted);
+    check("lookup_sampled_replay",
+          a.tokens == b.tokens && a.tokens.size() == G && SameState(a, b) &&
+              (a.stats.copied > 0 || !full) &&
+              a.stats.copied == b.stats.copied &&
+              a.stats.copied_accepted == b.stats.copied_accepted,
+          std::move(o2));
+    auto s3 = fresh();
+    auto s4 = fresh();
+    Run c;
+    std::unique_ptr<l3::SessionSnapshot> snap;
+    bool ok = s3 && s4 && s3->Feed(prompt, {}, &error);
+    snap = ok ? s3->SaveSnapshot(&error) : nullptr;
+    ok = ok && snap && s4->RestoreSnapshot(*snap, &error) &&
+         GenerateMtp(*model, *s4, sampled, prompt, G, 7, layers, &c, &error,
+                     false, on);
+    auto o3 = json::Value::object();
+    o3["copied"] = U(c.stats.copied);
+    check("lookup_sampled_replay_from_snapshot",
+          ok && c.tokens == a.tokens && c.stats.copied == a.stats.copied,
+          std::move(o3));
+  }
+
   // ---- draft head ----------------------------------------------------------
   // The draft step scores with a Q8_0 copy of the output head (the default
   // above); the F16 head must give the same committed tokens and end state
@@ -345,6 +499,120 @@ int Execute(const Args& args, Report& report,
                 mtp.stats.cycles > 0,
             std::move(o));
     }
+  }
+
+  // ---- forced prompt-lookup copies -----------------------------------------
+  // The same patterns through the copy path (DraftHooks::copy_source replaces
+  // the index): copies that replay the autoregressive continuation, corrupted
+  // at chosen depths, and a mix that alternates copy cycles with MTP cycles.
+  // Output, final state, MTP cache rows and hidden carry must be those of
+  // autoregressive decoding whatever the copies were.
+  {
+    const auto& prompt = prompts[0];
+    auto s_ar = fresh();
+    Run ar;
+    if (!s_ar ||
+        !GenerateAr(*model, *s_ar, greedy, prompt, G, layers, &ar, &error)) {
+      return fail_with("copy pattern reference run");
+    }
+    struct Pattern {
+      const char* name;
+      int wrong_depth;  // 1-based depth to corrupt, 0 = none, -1 = every depth
+      bool mixed;       // copy cycles alternate with MTP cycles
+    };
+    for (const Pattern pat : {Pattern{"all_accepted", 0, false},
+                              Pattern{"none_accepted", -1, false},
+                              Pattern{"reject_depth2", 2, false},
+                              Pattern{"reject_depth1", 1, false},
+                              Pattern{"mixed_with_mtp_cycles", 0, true}}) {
+      auto s = fresh();
+      Run mtp;
+      l3::Session::DraftHooks hooks;
+      hooks.copy_source = [&](std::span<const std::int32_t> chain) {
+        const std::size_t at = mtp.tokens.size() + chain.size();
+        if (pat.mixed && (mtp.tokens.size() / 8) % 2 == 1) {
+          return std::int32_t{-1};  // an MTP cycle
+        }
+        if (at >= ar.tokens.size()) {
+          return std::int32_t{-1};
+        }
+        const std::int32_t truth = ar.tokens[at];
+        const auto depth = static_cast<int>(chain.size());
+        const bool wrong = pat.wrong_depth == -1 || pat.wrong_depth == depth;
+        return wrong ? (truth + 1) % static_cast<std::int32_t>(l3::kVocab)
+                     : truth;
+      };
+      if (!s || !GenerateMtp(*model, *s, greedy, prompt, G, 7, layers, &mtp,
+                             &error, true, hooks)) {
+        return fail_with("copy pattern run");
+      }
+      const Diff d = Compare(mtp.end, ar.end);
+      auto o = json::Value::object();
+      o["cycles"] = U(mtp.stats.cycles);
+      o["drafted"] = U(mtp.stats.drafted);
+      o["accepted"] = U(mtp.stats.accepted);
+      o["copied"] = U(mtp.stats.copied);
+      o["copied_accepted"] = U(mtp.stats.copied_accepted);
+      o["final_state"] = ToJson(d);
+      const bool accepted_ok =
+          pat.wrong_depth == 0 ? mtp.stats.copied_accepted == mtp.stats.copied
+          : pat.wrong_depth == -1
+              ? mtp.stats.copied_accepted == 0
+              : mtp.stats.copied_accepted < mtp.stats.copied;
+      o["accepted_as_forced"] = accepted_ok;
+      o["ar_ms"] = ar.ms;
+      o["copies_ms"] = mtp.ms;
+      const bool mtp_cycles = mtp.stats.drafted > mtp.stats.copied;
+      o["mtp_cycles"] = mtp_cycles;
+      check(std::string("forced_copies_") + pat.name,
+            ar.tokens == mtp.tokens && session_tool::Exact(d) && accepted_ok &&
+                mtp.stats.copied > 0 && mtp.mtp_rows == ar.mtp_rows &&
+                mtp.mtp_hidden == ar.mtp_hidden && (!pat.mixed || mtp_cycles),
+            std::move(o));
+    }
+
+    // Sampled: copies replaying an earlier sampled run's tokens (right and
+    // wrong at random) are verified by the point-mass rule. The run
+    // reproduces itself from its seed, and every committed token is a token
+    // the sampler could draw (here: the run completes with a full budget).
+    sampling::SamplingConfig sampled;
+    sampled.temperature = 0.8F;
+    sampled.top_p = 0.95F;
+    sampled.top_k = 40;
+    sampled.seed = 31337;
+    const auto guess = [&](Run* out) {
+      return [out, &ar](std::span<const std::int32_t> chain) {
+        const std::size_t at = out->tokens.size() + chain.size();
+        if (at >= ar.tokens.size()) {
+          return std::int32_t{-1};
+        }
+        // Mostly the greedy continuation, every third guess a miss.
+        return at % 3 == 0
+                   ? (ar.tokens[at] + 1) % static_cast<std::int32_t>(l3::kVocab)
+                   : ar.tokens[at];
+      };
+    };
+    auto s1 = fresh();
+    auto s2 = fresh();
+    Run a, b;
+    l3::Session::DraftHooks h1, h2;
+    h1.copy_source = guess(&a);
+    h2.copy_source = guess(&b);
+    if (!s1 || !s2 ||
+        !GenerateMtp(*model, *s1, sampled, prompt, G, 7, layers, &a, &error,
+                     true, h1) ||
+        !GenerateMtp(*model, *s2, sampled, prompt, G, 7, layers, &b, &error,
+                     true, h2)) {
+      return fail_with("forced copies sampled runs");
+    }
+    auto o = json::Value::object();
+    o["copied"] = U(a.stats.copied);
+    o["copied_accepted"] = U(a.stats.copied_accepted);
+    check("forced_copies_sampled_replay",
+          a.tokens == b.tokens && a.tokens.size() == G && SameState(a, b) &&
+              a.stats.copied > 0 && a.stats.copied == b.stats.copied &&
+              a.stats.copied_accepted == b.stats.copied_accepted,
+          std::move(o));
   }
 
   // ---- rollback ------------------------------------------------------------
@@ -572,6 +840,64 @@ int Execute(const Args& args, Report& report,
           ok && (complete || !full) && a.tokens == b.tokens &&
               a.stats.drafted > 0,
           std::move(o));
+
+    // The same grammar with prompt lookup: the prompt holds an earlier call
+    // with the same bytes, so the forced call is copied. Copies are
+    // unconstrained proposals; the verifier's mask decides. Greedy equals
+    // constrained AR token for token and state for state, sampled stays in
+    // the grammar and reproduces itself.
+    {
+      const std::string call =
+          "<tool_call>record\n<arg_key>value</arg_key>\n<arg_value>" +
+          std::string(kLiteral) + "</arg_value>\n</tool_call>";
+      const auto echo = model->Tokenize(call + "\n" + call.substr(0, 5));
+      l3::Session::DraftHooks on;
+      on.lookup_min_match = full ? 0 : 4;
+      auto s_ar2 = fresh();
+      Run ar2;
+      if (!s_ar2 || !GenerateAr(*model, *s_ar2, constrained, echo, G, layers,
+                                &ar2, &error)) {
+        return fail_with("constrained lookup autoregressive run");
+      }
+      auto s_l = fresh();
+      Run greedy_l;
+      if (!s_l || !GenerateMtp(*model, *s_l, constrained, echo, G, 7, layers,
+                               &greedy_l, &error, true, on)) {
+        return fail_with("constrained lookup greedy run");
+      }
+      bool complete_l = false;
+      const bool ok_l = viable(greedy_l, &complete_l);
+      auto ol = json::Value::object();
+      ol["drafted"] = U(greedy_l.stats.drafted);
+      ol["copied"] = U(greedy_l.stats.copied);
+      ol["copied_accepted"] = U(greedy_l.stats.copied_accepted);
+      ol["tokens_equal"] = ar2.tokens == greedy_l.tokens;
+      ol["call_complete"] = complete_l;
+      check("constrained_lookup_greedy_equals_ar",
+            ar2.tokens == greedy_l.tokens && ok_l && (complete_l || !full) &&
+                greedy_l.stats.copied > 0 &&
+                session_tool::Exact(Compare(greedy_l.end, ar2.end)),
+            std::move(ol));
+      auto s_a = fresh();
+      auto s_b = fresh();
+      Run sa, sb;
+      if (!s_a || !s_b ||
+          !GenerateMtp(*model, *s_a, sampled, echo, G, 7, layers, &sa, &error,
+                       true, on) ||
+          !GenerateMtp(*model, *s_b, sampled, echo, G, 7, layers, &sb, &error,
+                       true, on)) {
+        return fail_with("constrained lookup sampled runs");
+      }
+      bool complete_s = false;
+      const bool ok_s = viable(sa, &complete_s);
+      auto os = json::Value::object();
+      os["copied"] = U(sa.stats.copied);
+      os["copied_accepted"] = U(sa.stats.copied_accepted);
+      os["call_complete"] = complete_s;
+      check("constrained_lookup_sampled_obeys_grammar",
+            ok_s && (complete_s || !full) && sa.tokens == sb.tokens,
+            std::move(os));
+    }
 
     // The serving path end to end: ConstrainChatRequest binds the Bailing
     // grammar for a forced strict tool, the MTP runner decodes under it and
