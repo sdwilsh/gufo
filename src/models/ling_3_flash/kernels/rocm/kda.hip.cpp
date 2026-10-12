@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 
+#include "src/models/ling_3_flash/kernels/rocm/act_quant.hip.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/kernels.hpp"
 
 namespace gufo::models::ling_3_flash::rocm::kda {
@@ -33,6 +35,15 @@ constexpr std::uint32_t kConvChunk = 32;  // tokens per conv block row
 // the carried state, a second small kernel advances it (no in-place race
 // between token chunks).
 // ---------------------------------------------------------------------------
+
+// One conv4 output before SiLU. The order of the four products is explicit
+// (it is the order the compiler chose for ConvKernel under -ffast-math, which
+// reassociates the plain expression) so the one-token fusion below and the
+// multi-token kernel give the same bits regardless of compiler choices.
+__device__ __forceinline__ float ConvTaps(const float4& w, float x0, float x1,
+                                          float x2, float x3) {
+  return fmaf(x3, w.w, fmaf(x0, w.x, fmaf(x2, w.z, x1 * w.y)));
+}
 
 __global__ void ConvKernel(const float* __restrict__ proj,
                            const float* __restrict__ w_q,
@@ -62,7 +73,7 @@ __global__ void ConvKernel(const float* __restrict__ proj,
   float x2 = raw(s - 1);
   for (std::uint32_t t = t0; t < t1; ++t) {
     const float x3 = raw(static_cast<int>(t));
-    const float y = wv.x * x0 + wv.y * x1 + wv.z * x2 + wv.w * x3;
+    const float y = ConvTaps(wv, x0, x1, x2, x3);
     out[static_cast<std::size_t>(t) * kConvChannels + gc] = Silu(y);
     x0 = x1;
     x1 = x2;
@@ -128,6 +139,26 @@ __device__ inline float WaveSum(float v) {
   return v;
 }
 
+// 1 / sqrt(sum(v^2) + eps) over the 128 values held by one wave (4 per lane),
+// reproducing the code the compiler generates for L2NormKernel under
+// -ffast-math, which reassociates the plain expression into (eps + p) + s and
+// turns 1 / sqrt into a bare v_rsq_f32. The decode fusion must give the same
+// bits as that kernel; the empty asm keeps the order from being reassociated.
+__device__ __forceinline__ float L2Scale(const float4& v) {
+  float s = v.x * v.x;
+  s = fmaf(v.y, v.y, s);
+  s = fmaf(v.z, v.z, s);
+  s = fmaf(v.w, v.w, s);
+#pragma unroll
+  for (int off = 16; off > 1; off >>= 1) {
+    s += __shfl_xor(s, off, 32);
+  }
+  const float p = __shfl_xor(s, 1, 32);
+  float t = kKdaL2Eps + p;
+  __asm__ volatile("" : "+v"(t));
+  return __builtin_amdgcn_rsqf(t + s);
+}
+
 __global__ void L2NormKernel(float* x, std::uint32_t ld) {
   const std::uint32_t head = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   const std::uint32_t lane = threadIdx.x & 31;
@@ -135,13 +166,27 @@ __global__ void L2NormKernel(float* x, std::uint32_t ld) {
                   x + static_cast<std::size_t>(blockIdx.y) * ld + head * kD) +
               lane;
   float4 v = *p;
-  const float ss = WaveSum(v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w);
-  const float r = 1.0F / sqrtf(ss + kKdaL2Eps);
+  const float r = L2Scale(v);
   v.x *= r;
   v.y *= r;
   v.z *= r;
   v.w *= r;
   *p = v;
+}
+
+// Output norm and gate of one lane's 4 values of a head (shared by the plain
+// and the quantising kernel so both give the same bits).
+__device__ __forceinline__ float4 OutputNormGateLane(const float4& v,
+                                                     const float4& gate,
+                                                     const float4& gm) {
+  const float ss = WaveSum(v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w);
+  const float r = 1.0F / sqrtf(ss / static_cast<float>(kD) + kRmsEps);
+  float4 y;
+  y.x = v.x * r * gm.x * Sigmoid(gate.x);
+  y.y = v.y * r * gm.y * Sigmoid(gate.y);
+  y.z = v.z * r * gm.z * Sigmoid(gate.z);
+  y.w = v.w * r * gm.w * Sigmoid(gate.w);
+  return y;
 }
 
 __global__ void OutputNormGateKernel(const float* __restrict__ o,
@@ -156,14 +201,112 @@ __global__ void OutputNormGateKernel(const float* __restrict__ o,
   const float4 gate = reinterpret_cast<const float4*>(
       proj + t * kKdaProjRows + kKdaGaRow + head * kD)[lane];
   const float4 gm = reinterpret_cast<const float4*>(gamma)[lane];
-  const float ss = WaveSum(v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w);
-  const float r = 1.0F / sqrtf(ss / static_cast<float>(kD) + kRmsEps);
-  float4 y;
-  y.x = v.x * r * gm.x * Sigmoid(gate.x);
-  y.y = v.y * r * gm.y * Sigmoid(gate.y);
-  y.z = v.z * r * gm.z * Sigmoid(gate.z);
-  y.w = v.w * r * gm.w * Sigmoid(gate.w);
+  const float4 y = OutputNormGateLane(v, gate, gm);
   reinterpret_cast<float4*>(out + t * kInner + head * kD)[lane] = y;
+}
+
+// ---------------------------------------------------------------------------
+// Decode (one token) fusion: conv + conv-state advance + SiLU + q/k L2 norm +
+// gate/beta prep in one launch. Same expressions as ConvKernel/ConvStateKernel/
+// L2NormKernel/GateBetaKernel for n_tokens == 1, so the results are identical.
+// A wave owns one 128-channel head of one stream (lane: 4 consecutive
+// channels); each channel's state is read and rewritten by its own lane only.
+// ---------------------------------------------------------------------------
+constexpr std::uint32_t kPrepWaves = 4;                             // per block
+constexpr std::uint32_t kConvHeadWaves = 3 * kHeads;                // 96
+constexpr std::uint32_t kConvBlocks = kConvHeadWaves / kPrepWaves;  // 24
+
+__global__ __launch_bounds__(kPrepWaves * 32) void PrepDecodeKernel(
+    const float* __restrict__ proj, const float* __restrict__ w_q,
+    const float* __restrict__ w_k, const float* __restrict__ w_v,
+    float* __restrict__ state, const float* __restrict__ ssm_a,
+    const float* __restrict__ dt_bias, float* __restrict__ out,
+    float* __restrict__ g, float* __restrict__ beta) {
+  if (blockIdx.x < kConvBlocks) {
+    const std::uint32_t wave_id = blockIdx.x * kPrepWaves + (threadIdx.x >> 5);
+    const std::uint32_t stream = wave_id / kHeads;
+    const std::uint32_t head = wave_id % kHeads;
+    const std::uint32_t lane = threadIdx.x & 31;
+    const std::uint32_t c0 = head * kD + lane * 4;  // channel within stream
+    const float* w = (stream == 0 ? w_q : stream == 1 ? w_k : w_v) + c0 * 4;
+    float* st = state + static_cast<std::size_t>(stream) * 3 * kInner + c0;
+    const float* col = proj + stream * kInner + c0;
+    float y[4];
+    float x0[4], x1[4], x2[4], x3[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      x0[e] = st[e];
+      x1[e] = st[kInner + e];
+      x2[e] = st[2 * kInner + e];
+      x3[e] = col[e];
+    }
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      const float4 wv = *reinterpret_cast<const float4*>(w + e * 4);
+      const float yy = ConvTaps(wv, x0[e], x1[e], x2[e], x3[e]);
+      y[e] = Silu(yy);
+    }
+    // Advance the window: new positions are old 1, old 2 and the raw token.
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      st[e] = x1[e];
+      st[kInner + e] = x2[e];
+      st[2 * kInner + e] = x3[e];
+    }
+    float4 v = make_float4(y[0], y[1], y[2], y[3]);
+    if (stream < 2) {
+      const float r = L2Scale(v);
+      v.x *= r;
+      v.y *= r;
+      v.z *= r;
+      v.w *= r;
+    }
+    reinterpret_cast<float4*>(out + static_cast<std::size_t>(stream) * kInner +
+                              c0)[0] = v;
+    return;
+  }
+  const std::uint32_t idx =
+      (blockIdx.x - kConvBlocks) * blockDim.x + threadIdx.x;
+  if (idx < kInner) {
+    const float f = proj[kKdaFaRow + idx];
+    g[idx] = kKdaGateLowerBound * Sigmoid(ssm_a[idx / kD] * (f + dt_bias[idx]));
+  } else if (idx < kInner + kHeads) {
+    const std::uint32_t h = idx - kInner;
+    beta[h] = Sigmoid(proj[kKdaBetaRow + h]);
+  }
+}
+
+__global__ void OutputNormGateQuantKernel(const float* __restrict__ o,
+                                          const float* __restrict__ proj,
+                                          const float* __restrict__ gamma,
+                                          float* __restrict__ out,
+                                          std::int8_t* __restrict__ q,
+                                          std::int8_t* __restrict__ q2,
+                                          float* __restrict__ dq) {
+  const std::uint32_t head = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  const std::uint32_t lane = threadIdx.x & 31;
+  const std::size_t t = blockIdx.y;
+  const float4 v =
+      reinterpret_cast<const float4*>(o + t * kInner + head * kD)[lane];
+  const float4 gate = reinterpret_cast<const float4*>(
+      proj + t * kKdaProjRows + kKdaGaRow + head * kD)[lane];
+  const float4 gm = reinterpret_cast<const float4*>(gamma)[lane];
+  const float4 y = OutputNormGateLane(v, gate, gm);
+  const std::size_t flat = t * kInner + head * kD + lane * 4;
+  reinterpret_cast<float4*>(out)[flat / 4] = y;
+  // Quantisation blocks of 32 values span 8 lanes (the standalone kernel's
+  // wave-wide max over 32 consecutive elements).
+  float m = fmaxf(fmaxf(fabsf(y.x), fabsf(y.y)), fmaxf(fabsf(y.z), fabsf(y.w)));
+#pragma unroll
+  for (int off = 4; off > 0; off >>= 1)
+    m = fmaxf(m, __shfl_xor(m, off, 32));
+  const float vals[4] = {y.x, y.y, y.z, y.w};
+#pragma unroll
+  for (int e = 0; e < 4; ++e) {
+    QuantizeValue(vals[e], m, &q[flat + e], &q2[flat + e]);
+  }
+  if ((lane & 7) == 0)
+    dq[flat >> 5] = QuantScale(m);
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +431,239 @@ __launch_bounds__(kTile) __global__
 }
 
 // ---------------------------------------------------------------------------
+// Prefill recurrence (n > 8 tokens). The same token-sequential gated delta
+// rule as RecurrentKernel, restructured for throughput. RecurrentKernel keeps
+// a whole 128-row state column in one lane (256 VGPRs, spilled) and stages one
+// token at a time, so a wave is latency bound (estimated ~10 us per token from
+// 860M timings) with only 128 waves per layer. Here a quad of lanes shares each
+// pair of state columns (lane = group * 4 + part, `part` owning float4 key rows
+// f = 4 * m + part), which leaves 64 state registers and no spills, makes 256
+// waves per layer, halves the LDS reads per FMA (two columns share every
+// k/q/exp(g) read) and finishes the two per-token dot products with quad DPP
+// adds. A block of two waves covers (head, 32 value columns). q, k, exp(g), v
+// and beta of the next kBatch tokens are loaded into registers while the
+// current ones compute, and the outputs leave through LDS as coalesced float4
+// rows.
+//
+// The arithmetic is a fixed function of the token sequence: tokens are
+// processed in order from the carried state with a reduction tree that does
+// not depend on n, on where a call starts or on the batching, so any split of
+// a prefill run into calls gives bit-identical outputs and state (the prefill
+// numeric family of engine.hpp). It differs from RecurrentKernel (small-batch
+// family) only in the summation order of the two per-token dot products.
+// ---------------------------------------------------------------------------
+
+constexpr std::uint32_t kRowLanes = 4;  // lanes per state column group
+constexpr std::uint32_t kCpl = 2;       // adjacent state columns per lane
+constexpr std::uint32_t kPfCols = 32;   // value columns per block
+constexpr std::uint32_t kPfThreads = kPfCols / kCpl * kRowLanes;  // 64
+constexpr std::uint32_t kBatch = 2;                       // staged tokens
+constexpr std::uint32_t kMyRows4 = (kD / 4) / kRowLanes;  // float4 rows / lane
+constexpr std::uint32_t kPerTokenVec = 3 * (kD / 4) + kPfCols / 4;  // q,k,g,v
+
+// Sum over the kRowLanes adjacent lanes of a column group (lane = group * 4 +
+// part): two quad DPP adds, the same tree for every lane.
+__device__ inline float QuadSum(float x) {
+  static_assert(kRowLanes == 4);
+  const float a =
+      x + __builtin_bit_cast(
+              float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, x),
+                                                 0xB1, 0xF, 0xF, false));
+  return a + __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(
+                                           0, __builtin_bit_cast(int, a), 0x4E,
+                                           0xF, 0xF, false));
+}
+
+struct PrefillStage {
+  float4 vec[(kBatch * kPerTokenVec + kPfThreads - 1) / kPfThreads];
+  float beta;
+};
+
+__launch_bounds__(kPfThreads) __global__
+    void PrefillKernel(float* __restrict__ state, RecurrentArgs a,
+                       std::uint32_t n_tokens) {
+  const std::uint32_t tid = threadIdx.x;
+  const std::uint32_t lane = tid & 31;
+  const std::uint32_t wave = tid >> 5;
+  const std::uint32_t part = lane % kRowLanes;
+  const std::uint32_t col = wave * (32 / kRowLanes * kCpl) +
+                            (lane / kRowLanes) * kCpl;  // first of kCpl columns
+  const std::uint32_t h = blockIdx.y;
+  const std::uint32_t j0 = blockIdx.x * kPfCols;
+
+  __shared__ float4 s_q[2][kBatch][kD / 4];
+  __shared__ float4 s_k[2][kBatch][kD / 4];
+  __shared__ float4 s_e[2][kBatch][kD / 4];  // exp(g)
+  __shared__ float4 s_v[2][kBatch][kPfCols / 4];
+  __shared__ float s_b[2][kBatch];
+  __shared__ float4 s_o[2][kBatch][kPfCols / 4];
+
+  // State registers: float4 row group f = kRowLanes * m + part (4 rows each)
+  // of kCpl adjacent columns.
+  float st[kMyRows4][4][kCpl];
+  {
+    const float* S = state + static_cast<std::size_t>(h) * kD * kD + j0 + col;
+#pragma unroll
+    for (std::uint32_t m = 0; m < kMyRows4; ++m) {
+#pragma unroll
+      for (std::uint32_t c = 0; c < 4; ++c) {
+        const float2 w = *reinterpret_cast<const float2*>(
+            S + static_cast<std::size_t>(4 * (kRowLanes * m + part) + c) * kD);
+        st[m][c][0] = w.x;
+        st[m][c][1] = w.y;
+      }
+    }
+  }
+
+  const auto load_batch = [&](std::uint32_t base, PrefillStage& r) {
+#pragma unroll
+    for (std::uint32_t it = 0; it < std::size(r.vec); ++it) {
+      const std::uint32_t idx = tid + it * kPfThreads;
+      float4 v = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+      if (idx < kBatch * kPerTokenVec) {
+        const std::uint32_t tt = idx / kPerTokenVec;
+        const std::uint32_t p = idx % kPerTokenVec;
+        const std::size_t t = base + tt;
+        if (t < n_tokens) {
+          const float* src;
+          if (p < kD / 4) {
+            src = a.q + t * a.ld_q + h * kD + 4 * p;
+          } else if (p < 2 * (kD / 4)) {
+            src = a.k + t * a.ld_k + h * kD + 4 * (p - kD / 4);
+          } else if (p < 3 * (kD / 4)) {
+            src = a.g + t * a.ld_g + h * kD + 4 * (p - 2 * (kD / 4));
+          } else {
+            src = a.v + t * a.ld_v + h * kD + j0 + 4 * (p - 3 * (kD / 4));
+          }
+          v = *reinterpret_cast<const float4*>(src);
+        }
+      }
+      r.vec[it] = v;
+    }
+    r.beta = 0.0F;
+    if (tid < kBatch && base + tid < n_tokens) {
+      r.beta = a.beta[static_cast<std::size_t>(base + tid) * a.ld_beta + h];
+    }
+  };
+  const auto store_batch = [&](std::uint32_t buf, const PrefillStage& r) {
+#pragma unroll
+    for (std::uint32_t it = 0; it < std::size(r.vec); ++it) {
+      const std::uint32_t idx = tid + it * kPfThreads;
+      if (idx < kBatch * kPerTokenVec) {
+        const std::uint32_t tt = idx / kPerTokenVec;
+        const std::uint32_t p = idx % kPerTokenVec;
+        const float4 v = r.vec[it];
+        if (p < kD / 4) {
+          s_q[buf][tt][p] = v;
+        } else if (p < 2 * (kD / 4)) {
+          s_k[buf][tt][p - kD / 4] = v;
+        } else if (p < 3 * (kD / 4)) {
+          s_e[buf][tt][p - 2 * (kD / 4)] =
+              make_float4(expf(v.x), expf(v.y), expf(v.z), expf(v.w));
+        } else {
+          s_v[buf][tt][p - 3 * (kD / 4)] = v;
+        }
+      }
+    }
+    if (tid < kBatch) {
+      s_b[buf][tid] = r.beta;
+    }
+  };
+
+  PrefillStage stage;
+  load_batch(0, stage);
+  store_batch(0, stage);
+  __syncthreads();
+
+  const float scale = rsqrtf(static_cast<float>(kD));
+  const std::uint32_t n_batches = (n_tokens + kBatch - 1) / kBatch;
+  for (std::uint32_t b = 0; b < n_batches; ++b) {
+    const std::uint32_t buf = b & 1;
+    const std::uint32_t base = b * kBatch;
+    const bool more = b + 1 < n_batches;
+    if (more) {
+      load_batch(base + kBatch, stage);
+    }
+    const std::uint32_t nt = min(kBatch, n_tokens - base);
+    for (std::uint32_t tt = 0; tt < nt; ++tt) {
+      float4 kk[kMyRows4];
+      float u[kCpl][4] = {};
+#pragma unroll
+      for (std::uint32_t m = 0; m < kMyRows4; ++m) {
+        const std::uint32_t f = kRowLanes * m + part;
+        kk[m] = s_k[buf][tt][f];
+        const float4 ee = s_e[buf][tt][f];
+#pragma unroll
+        for (std::uint32_t x = 0; x < kCpl; ++x) {
+          st[m][0][x] *= ee.x;
+          st[m][1][x] *= ee.y;
+          st[m][2][x] *= ee.z;
+          st[m][3][x] *= ee.w;
+          u[x][0] += st[m][0][x] * kk[m].x;
+          u[x][1] += st[m][1][x] * kk[m].y;
+          u[x][2] += st[m][2][x] * kk[m].z;
+          u[x][3] += st[m][3][x] * kk[m].w;
+        }
+      }
+      const float2 vv = *reinterpret_cast<const float2*>(
+          &reinterpret_cast<const float*>(&s_v[buf][tt][0])[col]);
+      const float bt = s_b[buf][tt];
+      float delta[kCpl];
+      delta[0] =
+          (vv.x - QuadSum((u[0][0] + u[0][1]) + (u[0][2] + u[0][3]))) * bt;
+      delta[1] =
+          (vv.y - QuadSum((u[1][0] + u[1][1]) + (u[1][2] + u[1][3]))) * bt;
+      float o[kCpl][4] = {};
+#pragma unroll
+      for (std::uint32_t m = 0; m < kMyRows4; ++m) {
+        const std::uint32_t f = kRowLanes * m + part;
+        const float4 qq = s_q[buf][tt][f];
+#pragma unroll
+        for (std::uint32_t x = 0; x < kCpl; ++x) {
+          st[m][0][x] = fmaf(kk[m].x, delta[x], st[m][0][x]);
+          st[m][1][x] = fmaf(kk[m].y, delta[x], st[m][1][x]);
+          st[m][2][x] = fmaf(kk[m].z, delta[x], st[m][2][x]);
+          st[m][3][x] = fmaf(kk[m].w, delta[x], st[m][3][x]);
+          o[x][0] += st[m][0][x] * qq.x;
+          o[x][1] += st[m][1][x] * qq.y;
+          o[x][2] += st[m][2][x] * qq.z;
+          o[x][3] += st[m][3][x] * qq.w;
+        }
+      }
+      const float o0 = QuadSum((o[0][0] + o[0][1]) + (o[0][2] + o[0][3]));
+      const float o1 = QuadSum((o[1][0] + o[1][1]) + (o[1][2] + o[1][3]));
+      if (part == 0) {
+        *reinterpret_cast<float2*>(&reinterpret_cast<float*>(
+            &s_o[buf][tt][0])[col]) = make_float2(o0 * scale, o1 * scale);
+      }
+    }
+    if (more) {
+      store_batch(buf ^ 1, stage);
+    }
+    __syncthreads();
+    for (std::uint32_t idx = tid; idx < kBatch * (kPfCols / 4);
+         idx += kPfThreads) {
+      const std::uint32_t tt = idx / (kPfCols / 4);
+      if (base + tt < n_tokens) {
+        reinterpret_cast<float4*>(
+            a.o + static_cast<std::size_t>(base + tt) * a.ld_o + h * kD +
+            j0)[idx % (kPfCols / 4)] = s_o[buf][tt][idx % (kPfCols / 4)];
+      }
+    }
+  }
+  float* S = state + static_cast<std::size_t>(h) * kD * kD + j0 + col;
+#pragma unroll
+  for (std::uint32_t m = 0; m < kMyRows4; ++m) {
+#pragma unroll
+    for (std::uint32_t c = 0; c < 4; ++c) {
+      *reinterpret_cast<float2*>(
+          S + static_cast<std::size_t>(4 * (kRowLanes * m + part) + c) * kD) =
+          make_float2(st[m][c][0], st[m][c][1]);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // State snapshot / restore: fixed-size float4 grid-stride copy.
 // ---------------------------------------------------------------------------
 
@@ -359,10 +735,10 @@ void RecurrentDecode(float* state, const float* q, const float* k,
   RecurrentKernel<<<dim3(kD / kTile, kHeads), kTile, 0, stream>>>(state, a, 1);
 }
 
-void PrefillRowSplit(float* state, const float* q, std::uint32_t ld_q,
-                     const float* k, std::uint32_t ld_k, const float* v,
-                     std::uint32_t ld_v, const float* g, const float* beta,
-                     float* o, std::uint32_t n_tokens, hipStream_t stream) {
+void RecurrentSequence(float* state, const float* q, std::uint32_t ld_q,
+                       const float* k, std::uint32_t ld_k, const float* v,
+                       std::uint32_t ld_v, const float* g, const float* beta,
+                       float* o, std::uint32_t n_tokens, hipStream_t stream) {
   if (n_tokens == 0) {
     return;
   }
@@ -372,6 +748,19 @@ void PrefillRowSplit(float* state, const float* q, std::uint32_t ld_q,
                                                                   n_tokens);
 }
 
+void PrefillSequence(float* state, const float* q, std::uint32_t ld_q,
+                     const float* k, std::uint32_t ld_k, const float* v,
+                     std::uint32_t ld_v, const float* g, const float* beta,
+                     float* o, std::uint32_t n_tokens, hipStream_t stream) {
+  if (n_tokens == 0) {
+    return;
+  }
+  const RecurrentArgs a{q,    k,    v,    g,      beta,   o,
+                        ld_q, ld_k, ld_v, kInner, kHeads, kInner};
+  PrefillKernel<<<dim3(kD / kPfCols, kHeads), kPfThreads, 0, stream>>>(
+      state, a, n_tokens);
+}
+
 void OutputNormGate(const float* o, const float* proj, const float* ssm_norm,
                     float* out, std::uint32_t n_tokens, hipStream_t stream) {
   if (n_tokens == 0) {
@@ -379,6 +768,28 @@ void OutputNormGate(const float* o, const float* proj, const float* ssm_norm,
   }
   OutputNormGateKernel<<<dim3(kHeads / 4, n_tokens), 128, 0, stream>>>(
       o, proj, ssm_norm, out);
+}
+
+void PrepDecode(const float* proj, const float* w_q, const float* w_k,
+                const float* w_v, float* conv_state, const float* ssm_a,
+                const float* dt_bias, float* conv_out, float* g, float* beta,
+                hipStream_t stream) {
+  constexpr std::uint32_t kGateBlocks =
+      (kInner + kHeads + kPrepWaves * 32 - 1) / (kPrepWaves * 32);
+  PrepDecodeKernel<<<kConvBlocks + kGateBlocks, kPrepWaves * 32, 0, stream>>>(
+      proj, w_q, w_k, w_v, conv_state, ssm_a, dt_bias, conv_out, g, beta);
+}
+
+void OutputNormGateQuant(const float* o, const float* proj,
+                         const float* ssm_norm, float* out,
+                         std::uint32_t n_tokens, void* quant,
+                         hipStream_t stream) {
+  if (n_tokens == 0) {
+    return;
+  }
+  const dense::QuantView v = dense::QuantLayout(quant, n_tokens, kInner);
+  OutputNormGateQuantKernel<<<dim3(kHeads / 4, n_tokens), 128, 0, stream>>>(
+      o, proj, ssm_norm, out, v.q, v.q2, v.d);
 }
 
 void SnapshotState(const float* kda_state, const float* kda_conv,

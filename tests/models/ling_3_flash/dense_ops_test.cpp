@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <thread>
 #include <vector>
@@ -14,6 +15,7 @@
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/core/runtime_environment.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/kernels.hpp"
+#include "tests/models/ling_3_flash/parent_digests.hpp"
 
 namespace dn = gufo::models::ling_3_flash::rocm::dense;
 using gufo::models::ling_3_flash::rocm::WeightType;
@@ -205,7 +207,7 @@ void TestQ8(std::uint32_t rows, std::uint32_t k) {
   }
   {
     HIP_OK(hipMemset(dy.p, 0xFF, dy.n * sizeof(float)));
-    dn::GemmQ8_0(dw.p, dx.p, dy.p, kTok, k, rows, nullptr, nullptr);
+    dn::GemmQ8_0(dw.p, dx.p, dy.p, kTok, k, rows, scratch.p, nullptr);
     HIP_OK(hipDeviceSynchronize());
     Name(name, sizeof name, "GemmQ8_0", rows, k, kTok);
     Check(name, dy.Get(), ref.data(), ref.size(), 3e-3);
@@ -288,7 +290,8 @@ void TestQ8Strided() {
   Dev<float> dx(x);
   Dev<float> dy(std::size_t{n} * ldy);
   HIP_OK(hipMemset(dy.p, 0, dy.n * sizeof(float)));
-  dn::GemmQ8_0Strided(dw.p, dx.p, dy.p + off, n, k, rows, ldy, nullptr,
+  Dev<std::uint8_t> scratch(dn::ScratchBytes(WeightType::kQ8_0, n, k));
+  dn::GemmQ8_0Strided(dw.p, dx.p, dy.p + off, n, k, rows, ldy, scratch.p,
                       nullptr);
   HIP_OK(hipDeviceSynchronize());
   const auto got = dy.Get();
@@ -353,20 +356,264 @@ void TestF16(std::uint32_t rows, std::uint32_t k) {
   });
   Dev<std::uint16_t> dw(wh);
   Dev<float> dx(x), dy(std::size_t{kTok} * rows);
+  Dev<std::uint8_t> scratch(2 * std::size_t{kTok} * k);
   const auto* w = reinterpret_cast<const __half*>(dw.p);
   char name[96];
   for (std::uint32_t n : {1U, 2U, 8U}) {
-    dn::GemvF16(w, dx.p, dy.p, n, k, rows, nullptr);
+    dn::GemvF16(w, dx.p, dy.p, n, k, rows, scratch.p, nullptr);
     HIP_OK(hipDeviceSynchronize());
     auto got = dy.Get();
     got.resize(std::size_t{n} * rows);
     Name(name, sizeof name, "GemvF16", rows, k, n);
     Check(name, got, ref.data(), got.size(), 1e-5);
   }
-  dn::GemmF16(w, dx.p, dy.p, kTok, k, rows, nullptr);
+  dn::GemmF16(w, dx.p, dy.p, kTok, k, rows, scratch.p, nullptr);
   HIP_OK(hipDeviceSynchronize());
   Name(name, sizeof name, "GemmF16", rows, k, kTok);
   Check(name, dy.Get(), ref.data(), ref.size(), 2e-3);
+}
+
+// ---- prefill GEMM: split / tile-shape invariance and large-n accuracy -------
+std::uint64_t Fnv(const void* p, std::size_t bytes) {
+  std::uint64_t h = 1469598103934665603ULL;
+  const auto* b = static_cast<const std::uint8_t*>(p);
+  for (std::size_t i = 0; i < bytes; ++i)
+    h = (h ^ b[i]) * 1099511628211ULL;
+  return h;
+}
+
+/// Host emulation of the WMMA GEMM for one output: F16-rounded operands,
+/// F32 accumulation adding 8 products at a time with truncation toward zero.
+float EmulateDot(const float* w, const float* x, std::size_t k) {
+  float acc = 0.0F;
+  for (std::size_t kb = 0; kb < k; kb += 8) {
+    double sum = 0;
+    for (int i = 0; i < 8; ++i)
+      sum += double{static_cast<float>(static_cast<_Float16>(w[kb + i]))} *
+             static_cast<float>(static_cast<_Float16>(x[kb + i]));
+    const double tot = double{acc} + sum;
+    float f = static_cast<float>(tot);
+    if (std::fabs(double{f}) > std::fabs(tot))
+      f = std::nextafterf(f, 0.0F);
+    acc = f;
+  }
+  return acc;
+}
+
+/// One weight matrix, the same activations: the n = N call must equal (bit
+/// for bit) every chunked split of the same tokens and every tile shape, and
+/// match the host emulation on sampled outputs.
+void TestGemmInvariance(bool q8, std::uint32_t rows, std::uint32_t k,
+                        std::uint32_t n_total) {
+  // Fixed per-case seed: the digest must not depend on the test order.
+  g_rng.seed(0x5eed0000U + rows * 31U + k * 7U + n_total + (q8 ? 1U : 0U));
+  std::vector<std::uint8_t> wbytes;
+  std::vector<float> wd;  // dequantised (F16-exact for the F16 case)
+  if (q8) {
+    wbytes = QuantizeQ8_0(Randn(std::size_t{rows} * k, 0.5F), k);
+    wd = DequantQ8_0Rows(wbytes, rows, k);
+  } else {
+    wbytes.resize(std::size_t{rows} * k * 2);
+    wd.resize(std::size_t{rows} * k);
+    std::normal_distribution<float> d(0.0F, 0.05F);
+    for (std::size_t i = 0; i < wd.size(); ++i) {
+      const std::uint16_t h = HalfBits(d(g_rng));
+      std::memcpy(&wbytes[i * 2], &h, 2);
+      _Float16 f;
+      std::memcpy(&f, &h, 2);
+      wd[i] = static_cast<float>(f);
+    }
+  }
+  const auto x = Randn(std::size_t{n_total} * k);
+  Dev<std::uint8_t> dw(wbytes);
+  Dev<float> dx(x);
+  Dev<float> dy(std::size_t{n_total} * rows);
+  Dev<std::uint8_t> scratch(dn::ScratchBytes(WeightType::kQ8_0, n_total, k));
+  const auto* wh = reinterpret_cast<const __half*>(dw.p);
+  const auto run = [&](std::uint32_t t0, std::uint32_t n, int shape,
+                       bool use_scratch = true) {
+    void* sc = use_scratch ? scratch.p : nullptr;
+    float* y = dy.p + std::size_t{t0} * rows;
+    const float* xs = dx.p + std::size_t{t0} * k;
+    if (q8) {
+      if (shape < 0)
+        dn::GemmQ8_0(dw.p, xs, y, n, k, rows, sc, nullptr);
+      else
+        dn::GemmQ8_0Shape(dw.p, xs, y, n, k, rows, rows, shape, sc, nullptr);
+    } else {
+      if (shape < 0)
+        dn::GemmF16(wh, xs, y, n, k, rows, sc, nullptr);
+      else
+        dn::GemmF16Shape(wh, xs, y, n, k, rows, shape, sc, nullptr);
+    }
+  };
+  const auto fetch = [&] {
+    HIP_OK(hipDeviceSynchronize());
+    return dy.Get();
+  };
+  char name[160];
+  const char* what = q8 ? "GemmQ8_0" : "GemmF16";
+  run(0, n_total, -1);
+  const auto full = fetch();
+  std::printf("DIGEST %s rows=%u k=%u n=%u %016llx\n", what, rows, k, n_total,
+              static_cast<unsigned long long>(
+                  Fnv(full.data(), full.size() * sizeof(float))));
+  {  // golden digest of the parent kernels
+    const auto digest = Fnv(full.data(), full.size() * sizeof(float));
+    bool found = false, ok = true;
+    for (const auto& g : parent_digests::kDense)
+      if (g.rows == rows && g.k == k && g.n == n_total &&
+          std::strcmp(g.op, what) == 0) {
+        found = true;
+        ok = g.digest == digest;
+      }
+    if (found) {
+      std::snprintf(name, sizeof name, "%s == parent digest rows=%u k=%u n=%u",
+                    what, rows, k, n_total);
+      std::printf("%-4s %s\n", ok ? "PASS" : "FAIL", name);
+      if (!ok)
+        ++g_failures;
+    }
+  }
+  const auto same = [&](const char* tag, const std::vector<float>& got) {
+    const bool ok =
+        std::memcmp(got.data(), full.data(), got.size() * sizeof(float)) == 0;
+    std::snprintf(name, sizeof name, "%s %s rows=%u k=%u n=%u", what, tag, rows,
+                  k, n_total);
+    std::printf("%-4s %s\n", ok ? "PASS" : "FAIL", name);
+    if (!ok)
+      ++g_failures;
+  };
+  HIP_OK(hipMemset(dy.p, 0xFF, dy.n * sizeof(float)));
+  run(0, n_total, -1, false);
+  same("scratch-free path bit-identical", fetch());
+  for (int shape = 0; shape < dn::kGemmShapes; ++shape) {
+    HIP_OK(hipMemset(dy.p, 0xFF, dy.n * sizeof(float)));
+    run(0, n_total, shape);
+    char tag[40];
+    std::snprintf(tag, sizeof tag, "tile shape %d bit-identical", shape);
+    same(tag, fetch());
+  }
+  // Chunk prefixes; the remainder of the tokens goes in one last call.
+  const std::vector<std::vector<std::uint32_t>> splits = {
+      {9},
+      {n_total > 9 ? n_total - 9 : 9},
+      {97, 128},
+      {512, 512, 512},
+      {64, 64, 64, 64}};
+  for (std::size_t si = 0; si < splits.size(); ++si) {
+    HIP_OK(hipMemset(dy.p, 0xFF, dy.n * sizeof(float)));
+    std::uint32_t t0 = 0;
+    for (std::uint32_t n : splits[si]) {
+      n = std::min(n, n_total - t0);
+      if (n == 0)
+        break;
+      run(t0, n, -1);
+      t0 += n;
+    }
+    if (t0 < n_total)
+      run(t0, n_total - t0, -1);
+    char tag[40];
+    std::snprintf(tag, sizeof tag, "split %zu bit-identical", si);
+    same(tag, fetch());
+  }
+  // Sampled accuracy against the host emulation (every tile edge case: the
+  // first/last tokens and rows are always included).
+  std::vector<std::uint32_t> ts{0, n_total - 1}, rs{0, rows - 1};
+  for (int i = 0; i < 46; ++i) {
+    ts.push_back(g_rng() % n_total);
+    rs.push_back(g_rng() % rows);
+  }
+  std::vector<float> got, ref;
+  for (auto t : ts)
+    for (auto r : rs) {
+      got.push_back(full[std::size_t{t} * rows + r]);
+      ref.push_back(
+          EmulateDot(&wd[std::size_t{r} * k], &x[std::size_t{t} * k], k));
+    }
+  std::snprintf(name, sizeof name,
+                "%s vs F16+RTZ-8 emulation (sampled) rows=%u k=%u n=%u", what,
+                rows, k, n_total);
+  Check(name, got, ref.data(), ref.size(), 3e-5);
+}
+
+// ---- --bench ----------------------------------------------------------------
+void BenchGemm(bool q8, std::uint32_t rows, std::uint32_t k, std::uint32_t n,
+               const std::vector<std::uint8_t>& wbytes) {
+  Dev<std::uint8_t> dw(wbytes);
+  Dev<float> dx(Randn(std::size_t{n} * k));
+  Dev<float> dy(std::size_t{n} * rows);
+  Dev<std::uint8_t> scratch(dn::ScratchBytes(WeightType::kQ8_0, n, k));
+  const auto* wh = reinterpret_cast<const __half*>(dw.p);
+  hipEvent_t e0, e1;
+  HIP_OK(hipEventCreate(&e0));
+  HIP_OK(hipEventCreate(&e1));
+  const auto launch = [&](int shape) {
+    if (shape < 0) {  // default dispatch
+      if (q8)
+        dn::GemmQ8_0(dw.p, dx.p, dy.p, n, k, rows, scratch.p, nullptr);
+      else
+        dn::GemmF16(wh, dx.p, dy.p, n, k, rows, scratch.p, nullptr);
+    } else if (q8) {
+      dn::GemmQ8_0Shape(dw.p, dx.p, dy.p, n, k, rows, rows, shape, scratch.p,
+                        nullptr);
+    } else {
+      dn::GemmF16Shape(wh, dx.p, dy.p, n, k, rows, shape, scratch.p, nullptr);
+    }
+  };
+  const auto time_ms = [&](int shape) {
+    // Whole-batch timing of >= 20 launches covering >= 5 ms.
+    int reps = 20;
+    for (;;) {
+      HIP_OK(hipEventRecord(e0));
+      for (int i = 0; i < reps; ++i)
+        launch(shape);
+      HIP_OK(hipEventRecord(e1));
+      HIP_OK(hipEventSynchronize(e1));
+      float ms = 0;
+      HIP_OK(hipEventElapsedTime(&ms, e0, e1));
+      if (ms >= 5.0F)
+        return static_cast<double>(ms) / reps;
+      reps *= 2;
+    }
+  };
+  // Tiny kernels are dominated by clock ramp-up and the first launch of each
+  // configuration: warm up the GPU on every configuration, then time two
+  // passes (forward, reverse order) and keep the minimum per configuration.
+  std::vector<int> order{-1};
+  for (int s2 = 0; s2 < dn::kGemmShapes; ++s2)
+    order.push_back(s2);
+  for (int s2 : order)
+    (void)time_ms(s2);
+  std::vector<double> best(order.size(), 1e30);
+  for (int pass = 0; pass < 2; ++pass)
+    for (std::size_t i = 0; i < order.size(); ++i) {
+      const std::size_t j = pass == 0 ? i : order.size() - 1 - i;
+      best[j] = std::min(best[j], time_ms(order[j]));
+    }
+  const double flop = 2.0 * rows * k * n;
+  for (std::size_t i = 0; i < order.size(); ++i) {
+    const std::string shape =
+        order[i] < 0
+            ? "auto(chosen=" + std::to_string(dn::GemmShapeFor(n, rows)) + ")"
+            : std::to_string(order[i]);
+    std::printf("BENCH %s rows=%u k=%u n=%u shape=%s ms=%.4f tflops=%.2f\n",
+                q8 ? "GemmQ8_0" : "GemmF16", rows, k, n, shape.c_str(), best[i],
+                flop / (best[i] * 1e-3) / 1e12);
+  }
+  HIP_OK(hipEventDestroy(e0));
+  HIP_OK(hipEventDestroy(e1));
+}
+
+void RunBench() {
+  const std::pair<std::uint32_t, std::uint32_t> shapes[] = {
+      {20512, 2560}, {6144, 2560}, {2560, 4096},
+      {2560, 6144},  {768, 2560},  {2560, 768}};
+  for (const auto& [rows, k] : shapes) {
+    const auto wq = QuantizeQ8_0(Randn(std::size_t{rows} * k, 0.5F), k);
+    for (std::uint32_t n : {16U, 64U, 128U, 512U, 2048U})
+      BenchGemm(true, rows, k, n, wq);
+  }
 }
 
 // ---- Q4_K embedding
@@ -466,20 +713,206 @@ void TestResidualSwiGlu() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Decode fusions must reproduce the separate launches bit for bit.
+// ---------------------------------------------------------------------------
+bool SameBytes(const void* a, const void* b, std::size_t bytes) {
+  return std::memcmp(a, b, bytes) == 0;
+}
+
+void Verdict(bool ok, const char* what, std::uint32_t n) {
+  std::printf("%s %s n=%u\n", ok ? "PASS" : "FAIL", what, n);
+  if (!ok)
+    ++g_failures;
+}
+
+void TestFusions() {
+  constexpr std::uint32_t kH = 2560;
+  const auto gamma = Randn(kH, 0.3F);
+  std::vector<float> gamma1 = gamma;
+  for (auto& g : gamma1)
+    g += 1.0F;
+  Dev<float> dg(gamma1);
+  for (std::uint32_t n = 1; n <= 8; ++n) {
+    const auto res0 = Randn(std::size_t{n} * kH, 2.0F);
+    const auto add = Randn(std::size_t{n} * kH, 1.5F);
+    const auto eo = Randn(std::size_t{n} * 8 * kH, 0.7F);
+    auto wts = Randn(std::size_t{n} * 8, 0.4F);
+    const auto shared = Randn(std::size_t{n} * kH, 0.5F);
+    const std::size_t qb = dn::QuantActBytes(n, kH);
+    Dev<std::uint8_t> q_ref(qb), q_new(qb);
+    Dev<float> x_ref(std::size_t{n} * kH), x_new(std::size_t{n} * kH);
+    const auto planes_equal = [&](const char* what) {
+      HIP_OK(hipDeviceSynchronize());
+      const auto a = q_ref.Get();
+      const auto b = q_new.Get();
+      const auto xa = x_ref.Get();
+      const auto xb = x_new.Get();
+      Verdict(SameBytes(a.data(), b.data(), qb) &&
+                  SameBytes(xa.data(), xb.data(), xa.size() * 4),
+              what, n);
+    };
+    // Plain: x = res.
+    {
+      Dev<float> res(res0);
+      HIP_OK(hipMemset(q_ref.p, 0, qb));
+      HIP_OK(hipMemset(q_new.p, 0, qb));
+      dn::RmsNormRows(res.p, dg.p, x_ref.p, n, kH, 1, 1e-6F, nullptr);
+      dn::QuantizeActivations(x_ref.p, n, kH, q_ref.p, nullptr);
+      dn::RmsNormQuantRows(res.p, dg.p, x_new.p, n, 1e-6F, q_new.p, nullptr);
+      planes_equal("RmsNormQuantRows == norm + quantise");
+    }
+    // Residual add.
+    {
+      Dev<float> r_ref(res0), r_new(res0), d_add(add);
+      HIP_OK(hipMemset(q_ref.p, 0, qb));
+      HIP_OK(hipMemset(q_new.p, 0, qb));
+      dn::AddResidual(r_ref.p, d_add.p, std::size_t{n} * kH, nullptr);
+      dn::RmsNormRows(r_ref.p, dg.p, x_ref.p, n, kH, 1, 1e-6F, nullptr);
+      dn::QuantizeActivations(x_ref.p, n, kH, q_ref.p, nullptr);
+      dn::AddResidualRmsNormQuant(r_new.p, d_add.p, dg.p, x_new.p, n, 1e-6F,
+                                  q_new.p, nullptr);
+      planes_equal("AddResidualRmsNormQuant == add + norm + quantise");
+      const auto a = r_ref.Get();
+      const auto b = r_new.Get();
+      Verdict(SameBytes(a.data(), b.data(), a.size() * 4),
+              "AddResidualRmsNormQuant residual", n);
+    }
+    // MoE combine.
+    {
+      Dev<float> r_ref(res0), r_new(res0), d_eo(eo), d_w(wts), d_sh(shared);
+      HIP_OK(hipMemset(q_ref.p, 0, qb));
+      HIP_OK(hipMemset(q_new.p, 0, qb));
+      gufo::models::ling_3_flash::rocm::moe::Combine(r_ref.p, d_eo.p, d_w.p,
+                                                     d_sh.p, n, nullptr);
+      dn::RmsNormRows(r_ref.p, dg.p, x_ref.p, n, kH, 1, 1e-6F, nullptr);
+      dn::QuantizeActivations(x_ref.p, n, kH, q_ref.p, nullptr);
+      dn::CombineRmsNormQuant(r_new.p, d_eo.p, d_w.p, d_sh.p, dg.p, x_new.p, n,
+                              1e-6F, q_new.p, nullptr);
+      planes_equal("CombineRmsNormQuant == combine + norm + quantise");
+      const auto a = r_ref.Get();
+      const auto b = r_new.Get();
+      Verdict(SameBytes(a.data(), b.data(), a.size() * 4),
+              "CombineRmsNormQuant residual", n);
+    }
+    // SwiGLU with planes (shared expert: 768 wide, and a clamp).
+    for (const float limit : {0.0F, 7.0F}) {
+      constexpr std::uint32_t kF = 768;
+      const auto gate = Randn(std::size_t{n} * kF, 4.0F);
+      const auto up = Randn(std::size_t{n} * kF, 4.0F);
+      Dev<float> dgate(gate), dup(up), o_ref(std::size_t{n} * kF),
+          o_new(std::size_t{n} * kF);
+      const std::size_t qf = dn::QuantActBytes(n, kF);
+      Dev<std::uint8_t> a_ref(qf), a_new(qf);
+      HIP_OK(hipMemset(a_ref.p, 0, qf));
+      HIP_OK(hipMemset(a_new.p, 0, qf));
+      dn::SwiGluClamped(dgate.p, dup.p, o_ref.p, std::size_t{n} * kF, limit,
+                        nullptr);
+      dn::QuantizeActivations(o_ref.p, n, kF, a_ref.p, nullptr);
+      dn::SwiGluClampedQuant(dgate.p, dup.p, o_new.p, std::size_t{n} * kF, kF,
+                             limit, a_new.p, nullptr);
+      HIP_OK(hipDeviceSynchronize());
+      const auto pa = a_ref.Get();
+      const auto pb = a_new.Get();
+      const auto oa = o_ref.Get();
+      const auto ob = o_new.Get();
+      Verdict(SameBytes(pa.data(), pb.data(), qf) &&
+                  SameBytes(oa.data(), ob.data(), oa.size() * 4),
+              limit > 0 ? "SwiGluClampedQuant (clamped)" : "SwiGluClampedQuant",
+              n);
+    }
+  }
+}
+
+// Three weight matrices over one set of planes in one launch == three
+// separate GemvQ8_0 launches, bit for bit (including 4-token sub-batches).
+void TestGroupedGemv() {
+  struct Shape {
+    std::uint32_t rows, k;
+  };
+  for (const std::uint32_t k : {2560U, 4096U, 768U}) {
+    const std::uint32_t rows[3] = {6144, 576, 32};
+    std::vector<std::vector<std::uint8_t>> wq;
+    std::vector<std::unique_ptr<Dev<std::uint8_t>>> dw;
+    for (int i = 0; i < 3; ++i) {
+      wq.push_back(QuantizeQ8_0(Randn(std::size_t{rows[i]} * k, 0.5F), k));
+      dw.push_back(std::make_unique<Dev<std::uint8_t>>(wq.back()));
+    }
+    for (std::uint32_t n : {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U}) {
+      const auto x = Randn(std::size_t{n} * k);
+      Dev<float> dx(x);
+      Dev<std::uint8_t> scratch(dn::ScratchBytes(WeightType::kQ8_0, 8, k));
+      Dev<std::uint8_t> quant(dn::QuantActBytes(n, k));
+      std::vector<std::unique_ptr<Dev<float>>> y_ref, y_new;
+      for (int i = 0; i < 3; ++i) {
+        y_ref.push_back(std::make_unique<Dev<float>>(std::size_t{n} * rows[i]));
+        y_new.push_back(std::make_unique<Dev<float>>(std::size_t{n} * rows[i]));
+        dn::GemvQ8_0(dw[i]->p, dx.p, y_ref[i]->p, n, k, rows[i], scratch.p,
+                     nullptr);
+      }
+      dn::QuantizeActivations(dx.p, n, k, quant.p, nullptr);
+      dn::Q8Group groups[3] = {{dw[0]->p, y_new[0]->p, rows[0]},
+                               {dw[1]->p, y_new[1]->p, rows[1]},
+                               {dw[2]->p, y_new[2]->p, rows[2]}};
+      dn::GemvQ8_0Quantized(groups, 3, quant.p, n, k, nullptr);
+      HIP_OK(hipDeviceSynchronize());
+      bool ok = true;
+      for (int i = 0; i < 3; ++i) {
+        const auto a = y_ref[i]->Get();
+        const auto b = y_new[i]->Get();
+        ok = ok && SameBytes(a.data(), b.data(), a.size() * 4);
+      }
+      char name[96];
+      std::snprintf(name, sizeof name, "grouped GemvQ8_0Quantized k=%u", k);
+      Verdict(ok, name, n);
+    }
+  }
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  // Before the first HIP call: a missing $TMPDIR crashes the runtime.
+  if (!gufo::core::RequireTempDirectory())
+    return 1;
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
   int count = 0;
   if (hipGetDeviceCount(&count) != hipSuccess || count == 0) {
     std::puts("SKIP: no GPU");
     return 77;
   }
+  if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
+    RunBench();
+    return 0;
+  }
   const std::pair<std::uint32_t, std::uint32_t> q8_shapes[] = {
       {20512, 2560}, {6144, 2560}, {576, 2560}, {32, 2560},
       {2560, 4096},  {2560, 6144}, {768, 2560}, {2560, 768}};
   for (const auto& [rows, k] : q8_shapes)
     TestQ8(rows, k);
+  // Dispatch contract: small chunks (agent turns of 50-150 tokens) must not
+  // take the 128x128 tile.
+  for (std::uint32_t rows : {768U, 2560U, 6144U, 20512U}) {
+    const int want[][2] = {{9, 3}, {16, 3}, {17, 2}, {32, 2}, {33, 1}, {64, 1}};
+    for (const auto& [n, shape] : want) {
+      const bool ok = dn::GemmShapeFor(n, rows) == shape;
+      std::printf("%-4s GemmShapeFor(n=%d, rows=%u) == %d\n",
+                  ok ? "PASS" : "FAIL", n, rows, shape);
+      if (!ok)
+        ++g_failures;
+    }
+  }
+  // Prefill GEMM at real shapes and n in {9, 64, 512, 2048}: tile-shape and
+  // split invariance (bit-exact) plus sampled accuracy.
+  for (std::uint32_t n : {9U, 64U, 512U, 2048U}) {
+    TestGemmInvariance(true, 20512, 2560, n);
+    TestGemmInvariance(true, 2560, 4096, n);
+    TestGemmInvariance(true, 768, 2560, n);
+    TestGemmInvariance(true, 2560, 768, n);
+    TestGemmInvariance(true, 6144, 2560, n);
+    TestGemmInvariance(true, 2560, 6144, n);
+    TestGemmInvariance(false, 4097, 2560, n);
+  }
   TestQ8BatchInvariant(6144, 6144);  // dense FFN down: 4-token sub-batches
   TestQ8BatchInvariant(2560, 2560);
   TestQ8BatchInvariant(576, 4096);
@@ -494,6 +927,8 @@ int main() {
   TestRmsNorm(2, 32 * 192, 32, true, true);  // d = 192
   TestRmsNorm(2, 512, 1, true, false);       // MLA latent
   TestResidualSwiGlu();
+  TestFusions();
+  TestGroupedGemv();
   std::printf("%s (%d failures)\n", g_failures ? "FAILED" : "ALL PASSED",
               g_failures);
   return g_failures ? 1 : 0;

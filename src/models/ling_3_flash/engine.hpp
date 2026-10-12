@@ -28,10 +28,24 @@ class RecurrentSnapshot;
 struct ForwardTiming;
 }  // namespace rocm
 
+/// Prefill chunk (ModelOptions::max_batch) the CLI, the bench and the server
+/// pass (llama.cpp's n_ubatch). ModelOptions::max_batch itself defaults to
+/// 2048, the capacity library users get; the executables choose 512. The
+/// server's `--prefill-chunk` is a separate scheduling budget between decode
+/// rounds, not this value. Chunks larger than 8 tokens give bit-identical
+/// results whatever their size (see the reproducibility contract below).
+inline constexpr std::uint32_t kCliPrefillBatch = 512;
+
 struct ModelOptions {
   std::uint32_t max_context = 4096;
-  /// Tokens per forward pass; longer prompts are fed in chunks of this size.
+  /// Tokens per forward pass (device buffers are sized for it); longer
+  /// prompts are fed in chunks of this size.
   std::uint32_t max_batch = 2048;
+  /// Device bytes, shared by all sessions, for persistent expanded K/V of the
+  /// MLA layers (112 KiB per cached token, filled lazily by prefill-family
+  /// chunks). Rows past a session's share are expanded per chunk with
+  /// identical bits, so this is a speed/memory trade only. 0 disables it.
+  std::uint64_t expanded_kv_bytes = std::uint64_t{12} << 30;
   /// Debug aids for GPUs too small for the artifact: upload only blocks
   /// [layer_first, layer_first + layer_limit) (limit 0 = to the end of the
   /// trunk). A truncated trunk has meaningless logits; Forward requires
@@ -39,6 +53,9 @@ struct ModelOptions {
   /// resident block.
   std::uint32_t layer_first = 0;
   std::uint32_t layer_limit = 0;
+  /// Replay small-batch decode steps as HIP graphs (default). Tests clear it to
+  /// compare with the eager launch sequence; results are bit-identical.
+  bool graphs = true;
 };
 
 /// Timing of one forward pass (device events), kept per chunk.
@@ -61,6 +78,9 @@ struct FeedOptions {
   std::vector<float>* all_logits{nullptr};
   GpuTensorSink* sink{nullptr};
   std::vector<StepTiming>* timings{nullptr};
+  /// Merges per-operation device times (see OpTiming) of the chunks of this
+  /// call into the vector; such steps run eagerly. For profiling.
+  std::vector<OpTiming>* op_profile{nullptr};
 };
 
 class Session;
@@ -109,6 +129,8 @@ public:
   [[nodiscard]] static std::size_t SessionBytes(std::uint32_t context) noexcept;
   [[nodiscard]] double LoadSeconds() const noexcept { return load_seconds_; }
   [[nodiscard]] double UploadSeconds() const noexcept;
+  /// HIP-graph decode replays so far (tests and the bench check the path ran).
+  [[nodiscard]] std::uint64_t GraphReplays() const noexcept;
 
 private:
   Model() = default;
@@ -133,9 +155,20 @@ private:
 ///     that token's own context. Every token is computed exactly as if it were
 ///     fed alone, so any split of a token run into chunks of 1..8 tokens gives
 ///     bit-identical logits, recurrent state, conv windows and cache rows.
-///   * prefill family, n > 8: F16 WMMA GEMM, prefill MoE and prefill
-///     attention. Any split of a token run into chunks that are all larger than
-///     8 tokens (for example 39 + 67 or one chunk of 106) is bit-identical.
+///   * prefill family, n > 8: F16 WMMA GEMM, prefill MoE and non-absorbed MLA
+///     prefill attention (cached latent rows expand per head to F16 K/V,
+///     once at first use into a budgeted persistent per-session store, or per
+///     call in transient 2048-key blocks beyond the budget; flash attention
+///     over 192/128 dims whose per-block partials fold in absolute block
+///     order; the absorbed form is used only by the small-batch family). The
+///     attention rule depends on n alone, never on the context length, the
+///     chunk layout or the store budget, and an expanded row has the same bits
+///     wherever it was expanded. Any split of a token run into chunks that are
+///     all larger than 8 tokens (for example 39 + 67 or one chunk of 106) is
+///     bit-identical. The KDA recurrence of this family is restructured for
+///     throughput but stays token-sequential from the carried state with a
+///     reduction tree independent of n and of where a call starts, so it adds
+///     no split dependence.
 /// The two families are different numeric formats by design: they agree to
 /// about 1e-3 per layer (logits rel-L2 well under 2e-2 over the whole trunk,
 /// top-1 usually the same) but not bit for bit.

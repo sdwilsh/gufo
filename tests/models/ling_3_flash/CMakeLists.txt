@@ -24,20 +24,16 @@ target_compile_definitions(ling_3_flash_chat_template_test PRIVATE
   GUFO_LING_CHAT_GOLDENS="${LING_FIXTURES}/chat_template_goldens.json")
 
 if (ENGINE_ENABLE_HIP)
-  # --- WS4a: kda ---
-  add_ling_3_flash_test(kda_ops gufo_ling_3_flash "hip;gpu;gfx1151")
-  # --- end WS4a ---
-  # --- mla (WS4b) ---
-  add_ling_3_flash_test(mla_ops gufo_ling_3_flash "hip;gpu;gfx1151")
-  # --- end mla ---
-  # --- WS4c: MoE routing and routed-expert op tests ---
-  add_ling_3_flash_test(moe_ops gufo_ling_3_flash "hip;gpu;gfx1151")
-  # --- end WS4c ---
-  # --- WS4d dense kernel op tests ---
-  add_ling_3_flash_test(dense_ops gufo_ling_3_flash "hip;gpu;gfx1151")
-  set_tests_properties(ling_3_flash.dense_ops PROPERTIES
-    SKIP_RETURN_CODE 77 TIMEOUT 600)
-  # --- end WS4d ---
+  foreach(ops dense kda mla moe)
+    add_ling_3_flash_test(${ops}_ops gufo_ling_3_flash "hip;gpu;gfx1151")
+  endforeach()
+  set_tests_properties(ling_3_flash.dense_ops PROPERTIES TIMEOUT 900)
+  set_tests_properties(ling_3_flash.moe_ops PROPERTIES TIMEOUT 1800)
+  # Fast bit-exactness subset of the prefill MoE path.
+  add_test(NAME ling_3_flash.moe_ops_invariance
+    COMMAND ling_3_flash_moe_ops_test --invariance)
+  set_tests_properties(ling_3_flash.moe_ops_invariance PROPERTIES
+    LABELS "ling_3_flash;hip;gpu;gfx1151" SKIP_RETURN_CODE 77 TIMEOUT 600)
 endif()
 
 # Full-model checks. Built explicitly (target ling_3_flash_model_tests), never
@@ -45,19 +41,36 @@ endif()
 # exist only when a model is named: -DGUFO_LING_MODEL=/path/first-shard.gguf.
 if (ENGINE_ENABLE_HIP)
   set(LING_MODEL_BINARIES)
-  foreach(name IN ITEMS session_test logit_dump layer_check b2)
+  foreach(name IN ITEMS session_test logit_dump layer_check b2 decode_digest
+                        handoff_study)
     set(target ling_3_flash_${name})
     add_executable(${target} EXCLUDE_FROM_ALL ${name}.cpp)
     target_link_libraries(${target} PRIVATE gufo_ling_3_flash hip::host)
     list(APPEND LING_MODEL_BINARIES ${target})
+    set(model_args --model ${GUFO_LING_MODEL})
+    if (name STREQUAL "decode_digest")
+      # Graph replay vs eager, bit for bit.
+      list(APPEND model_args --graph-compare)
+    endif()
     if (GUFO_LING_MODEL)
       add_test(NAME ling_3_flash.model_${name}
-        COMMAND ${target} --model ${GUFO_LING_MODEL})
+        COMMAND ${target} ${model_args})
       set_tests_properties(ling_3_flash.model_${name} PROPERTIES
         LABELS "ling_3_flash;hip;gpu;gfx1151;model" SKIP_RETURN_CODE 77
         TIMEOUT 3600)
     endif()
   endforeach()
+  if (GUFO_LING_MODEL)
+    # Crosses the clamped 96-split attention plan (24,576 keys) between the
+    # step that captures a graph and the steps that replay it.
+    add_test(NAME ling_3_flash.model_decode_digest_long
+      COMMAND ling_3_flash_decode_digest --model ${GUFO_LING_MODEL}
+        --graph-compare --layers 8 --max-batch 512 --max-context 25000
+        --prompt-tokens 24570 --decode-tokens 12)
+    set_tests_properties(ling_3_flash.model_decode_digest_long PROPERTIES
+      LABELS "ling_3_flash;hip;gpu;gfx1151;model" SKIP_RETURN_CODE 77
+      TIMEOUT 3600)
+  endif()
   add_custom_target(ling_3_flash_model_tests DEPENDS ${LING_MODEL_BINARIES})
 endif()
 
