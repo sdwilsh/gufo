@@ -42,6 +42,9 @@ struct DeviceLayer {
   DeviceTensor conv_q, conv_k, conv_v, ssm_dt, ssm_a, ssm_norm;
 
   DeviceTensor attn_q, kv_a, kv_a_norm, k_b, v_b, attn_gate;
+  /// F16 expansion weights for non-absorbed prefill (mla::ExpansionWeightBytes
+  /// bytes, built from k_b and v_b after the upload).
+  DeviceTensor mla_w16;
 
   DeviceTensor ffn_gate, ffn_up, ffn_down;  ///< dense FFN (blocks 0-1)
 

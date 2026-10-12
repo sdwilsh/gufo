@@ -3,12 +3,25 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 /// Shared contracts of the Ling-3.0-flash (`bailingmoe3`) runtime: fixed
 /// dimensions, tensor row orders and device buffer layouts. Everything here is
 /// constants and POD so kernels, the engine and tests can code against one
 /// definition. Math is specified in artifacts/ling-3-flash/PLAN.md section 1.
 namespace gufo::models::ling_3_flash {
+
+/// Device time of one kind of decode operation (summed over layers and steps),
+/// from stream events between consecutive launches of an eager step; the
+/// interval includes the launch gap before the operation. `bytes` is the
+/// weight/state/cache traffic the operation must read (a lower bound), so
+/// bytes / ms is the effective bandwidth.
+struct OpTiming {
+  std::string name;
+  std::uint32_t count{0};
+  double ms{0.0};
+  double bytes{0.0};
+};
 
 // ---- Trunk geometry -------------------------------------------------------
 inline constexpr std::uint32_t kBlockCount = 43;   ///< Trunk plus MTP block.
@@ -131,6 +144,15 @@ struct SessionState {
   void* mla_cache{nullptr};   ///< F16, MlaCacheLayout
   MlaCacheLayout cache;
   std::uint32_t position{0};  ///< Tokens already consumed (next position).
+  /// Persistent expanded K/V of the MLA layers (mla::ExpandedLayerBytes(
+  /// expanded_rows) per layer), rows [0, expanded_rows) with expanded_rows a
+  /// multiple of 2048 (0 = none). Rows are expanded lazily by the prefill
+  /// attention: `mla_expanded_to[m]` rows of layer m are current; an append at
+  /// first_pos lowers it to first_pos, so truncation, restore and rewrites
+  /// need no other bookkeeping.
+  void* mla_expanded{nullptr};  ///< F16
+  std::uint32_t expanded_rows{0};
+  mutable std::uint32_t mla_expanded_to[kMlaLayers]{};
 };
 
 /// Byte sizes of the per-sequence state as functions of the max context.

@@ -7,7 +7,7 @@
 // Exit 77 without --model.
 //
 //   session_test --model FIRST_SHARD.gguf [--prompt-tokens N] [--decode-tokens
-//   K]
+//   K] [--tokens ID,ID,... (prompt + K decode ids)]
 //                [--max-context N] [--max-batch N] [--layers N]
 //                [--timeout-seconds S] [--hold-seconds S]
 //
@@ -158,17 +158,37 @@ json::Value ToJson(const Diff& d) {
 // Numeric families (see the reproducibility contract in engine.hpp). Chunks of
 // 1..8 tokens are the small-batch/decode family (two-plane int8 Q8_0 GEMV,
 // decode MoE, one decode-attention launch per token); chunks above 8 tokens
-// are the prefill family (F16 WMMA GEMM, prefill attention). They are
-// different numeric formats by design. Inside one family the result is
+// are the prefill family (F16 WMMA GEMM, non-absorbed prefill attention). They
+// are different numeric formats by design. Inside one family the result is
 // independent of the chunk layout, so those comparisons are gated at exact
 // (bitwise) equality of the logits, the recurrent state, the conv windows and
-// the cache. Across families the logits differ by the format error of the two
-// paths compounded over all layers, which is not a state-carry signal, so only
-// a logits-level bound is gated there and state/cache numbers are reported.
-constexpr double kCrossFamilyLogits = 2e-2;  // B2r on gfx1151 measured 4.9e-3
+// the cache. Across families the results differ by the format error of the
+// two paths compounded over all layers: gated at calibrated limits only.
+// Cross-family limits, set per check from the parent (mqlsrksw / B2r3) build's
+// measured floor on gfx1151 with margin. The handoff itself is gated across
+// many prompts by handoff_study + study-verdict.py; these single-sequence
+// limits only catch gross state/conv/cache errors (O(1e-1)).
+struct CrossLimits {
+  double logits, state, conv, cache;
+};
+// chunks of 5 vs one prefill: base floor 1.05e-2 / 1.85e-2 / 2.61e-2 / 1.16e-2
+// (B2r3, WS10, WS12 identical to within 6%), limits about 2.3x.
+constexpr CrossLimits kChunksVsPrefill{2.5e-2, 4.5e-2, 6e-2, 2.5e-2};
+// prefill N then decode vs prefill N+k: base floor 1.25e-4 / 1.86e-4 / 3.47e-4
+// / 7.3e-5; a single sequence can still hit a routing flip (WS11: 1.5e-3 /
+// 3.3e-3 / 8.9e-3 / 7.9e-4), so the limits keep that margin and no more.
+constexpr CrossLimits kPrefillThenDecode{5e-3, 1e-2, 2e-2, 5e-3};
 
-bool CrossFamilyOk(const Diff& d) {
-  return d.finite && d.logits <= kCrossFamilyLogits;
+bool CrossFamilyOk(const Diff& d, const CrossLimits& l) {
+  return d.finite && d.logits <= l.logits && d.state <= l.state &&
+         d.conv <= l.conv && d.cache <= l.cache;
+}
+
+void SetLimits(json::Value& o, const CrossLimits& l) {
+  o["limit_logits_rel_l2"] = l.logits;
+  o["limit_kda_state_rel_l2"] = l.state;
+  o["limit_kda_conv_rel_l2"] = l.conv;
+  o["limit_mla_cache_rel_l2"] = l.cache;
 }
 
 bool Exact(const Diff& d) {
@@ -191,17 +211,24 @@ const char* kText =
 
 int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
   const std::uint32_t layers = model->LayerCount();
-  const auto want_prompt =
-      static_cast<std::uint32_t>(args.Num("--prompt-tokens", 100));
   const auto want_decode =
       static_cast<std::uint32_t>(args.Num("--decode-tokens", 6));
-  std::string text;
   std::vector<std::int32_t> ids;
-  while (ids.size() < want_prompt + want_decode) {
-    text += kText;
-    ids = model->Tokenize(text);
+  std::uint32_t want_prompt =
+      static_cast<std::uint32_t>(args.Num("--prompt-tokens", 100));
+  if (args.Has("--tokens")) {
+    // Explicit ids (prompt then the tokens to decode), e.g. a greedy-oracle
+    // prompt followed by its generated tokens.
+    ids = ParseIds(args.Str("--tokens"));
+    want_prompt = static_cast<std::uint32_t>(ids.size()) - want_decode;
+  } else {
+    std::string text;
+    while (ids.size() < want_prompt + want_decode) {
+      text += kText;
+      ids = model->Tokenize(text);
+    }
+    ids.resize(want_prompt + want_decode);
   }
-  ids.resize(want_prompt + want_decode);
   const std::uint32_t N = want_prompt;
   const std::uint32_t K = want_decode;
   const std::uint32_t total = N + K;
@@ -336,9 +363,10 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
     const Diff d = Compare(cap5, ref);
     auto o = ToJson(d);
     o["family"] = "cross (small-batch vs prefill)";
-    o["gate"] = "logits_rel_l2 only";
-    o["limit_logits_rel_l2"] = kCrossFamilyLogits;
-    finish_check("chunks_of_5_vs_prefill", CrossFamilyOk(d), std::move(o));
+    o["gate"] = "logits, kda state, conv, cache rel-L2";
+    SetLimits(o, kChunksVsPrefill);
+    finish_check("chunks_of_5_vs_prefill", CrossFamilyOk(d, kChunksVsPrefill),
+                 std::move(o));
   }
 
   // Prefill N then decode k == prefill N+k.
@@ -365,8 +393,8 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
     auto o = ToJson(d);
     // Decode uses the two-plane int8 Q8_0 GEMV; prefill F16 activations.
     o["family"] = "cross (small-batch vs prefill)";
-    o["gate"] = "logits_rel_l2 only";
-    o["limit_logits_rel_l2"] = kCrossFamilyLogits;
+    o["gate"] = "logits, kda state, conv, cache rel-L2";
+    SetLimits(o, kPrefillThenDecode);
     std::vector<double> ms;
     for (const auto& st : steps) {
       ms.push_back(st.total_ms);
@@ -374,7 +402,8 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
     std::sort(ms.begin(), ms.end());
     o["decode_steps"] = U(K);
     o["decode_ms_median"] = Round(ms.empty() ? 0.0 : ms[ms.size() / 2]);
-    finish_check("prefill_then_decode", CrossFamilyOk(d), std::move(o));
+    finish_check("prefill_then_decode", CrossFamilyOk(d, kPrefillThenDecode),
+                 std::move(o));
   }
 
   // Snapshot / restore round trip.
