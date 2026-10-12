@@ -55,12 +55,13 @@ constexpr std::size_t kDecodeHeader = 16;
 
 // The expert plan of a decode call (distinct experts and which (token, slot)
 // pairs use them). Run by a block of at least 64 threads, all of which must
-// call it (it synchronises); only the first 64 do work.
+// call it (it synchronises); only the first 64 do work. Pairs are numbered
+// token * 8 + slot; entries follow the first use of their expert.
 __device__ __forceinline__ void DecodePrepBody(const std::int32_t* ids,
                                                std::uint32_t n_tokens,
                                                std::uint8_t* scratch) {
   __shared__ int e[64];
-  __shared__ int rank[64];
+  __shared__ int leaders0;  // leaders among pairs 0..31
   const int p = threadIdx.x;
   const int n = static_cast<int>(n_tokens) * 8;
   if (p < 64) {
@@ -73,23 +74,24 @@ __device__ __forceinline__ void DecodePrepBody(const std::int32_t* ids,
   for (int q = 0; q < p && leader; ++q) {
     leader = e[q] != e[p];
   }
-  if (p < 64) {
-    rank[p] = leader ? 1 : 0;
-  }
-  __syncthreads();
+  // Rank of a leader = leaders before it (wave32 ballots, then wave 0's
+  // count for the pairs of wave 1).
+  const unsigned lanes = static_cast<unsigned>(__ballot(leader));
+  const int lane = p & 31;
+  int rank = __popc(lanes & ((1U << lane) - 1U));
   if (p == 0) {
-    int run = 0;
-    for (int q = 0; q < 64; ++q) {
-      const int f = rank[q];
-      rank[q] = run;
-      run += f;
-    }
-    *reinterpret_cast<int*>(scratch) = run;
+    leaders0 = __popc(lanes);
   }
   __syncthreads();
+  if (p >= 32) {
+    rank += leaders0;
+  }
+  if (p == 63) {
+    *reinterpret_cast<int*>(scratch) = rank + (leader ? 1 : 0);
+  }
   if (leader) {
     auto* entries = reinterpret_cast<DecodeEntry*>(scratch + kDecodeHeader);
-    DecodeEntry& en = entries[rank[p]];
+    DecodeEntry& en = entries[rank];
     en.expert = e[p];
     int c = 0;
     for (int q = p; q < n; ++q) {
@@ -107,111 +109,138 @@ __global__ __launch_bounds__(64) void DecodePrepKernel(const std::int32_t* ids,
   DecodePrepBody(ids, n_tokens, scratch);
 }
 
-// With `counter` (a zeroed word, left zeroed) the last block to finish also
-// builds the decode expert plan of all tokens into `scratch`, which saves the
-// separate DecodePrepKernel launch; the plan depends only on the ids.
+/// The better of two (value, index) candidates under Better, across lanes
+/// `off` apart.
+__device__ __forceinline__ void ShflBest(float& v, int& i, int off) {
+  const float ov = __shfl_xor(v, off, 32);
+  const int oi = __shfl_xor(i, off, 32);
+  if (Better(ov, oi, v, i)) {
+    v = ov;
+    i = oi;
+  }
+}
+
+// One block of 8 waves per token; wave w owns expert group w (64 experts, two
+// per lane: w * 64 + lane and w * 64 + 32 + lane). Same selection as the
+// definition (kernels.hpp): group score = the two largest sel of the group
+// (as a multiset), the 4 best groups (ties: lower group), then the top 8 sel
+// of their experts in Better order (ties: lower index); weights from the
+// unbiased p in that order. Each kept group's wave extracts its own top 8,
+// wave 0 the top 8 of those 32. With `counter` (a zeroed word, left zeroed)
+// the last block to finish also builds the decode expert plan of all tokens
+// into `scratch`, which saves the separate DecodePrepKernel launch; the plan
+// depends only on the ids.
 __global__ __launch_bounds__(256) void RouteKernel(
     const float* logits, const float* bias, std::int32_t* ids, float* weights,
     std::uint32_t* counter, std::uint8_t* scratch) {
   __shared__ float p[512];
-  __shared__ float sel[512];
   __shared__ float gscore[8];
-  __shared__ int gmask;
-  __shared__ float wv[8];
-  __shared__ int wi[8];
-  __shared__ int chosen[8];
+  __shared__ float cv[32];
+  __shared__ int ci[32];
   const int t = blockIdx.x;
   const int tid = threadIdx.x;
-  const float* lg = logits + static_cast<std::size_t>(t) * 512;
-  for (int i = tid; i < 512; i += 256) {
-    const float pi = 1.0F / (1.0F + expf(-lg[i]));
-    p[i] = pi;
-    sel[i] = pi + bias[i];
-  }
-  __syncthreads();
-  if (tid < 8) {
-    float t1 = -INFINITY, t2 = -INFINITY;
-    for (int i = 0; i < 64; ++i) {
-      const float v = sel[tid * 64 + i];
-      if (v > t1) {
-        t2 = t1;
-        t1 = v;
-      } else if (v > t2) {
-        t2 = v;
-      }
-    }
-    gscore[tid] = t1 + t2;
-  }
-  __syncthreads();
-  if (tid == 0) {
-    int mask = 0;
-    for (int r = 0; r < 4; ++r) {
-      int best = -1;
-      for (int g = 0; g < 8; ++g) {
-        if ((mask >> g) & 1) {
-          continue;
-        }
-        if (best < 0 || gscore[g] > gscore[best]) {
-          best = g;
-        }
-      }
-      mask |= 1 << best;
-    }
-    gmask = mask;
-  }
-  __syncthreads();
-  for (int i = tid; i < 512; i += 256) {
-    if (!((gmask >> (i >> 6)) & 1)) {
-      sel[i] = -INFINITY;
-    }
-  }
-  __syncthreads();
   const int lane = tid & 31;
   const int wave = tid >> 5;
-  for (int r = 0; r < 8; ++r) {
-    float bv = sel[tid];
-    int bi = tid;
-    const float v2 = sel[tid + 256];
-    if (Better(v2, tid + 256, bv, bi)) {
-      bv = v2;
-      bi = tid + 256;
-    }
+  const float* lg = logits + static_cast<std::size_t>(t) * 512;
+  const int i0 = wave * 64 + lane, i1 = i0 + 32;
+  const float p0 = 1.0F / (1.0F + expf(-lg[i0]));
+  const float p1 = 1.0F / (1.0F + expf(-lg[i1]));
+  p[i0] = p0;
+  p[i1] = p1;
+  float s0 = p0 + bias[i0];
+  float s1 = p1 + bias[i1];
+  {
+    // Largest, then the largest of the rest (one copy of the maximum
+    // removed, so a repeated maximum counts twice).
+    float m = fmaxf(s0, s1);
+#pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-      const float ov = __shfl_xor(bv, off, 32);
-      const int oi = __shfl_xor(bi, off, 32);
-      if (Better(ov, oi, bv, bi)) {
-        bv = ov;
-        bi = oi;
+      m = fmaxf(m, __shfl_xor(m, off, 32));
+    }
+    const unsigned e0 = static_cast<unsigned>(__ballot(s0 == m));
+    const unsigned e1 = static_cast<unsigned>(__ballot(s1 == m));
+    float second;
+    if (__popc(e0) + __popc(e1) >= 2) {
+      second = m;
+    } else {
+      float r = fmaxf(s0 == m ? -INFINITY : s0, s1 == m ? -INFINITY : s1);
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) {
+        r = fmaxf(r, __shfl_xor(r, off, 32));
       }
+      second = r;
     }
     if (lane == 0) {
-      wv[wave] = bv;
-      wi[wave] = bi;
+      gscore[wave] = m + second;
     }
-    __syncthreads();
-    if (tid == 0) {
-      float cv = wv[0];
-      int ci = wi[0];
-      for (int w = 1; w < 8; ++w) {
-        if (Better(wv[w], wi[w], cv, ci)) {
-          cv = wv[w];
-          ci = wi[w];
-        }
-      }
-      chosen[r] = ci;
-      sel[ci] = -INFINITY;
-    }
-    __syncthreads();
   }
-  if (tid == 0) {
+  __syncthreads();
+  int gmask = 0;
+#pragma unroll
+  for (int r = 0; r < 4; ++r) {
+    int best = -1;
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+      if (((gmask >> g) & 1) == 0 && (best < 0 || gscore[g] > gscore[best])) {
+        best = g;
+      }
+    }
+    gmask |= 1 << best;
+  }
+  int slot = 0;  // this group's rank among the kept groups
+#pragma unroll
+  for (int g = 0; g < 8; ++g) {
+    slot += (g < wave && ((gmask >> g) & 1)) ? 1 : 0;
+  }
+  if ((gmask >> wave) & 1) {
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+      float bv = s0;
+      int bi = i0;
+      if (Better(s1, i1, bv, bi)) {
+        bv = s1;
+        bi = i1;
+      }
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) {
+        ShflBest(bv, bi, off);
+      }
+      if (lane == 0) {
+        cv[slot * 8 + r] = bv;
+        ci[slot * 8 + r] = bi;
+      }
+      if (bi == i0) {
+        s0 = -INFINITY;
+      } else if (bi == i1) {
+        s1 = -INFINITY;
+      }
+    }
+  }
+  __syncthreads();
+  if (wave == 0) {
+    float v = cv[lane];
+    const int idx = ci[lane];
+    int chosen = 0;
     float sum = 0.0F;
     for (int r = 0; r < 8; ++r) {
-      sum += p[chosen[r]];
+      float bv = v;
+      int bi = idx;
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) {
+        ShflBest(bv, bi, off);
+      }
+      if (lane == r) {
+        chosen = bi;
+      }
+      sum += p[bi];
+      if (bi == idx) {
+        v = -INFINITY;
+      }
     }
     const float denom = fmaxf(sum, 6.1035e-5F);
-    for (int r = 0; r < 8; ++r) {
-      ids[t * 8 + r] = chosen[r];
-      weights[t * 8 + r] = p[chosen[r]] / denom * 2.5F;
+    if (lane < 8) {
+      ids[t * 8 + lane] = chosen;
+      weights[t * 8 + lane] = p[chosen] / denom * 2.5F;
     }
   }
   if (counter != nullptr) {

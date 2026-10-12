@@ -574,10 +574,14 @@ void Executor::Kda(const DeviceLayer& l, const Session& session,
     Q8(l.kda_proj, b.x, b.proj, n);
   }
   Mark("kda.proj_gemv", TensorBytes(l.kda_proj));
-  if (fuse && n == 1) {
+  if (fuse) {
     kda::PrepDecode(b.proj, l.conv_q.f32(), l.conv_k.f32(), l.conv_v.f32(),
                     conv_state, l.ssm_a.f32(), l.ssm_dt.f32(), b.conv, b.g,
-                    b.beta, stream_);
+                    b.beta, n,
+                    rollback_active_ && n > 1
+                        ? b.conv_ckpt + std::size_t{k} * kKdaConvStateFloats
+                        : nullptr,
+                    kKdaLayers * kKdaConvStateFloats, stream_);
   } else {
     if (n == 1) {
       kda::Conv3Decode(b.proj, l.conv_q.f32(), l.conv_k.f32(), l.conv_v.f32(),
@@ -754,10 +758,12 @@ void Executor::Ffn(const DeviceLayer& l, std::uint32_t il, std::uint32_t n,
     Mark("dense.combine_norm", 0);
     return;
   }
-  // The shared expert is independent of routing: in a captured graph it runs
-  // as a parallel branch (fork after the norm, join before the combine). It
+  // The shared expert is independent of routing: in the decode family it runs
+  // as a parallel branch (fork after the norm, join before the combine), in a
+  // captured graph and in eager steps (MTP verification, drafts) alike. It
   // reads x and its planes, writes ga/gb/act/aq/mixer and uses no b.scratch,
-  // so results are the same as in the serial order.
+  // so results are the same as in the serial order. Profiled steps and debug
+  // dumps stay serial so per-op times and dumps are attributable.
   const auto shexp_fused = [&]() {
     Q8Quantized({{&l.gate_shexp, b.ga}, {&l.up_shexp, b.gb}}, b.xq, n, kHidden);
     Mark("shexp.gate_up_gemv",
@@ -767,7 +773,8 @@ void Executor::Ffn(const DeviceLayer& l, std::uint32_t il, std::uint32_t n,
     Mark("shexp.swiglu_quant", 0);
     Q8Quantized({{&l.down_shexp, b.mixer}}, b.aq, n, kSharedFf);
   };
-  const bool branch = capturing_ && fuse && n <= kMaxDecodeTokens;
+  const bool branch = (capturing_ || (!profiling_ && sink == nullptr)) &&
+                      fuse && n <= kMaxDecodeTokens;
   if (branch) {
     const hipStream_t main_stream = stream_;
     (void)hipEventRecord(fork_event_, main_stream);
@@ -1003,6 +1010,7 @@ bool Executor::Trunk(const Session& session, std::uint32_t n,
         il + 1 < layers ? &model_.layers()[il + 1] : nullptr;
     if (!Block(session, il, first_pos, n, sink, fuse, ready, next, error)) {
       (void)hipStreamSynchronize(stream_);
+      (void)hipStreamSynchronize(branch_stream_);
       return false;
     }
     ready = fuse && next != nullptr;
