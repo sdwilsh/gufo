@@ -191,3 +191,10 @@ target_include_directories(ling_3_flash_mtp_acceptance_probe PRIVATE
   ${PROJECT_SOURCE_DIR})
 set_source_files_properties(mtp_acceptance_probe.cpp PROPERTIES
   COMPILE_OPTIONS "-O2")
+
+# CPU timing of the host-side request path (render, tokenize, cache boundary);
+# built explicitly: cmake --build <dir> --target ling_3_flash_tokenize_bench.
+add_executable(ling_3_flash_tokenize_bench EXCLUDE_FROM_ALL
+  ${PROJECT_SOURCE_DIR}/tools/models/ling_3_flash/tokenize_bench.cpp)
+target_link_libraries(ling_3_flash_tokenize_bench PRIVATE gufo_ling_3_flash
+  gufo_core)
