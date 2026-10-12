@@ -7,7 +7,10 @@ from cache_growth import check_unchanged_retry, log_offset
 from tool_native import assert_native, cached
 
 
-def check_tool_choice_cache(client, model, checks, chat_result, server_log=None):
+def check_tool_choice_cache(client, model, checks, chat_result, server_log=None,
+                            checkpoint_tail=0):
+    """`checkpoint_tail`: prompt tokens an exact replay may prefill again
+    (CHECKPOINT_TAIL_TOKENS)."""
     from messages_count_tokens import assert_count_response
     function = {
         "name": "read", "description": "Read a file.",
@@ -76,15 +79,17 @@ def check_tool_choice_cache(client, model, checks, chat_result, server_log=None)
             assert done["text"].strip() == "DONE", done
 
         # An identical prompt under another tool choice must have identical
-        # token counts and reuse its completed prompt without any prefill. If
-        # the server logged that memory pressure refused the prompt copy, the
-        # retry may prefill the final user turn and its assistant opening.
+        # token counts and reuse its completed prompt without any prefill,
+        # except the model's mandatory checkpoint tail. If the server logged
+        # that memory pressure refused the prompt copy, the retry may prefill
+        # the final user turn and its assistant opening.
         retry = record(label + "_retry", {**continued, "tool_choice": "auto"})
         assert retry["usage"]["prompt_tokens"] == done["usage"]["prompt_tokens"], retry
         prompt_tokens = retry["usage"]["prompt_tokens"]
         check_unchanged_retry(label + "_retry", retry, prompt_tokens - cached(retry["usage"]),
                               server_log, start, end,
-                              mutable_suffix_tokens=mutable_suffix_tokens)
+                              mutable_suffix_tokens=mutable_suffix_tokens,
+                              checkpoint_tail=checkpoint_tail)
 
     # Required calls remain mandatory even when the user asks for plain text.
     # The grammar must supply that guarantee without a system instruction.

@@ -1256,6 +1256,51 @@ void TestWarmChatCheckpointsStopAtTheStableBoundary() {
   dropped.Cancel();
 }
 
+/// Grid points keep at least a runner's checkpoint tail before the prompt
+/// end, without a per-model rule in the grid loop. Upstream (#445) plans no
+/// grid point within 128 tokens of the end for any model, which covers Ling's
+/// 9-token tail; a runner that asks for more than 128 gets it from the
+/// spacing pass over all cut points.
+void TestCheckpointsKeepAFullTail() {
+  class TailRunner final : public SnapshotRunner {
+  public:
+    TailRunner(std::shared_ptr<FakeStats> stats, std::size_t tail)
+        : SnapshotRunner(std::move(stats), 64, 256, 4096), tail_(tail) {}
+    TextRunnerDescriptor Descriptor() const override {
+      auto descriptor = SnapshotRunner::Descriptor();
+      descriptor.max_context = 32768;
+      descriptor.capabilities.min_checkpoint_tail_tokens = tail_;
+      return descriptor;
+    }
+
+  private:
+    std::size_t tail_;
+  };
+  const auto spans = [](std::size_t tail, std::size_t prompt_tokens) {
+    auto stats = std::make_shared<FakeStats>();
+    TextRunnerPool pool(std::make_shared<TailRunner>(stats, tail), 1);
+    auto request = pool.Acquire(std::vector<TextRunnerToken>(prompt_tokens, 1));
+    while (!request.prefill_complete())
+      (void)request.Prefill(32768);
+    request.Cancel();
+    return stats->prefill_spans;
+  };
+  // 4100 tokens: grid points 2048 and 4096; 4096 leaves four tokens.
+  for (const std::size_t tail : {std::size_t{0}, std::size_t{9}}) {
+    Expect(spans(tail, 4100) == std::vector<std::size_t>({2048, 2052}),
+           "a grid point that would leave a short tail is not planned");
+    Expect(spans(tail, 4105) == std::vector<std::size_t>({2048, 2057}),
+           "a grid point within 128 tokens of the end is not planned");
+    Expect(spans(tail, 4300) == std::vector<std::size_t>({2048, 2048, 204}),
+           "a grid point leaving more than 128 tokens is kept");
+  }
+  // A tail beyond the 128-token rule is enforced by the spacing pass.
+  Expect(spans(200, 4250) == std::vector<std::size_t>({2048, 2202}),
+         "a grid point closer to the end than the runner's tail is dropped");
+  Expect(spans(200, 4300) == std::vector<std::size_t>({2048, 2048, 204}),
+         "a grid point exactly a tail from the end is kept");
+}
+
 /// Every pair of consecutive cut points must be at least the runner's tail
 /// apart, not only the last one from the prompt end.
 void TestCutPointsKeepFullChunksApart() {
@@ -2774,8 +2819,46 @@ void TestBailingToolGrammar() {
          "an unrepresentable schema keeps the Bailing envelope");
 }
 
+// Chat and Responses carry images inside tool results (#506). A runner
+// without a vision encoder (Ling-3.0-flash, DeepSeek) prepares prompts through
+// TextModelRunner::PreparePrompt, which must refuse them as invalid input (a
+// 400 before any work) rather than render the tool result without its image.
+void TestTextOnlyRunnerRefusesToolResultImages() {
+  using gufo::tokenization::ChatMessage;
+  using gufo::tokenization::ChatRole;
+  FakeRunner runner(std::make_shared<FakeStats>());
+  ChatMessage call(ChatRole::kAssistant, "");
+  call.tool_calls.push_back(
+      {.id = "picture",
+       .name = "read_file",
+       .arguments = {{.name = "path", .value = "swatch.png"}}});
+  for (const bool image_only : {false, true}) {
+    ChatMessage result(ChatRole::kTool, image_only ? "" : "pixels:");
+    result.tool_call_id = "picture";
+    result.images.push_back(
+        {.offset = image_only ? 0U : 7U,
+         .bytes = std::make_shared<const std::vector<std::uint8_t>>(
+             std::vector<std::uint8_t>{1, 2, 3})});
+    ChatRequest request;
+    request.messages = {ChatMessage(ChatRole::kUser, "read the image"), call,
+                        result};
+    std::string error;
+    try {
+      (void)runner.PreparePrompt(request);
+    } catch (const std::invalid_argument& exception) {
+      error = exception.what();
+    }
+    Expect(error == "model does not support image input",
+           "a text-only runner refuses an image inside a tool result");
+    request.messages.back().images.clear();
+    Expect(runner.PreparePrompt(request).has_value(),
+           "the same tool result without its image is accepted");
+  }
+}
+
 }  // namespace
 
+// Every host-memory-derived budget (the RAM cache's automatic limit and its
 // ceiling) and the `effective_available_mib` log field come from
 // EffectiveHostAvailableBytes(), which a cgroup memory limit caps (the node's
 // MemAvailable is not what a limited pod may use).
@@ -2935,6 +3018,7 @@ int main() {
   TestPromptCountingValidatesCapabilitiesBeforeInference();
   TestServerInstructionsAreFraming();
   TestBailingToolGrammar();
+  TestTextOnlyRunnerRefusesToolResultImages();
   TestLingPromptCheckpointStopsBeforeReplacedFinalUserTurn();
   // The cache warning assertion in this binary matches the plain "[WARN]
   // [cache]" text captured from a redirected sink; a TTY stderr tints it.
@@ -2952,6 +3036,7 @@ int main() {
   TestWarmChatCheckpointsStopAtTheStableBoundary();
   TestWarmHitAdvancesTheStableCheckpoint();
   TestHistoryEditsRestoreIntermediateCheckpoints();
+  TestCheckpointsKeepAFullTail();
   TestCutPointsKeepFullChunksApart();
   TestLearnedBoundaryIsRetainedInRamBesideDisk();
   TestChatFallbackSurvivesSnapshotBudgetPressure();

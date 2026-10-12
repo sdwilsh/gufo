@@ -27,7 +27,8 @@ def refusal(reason="byte_capacity", tokens=PROMPT):
 
 
 class ToolChoiceRetryTest(unittest.TestCase):
-    def run_case(self, retry_cached, *, suffix=23, first_log="", continued="", retry_log="", with_log=True):
+    def run_case(self, retry_cached, *, suffix=23, first_log="", continued="", retry_log="", with_log=True,
+                 tail=0):
         call = {"id": "c1", "function": {"name": "read", "arguments": '{"path":"fixture.txt"}'}}
         first = result("tool_calls", "", [call], prompt=100)
         replies = [first, result(cached=105), result(cached=retry_cached)]
@@ -50,13 +51,21 @@ class ToolChoiceRetryTest(unittest.TestCase):
                     contextlib.redirect_stderr(io.StringIO()):
                 try:
                     tool_choice.check_tool_choice_cache(
-                        client, "fixture", {}, chat, log if with_log else None)
+                        client, "fixture", {}, chat, log if with_log else None,
+                        checkpoint_tail=tail)
                 except CaseChecked:
                     return
         self.fail("unexpected completion")
 
     def test_full_replay_needs_no_log(self):
         self.run_case(PROMPT, with_log=False)
+
+    def test_checkpoint_tail_needs_no_log(self):
+        self.run_case(PROMPT - 9, with_log=False, tail=9)
+
+    def test_prefill_beyond_the_checkpoint_tail_needs_a_refusal(self):
+        with self.assertRaises(AssertionError):
+            self.run_case(PROMPT - 10, with_log=False, tail=9)
 
     def test_suffix_requires_the_continued_requests_refusal(self):
         for reason in ("byte_capacity", "entry_capacity"):

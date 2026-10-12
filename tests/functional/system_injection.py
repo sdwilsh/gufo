@@ -2,8 +2,14 @@
 
 Qwen3.8's template accepts one leading system turn, so Qwen hoists later
 system/developer messages into it and the injection turn is prefilled again;
-DeepSeek renders them in place. Injection-turn reuse is therefore recorded, not
-required. The message then stays put, so the following turn must reuse it all.
+DeepSeek and Ling render them in place. Injection-turn reuse is therefore recorded, not
+required, except for Ling (`injection_reuse`) when the injection follows the
+served prompt: its prompt-cache checkpoint (LingCacheBoundary) lies before the
+generation prompt, so the injection turn re-prefills only that tail. The
+before-last-user shape rewrites the final user turn, which follows an assistant
+reply and so is not a replaceable turn (#407); every checkpoint of the served
+prompt lies inside that turn, so its reuse is recorded for Ling as well. The
+message then stays put, so the following turn must reuse it all.
 """
 
 from copy import deepcopy
@@ -25,9 +31,13 @@ def history(label):
 REMINDER = ("Reminder: the status word changed. From now on, whenever the user "
             "asks for the status word, reply with only BETA.")
 QUESTION = "Reply with only the status word."
+# Prompt tokens a Ling injection turn may prefill beyond the new messages: the
+# previous generation prompt and the 9-token tail the checkpoint keeps clear of
+# the prompt end.
+LING_REUSE_SLACK = 64
 
 
-def check_system_injection(client, model, checks, chat_result):
+def check_system_injection(client, model, checks, chat_result, injection_reuse=False):
     failures = []
 
     def record(name, result):
@@ -50,13 +60,13 @@ def check_system_injection(client, model, checks, chat_result):
         assert reused + prefilled == total, usage
         return total, reused, prefilled
 
-    def evidence(label, previous_total, work, required):
+    def evidence(label, previous_total, work, required, slack=0):
         total, reused, prefilled = work
         checks[label + "_evidence"] = {
             "previous_prompt_tokens": previous_total, "prompt_tokens": total,
             "cached_tokens": reused, "prefill_tokens": prefilled,
-            "full_reuse_required": required}
-        if required and reused < previous_total:
+            "full_reuse_required": required, "reuse_slack": slack}
+        if required and reused < previous_total - slack:
             failures.append(f"{label}: earlier prompt was not reused: "
                             f"{checks[label + '_evidence']}")
 
@@ -77,7 +87,8 @@ def check_system_injection(client, model, checks, chat_result):
             {"role": "user", "content": QUESTION},
         ]
         warm = record(label + "_injected", chat_result(client, injected))
-        evidence(label + "_injected", first_total, chat_work(warm), required=False)
+        evidence(label + "_injected", first_total, chat_work(warm),
+                 required=injection_reuse, slack=LING_REUSE_SLACK)
         control_request = deepcopy(injected)
         control_request["extra_body"]["cache_prompt"] = False
         control = record(label + "_cold_control", chat_result(client, control_request))
@@ -94,7 +105,10 @@ def check_system_injection(client, model, checks, chat_result):
         assert later["text"].strip() == "BETA", later
 
     # The exact #339 shape: a reminder inserted before the latest user turn of
-    # an already-served request.
+    # an already-served request. The request diverges where that turn begins,
+    # before the served prompt's stable checkpoint (its final user message, set
+    # back by the 9-token tail), so Ling, which cannot rewind recurrent state,
+    # prefills it again.
     label = "system_injection_chat_before_last_user"
     request = dict(model=model, messages=history(label), temperature=0, seed=37,
                    max_completion_tokens=16, extra_body={
@@ -123,7 +137,7 @@ def check_system_injection(client, model, checks, chat_result):
     warm = client.responses.create(**injected)
     record(label + "_injected", warm.to_dict())
     evidence(label + "_injected", response_work(first)[0], response_work(warm),
-             required=False)
+             required=injection_reuse, slack=LING_REUSE_SLACK)
     assert warm.status == "completed" and warm.output_text.strip() == "BETA", warm
     followup = {**injected, "input": [*injected["input"], *warm.output,
                                       {"role": "user", "content": QUESTION}]}

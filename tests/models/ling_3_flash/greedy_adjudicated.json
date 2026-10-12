@@ -1,0 +1,8 @@
+{
+  "comment": "Greedy divergences from the llama.cpp oracle that the F64 CPU reference confirmed (logit_dump --adjudicated). position is the index of the generated token; token is the one gufo emits there; reference_gap is the reference's logit/log-prob gap between the two candidates (nats).",
+  "entries": [
+    {"text": "memorised", "prompt": "story", "position": 26, "token": 464, "reference_gap": 0.5434, "source": "F64 CPU reference (ws20 f64 study)"},
+    {"text": "memorised", "prompt": "story", "position": 49, "token": 50048, "reference_gap": 0.165, "source": "F32 CPU reference: token 50048 -0.771 vs 11028 -0.936"},
+    {"text": "novel", "prompt": "story", "position": 22, "token": 116327, "reference_gap": 0.0449, "source": "F64 CPU reference: 116327 -1.5980 vs 36229 -1.6429"}
+  ]
+}

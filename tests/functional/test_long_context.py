@@ -28,7 +28,8 @@ def refusal(reason="byte_capacity", tokens=3143):
 
 
 class LongContextRetryTest(unittest.TestCase):
-    def run_replay(self, replay, *, before="", cold="", during_replay="", with_log=True):
+    def run_replay(self, replay, *, before="", cold="", during_replay="", with_log=True,
+                   tail=0):
         checks = {}
         client = SimpleNamespace(responses=SimpleNamespace(create=Mock(side_effect=ReplayChecked)))
         with tempfile.TemporaryDirectory() as directory:
@@ -44,7 +45,8 @@ class LongContextRetryTest(unittest.TestCase):
                     contextlib.redirect_stderr(io.StringIO()):
                 try:
                     openai_sdk.check_long_context(
-                        client, "fixture", checks, 8192, server_log=log if with_log else None)
+                        client, "fixture", checks, 8192, server_log=log if with_log else None,
+                        checkpoint_tail=tail)
                 except ReplayChecked:
                     self.assertEqual(send.call_count, 2)
                     self.assertEqual(send.call_args_list[0].args[1],
@@ -55,6 +57,13 @@ class LongContextRetryTest(unittest.TestCase):
 
     def test_full_replay_needs_no_capacity_exception(self):
         self.run_replay(response(3143, 0), with_log=False)
+
+    def test_checkpoint_tail_needs_no_capacity_exception(self):
+        self.run_replay(response(3134, 9), with_log=False, tail=9)
+
+    def test_prefill_beyond_the_checkpoint_tail_needs_a_refusal(self):
+        with self.assertRaises(AssertionError):
+            self.run_replay(response(3133, 10), with_log=False, tail=9)
 
     def test_framing_suffix_requires_the_previous_requests_capacity_refusal(self):
         for reason in ("byte_capacity", "entry_capacity"):

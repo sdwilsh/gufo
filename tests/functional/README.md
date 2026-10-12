@@ -266,7 +266,7 @@ RAM, disk and restart settings once their contracts pass.
 | `cache-transforms` | Clear an old tool result, remove a few hundred late user tokens, or retry/edit after a 10K+ result; restore coherent pre-edit boundaries and compare uncached answers. Requires context ≥ 32768. Not in `all` |
 | `cache-pressure` | Fill the RAM budget, compact an abandoned history, resume idle conversations, send volatile headers/UI tasks, then fan out children and resume their parent. Requires a small explicit RAM budget. Not in `all` |
 | `cache-messages-loop` | Twelve streamed `/v1/messages` tool-call/result cycles with actual calls and growing history; each request checks reuse and has an uncached Chat control. Requires context ≥ 16384. Not in `all` |
-| `system-injection` | System/developer messages after the conversation start, in Chat and Responses: accepted, followed by the model and equal to uncached responses; the hoisted turn's reuse is recorded and the next turn must reuse it in full |
+| `system-injection` | System/developer messages after the conversation start, in Chat and Responses: accepted, followed by the model and equal to uncached responses; the hoisted turn's reuse is recorded (required for Ling up to a 64-token tail, except when the injection precedes the final user turn) and the next turn must reuse it in full |
 | `cache-concurrency` | Concurrent identical prompts, shared-system fan-out with short and long tasks, short or no shared prefixes, a retained conversation beside a newcomer, and a cancelled leader; check waits, prefill work and uncached answers |
 
 For `discovery` (also included in `all`), pass `--expected-input-modalities text` or `text,image` before
@@ -325,6 +325,26 @@ Cancellation fixtures that stop after a fixed number of deltas can therefore
 replay different assistant text from main. Compare those timings using matched
 interrupted histories, not a direct baseline for the divergent session; this
 also applies to later disk-spacing and cancellation requests in that history.
+
+Ling-3.0-flash writes its own `<tool_call>` syntax, which the tool grammar
+steers like the other native formats, beside a response schema too. The `ling3`
+preset accounts for its cache policy. It retains no prompt shorter than 128
+tokens, so cases that assert a hit add a neutral system context
+(`MIN_RETAINED_PROMPT_TOKENS`). Each checkpoint holds about 76 MiB of fixed
+state, so a full run with a few-GiB `--cache-ram-bytes` reaches memory pressure;
+an exact replay may then restore the stable boundary, 9 tokens before the prompt
+end (`CHECKPOINT_TAIL_TOKENS`), and a failed `cache-edits` edit lists the
+checkpoints the budget refused. `tool-reasoning` records whether Ling quoted
+the opener in its reasoning, made a native call where the system prompt hands
+it another dialect's envelope, and wrote the single-newline stray-backtick
+shape before its call, rather than requiring them. The envelope stays framing
+and never becomes a call. Its end-to-end
+check is `ling_agent.py` (stdlib only): streaming requests shaped like Hermes
+Agent (`reasoning_effort`, no sampler values, canonical sorted-key arguments,
+no reasoning echo) plus an echo variant, typed/parallel calls, `tool_choice`,
+reasoning split and the model's raw byte layout. In a pod,
+`tools/models/ling_3_flash/serve_functional.py` starts `gufo serve` and runs it
+(`--sampling llamacpp` selects llama.cpp's defaults as explicit server flags).
 
 For real coding-agent regressions, run `pi_agent.py` against a local server with
 `--base-url`, `--model`, `--pi /path/to/pi-0.87.0`, `--server-log`, and a fresh
