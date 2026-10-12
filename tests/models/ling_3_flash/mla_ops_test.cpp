@@ -21,6 +21,7 @@
 #include "src/core/runtime_environment.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/kernels.hpp"
 #include "src/models/ling_3_flash/layout.hpp"
+#include "tests/models/ling_3_flash/parent_digests.hpp"
 
 namespace L = gufo::models::ling_3_flash;
 namespace mla = gufo::models::ling_3_flash::rocm::mla;
@@ -671,6 +672,51 @@ void TestNonAbsorbedInvariance() {
   }
 }
 
+std::uint64_t Fnv(const void* p, std::size_t bytes) {
+  std::uint64_t h = 1469598103934665603ULL;
+  const auto* b = static_cast<const std::uint8_t*>(p);
+  for (std::size_t i = 0; i < bytes; ++i)
+    h = (h ^ b[i]) * 1099511628211ULL;
+  return h;
+}
+
+// Output bits of the non-absorbed prefill against the parent kernels (golden
+// digests): chunks of 9..130 tokens (partially live query waves), from first
+// positions on and across 2048-key block edges, with the keys in the
+// persistent store, in the transient buffer, or split between them.
+void TestNonAbsorbedParentDigest() {
+  NaWeights w(91);
+  for (const auto& c : parent_digests::kMlaPrefill) {
+    if (c.n == 0)
+      break;
+    const std::uint32_t total = c.first + c.n;
+    const std::vector<__half> cache = MakeCache(total, 301 + total);
+    const std::vector<float> q =
+        Normal(std::size_t{c.n} * kH * kQH, 302 + c.n, 1.7F);
+    const std::vector<float> gate = Normal(std::size_t{c.n} * kH, 303, 1.5F);
+    Dev<__half> d_cache(cache);
+    Dev<float> d_q(q);
+    Dev<float> d_gate(gate);
+    Dev<float> d_qr(std::size_t{c.n} * kH * kQH);
+    Dev<float> d_out(std::size_t{c.n} * kH * kV);
+    Dev<std::uint8_t> d_scratch(mla::NonAbsorbedScratchBytes(c.n));
+    Dev<__half> store(
+        c.store_rows == 0 ? 1 : mla::ExpandedLayerBytes(c.store_rows) / 2);
+    const auto got =
+        RunNa(w, d_cache.get(), c.first, c.n, d_scratch, d_qr, d_out, d_q.get(),
+              d_gate.get(), store.get(), c.store_rows);
+    const auto digest = static_cast<unsigned long long>(
+        Fnv(got.data(), got.size() * sizeof(float)));
+    const bool ok = digest == c.digest;
+    std::printf(
+        "%-4s NonAbsorbed == parent digest first=%u n=%u store=%u "
+        "(%016llx)\n",
+        ok ? "PASS" : "FAIL", c.first, c.n, c.store_rows, digest);
+    if (!ok)
+      ++g_failures;
+  }
+}
+
 void TestVbUpProjGate() {
   const Q8Weights vb = MakeQ8(kV, kLat, 51, 0.05F);
   Dev<std::uint8_t> d_vb(vb.bytes);
@@ -891,6 +937,7 @@ int main() {
     TestDecode();
     TestNonAbsorbedPrefill();
     TestNonAbsorbedInvariance();
+    TestNonAbsorbedParentDigest();
     TestLayerCoreVsNonAbsorbed();
   } catch (const std::exception& e) {
     std::cerr << "error: " << e.what() << "\n";

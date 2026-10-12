@@ -676,9 +676,12 @@ __global__ void QPrepKernel(const float* __restrict__ q,
 // zeros. Output index of key k is idx = k - obase (obase a multiple of 16),
 // written only when idx < out_rows:
 //   K mode: out[(h * out_rows + idx) * 128 + d]            (F16)
-//   V mode: out[(h * 128 + e) * out_rows + slot(idx)], keys permuted inside
-//           each 16-key group so slot j holds key 2j and slot 8 + j key 2j + 1
-//           (the attention builds its P fragments in that slot order).
+//   V mode: out[((h * out_rows / 16 + idx / 16) * 128 + e) * 16 + slot(idx)]:
+//           V^T in 16-key tiles, each tile's 128 x 16 values contiguous (one
+//           4 KiB read per attention tile instead of 128 strided 32-byte
+//           pieces), keys permuted inside the tile so slot j holds key 2j and
+//           slot 8 + j key 2j + 1 (the attention builds its P fragments in
+//           that slot order).
 // blockIdx.z selects a transient slot: its keys start kExpKeys later and its
 // output moves by `slot_stride` halves.
 constexpr std::uint32_t kExpChunk = 64;
@@ -780,11 +783,13 @@ __launch_bounds__(256) __global__
         if constexpr (kVMode) {
           const std::uint32_t e = wm + (mi * 16) + row;
           const std::uint32_t idx = idx0 + wn + (ni * 16) + sub;
-          const std::uint32_t slot =
-              (idx & ~15U) | ((idx & 1U) << 3) | ((idx & 15U) >> 1U);
+          const std::uint32_t slot = ((idx & 1U) << 3) | ((idx & 15U) >> 1U);
           if (idx < out_rows) {
-            out[((std::size_t{h} * kMlaValueDim + e) * out_rows) + slot] =
-                value;
+            out[((((std::size_t{h} * (out_rows / kNaTile)) + (idx / kNaTile)) *
+                  kMlaValueDim) +
+                 e) *
+                    kNaTile +
+                slot] = value;
           }
         } else {
           const std::uint32_t idx = idx0 + wm + (mi * 16) + row;
@@ -947,11 +952,12 @@ __launch_bounds__(128) __global__ void NaAttentionKernel(
       r.k[j] = *reinterpret_cast<const uint4*>(
           kx + ((std::size_t{h} * rows + (kb - origin) + key) * kNope) +
           (c8 * 8));
-      const std::uint32_t e = idx / (kNaTile / 8);
-      const std::uint32_t v8 = idx % (kNaTile / 8);
+      // The tile's V^T (128 x 16) is contiguous: unit idx = (e, half).
       r.v[j] = *reinterpret_cast<const uint4*>(
-          vt + ((std::size_t{h} * kMlaValueDim + e) * rows) + (kb - origin) +
-          (v8 * 8));
+          vt +
+          (((std::size_t{h} * (rows / kNaTile)) + ((kb - origin) / kNaTile)) *
+           (kMlaValueDim * kNaTile)) +
+          (idx * 8));
     }
     const std::uint32_t key = tid / (kRope / 8);
     const std::uint32_t c8 = tid % (kRope / 8);
@@ -1054,7 +1060,10 @@ __launch_bounds__(128) __global__ void NaAttentionKernel(
         pf.u[4 + j] = half_id == 0U ? other : own[j];
       }
       const std::uint32_t valid = last_key > kb ? min(last_key - kb, 16U) : 0U;
-      const bool any_special = __any(valid != 16U);  // empty or partial
+      // Empty or partial for some query that is written out; the lanes of
+      // rows past the chunk end (valid 0) are never stored, and a WMMA output
+      // column depends only on its own P column, so they do not take part.
+      const bool any_special = __any(live && valid != 16U);
 #pragma unroll
       for (std::uint32_t t = 0; t < 8; ++t) {
         const v16h vf = LoadFrag(&v_lds[(((t * 16) + sub) * kNaVStride)]);
