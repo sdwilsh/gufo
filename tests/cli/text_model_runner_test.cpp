@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/logging.hpp"
 #include "src/core/json.hpp"
 #include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
@@ -2388,12 +2389,51 @@ void TestServerInstructionsAreFraming() {
 
 }  // namespace
 
+void TestHostBudgetsAreCgroupAware() {
+  std::uint64_t node_kib = 0;
+  {
+    std::ifstream meminfo("/proc/meminfo");
+    for (std::string line; std::getline(meminfo, line);) {
+      if (line.starts_with("MemAvailable:")) {
+        std::istringstream fields(line.substr(13));
+        fields >> node_kib;
+        break;
+      }
+    }
+  }
+  const auto effective = gufo::server::EffectiveHostAvailableBytes();
+  Expect(effective > 0, "effective host memory is positive");
+  // MemAvailable moves between the two reads; allow a little drift.
+  Expect(effective <= node_kib * 1024 + (std::uint64_t{256} << 20),
+         "effective host memory never exceeds the node's MemAvailable");
+  std::ifstream membership("/proc/self/cgroup");
+  for (std::string line; std::getline(membership, line);) {
+    if (!line.starts_with("0::/"))
+      continue;
+    std::ifstream limit_file(std::filesystem::path("/sys/fs/cgroup") /
+                             line.substr(4) / "memory.max");
+    std::uint64_t limit = 0;
+    if (limit_file >> limit) {
+      std::cerr << "cgroup memory.max=" << limit << " effective=" << effective
+                << " node=" << node_kib * 1024 << '\n';
+      Expect(effective <= limit,
+             "effective host memory is capped by the cgroup limit");
+    }
+    break;
+  }
+  const auto budget = gufo::server::HostSnapshotBudgetBytes();
+  Expect(budget <= effective &&
+             gufo::server::HostSnapshotCeilingBytes() <= effective + 1,
+         "snapshot budgets derive from the effective value");
+}
+
 int main() {
   TestPromptCountingValidatesCapabilitiesBeforeInference();
   TestServerInstructionsAreFraming();
   // The cache warning assertion in this binary matches the plain "[WARN]
   // [cache]" text captured from a redirected sink; a TTY stderr tints it.
   ::setenv("NO_COLOR", "1", 1);
+  TestHostBudgetsAreCgroupAware();
   TestInPassStableCheckpoint();
   TestInPassFailureRetainsOnlyCompletedCheckpoints();
   TestNewImageGetsAStableCheckpoint();
