@@ -449,7 +449,11 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
   // ---- teacher passes ----
   struct Pass {
     explicit Pass(const char* n)
-        : name(n), dump({}, {"h_out", "router_ids", "mixer_out", "h_mid"}) {}
+        : name(n),
+          dump({}, {"h_out", "router_ids", "mixer_out", "h_mid", "ffn_out",
+                    "ffn_routed", "ffn_shared", "ffn_in", "ffn_gate", "ffn_up",
+                    "ffn_act", "mla_q", "mla_kva", "mla_kv", "mla_qabs",
+                    "mla_lat", "mla_vb"}) {}
     const char* name;
     std::vector<Metric> metrics;
     std::vector<json::Value> comps;
@@ -457,14 +461,49 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
   };
   Pass prefill("teacher_prefill");
   Pass decode("teacher_decode");
-  for (Pass* pass : {&prefill, &decode}) {
+  // Two prefill chunks (state carried, positions > 0, partial tiles).
+  Pass split("teacher_prefill_split");
+  // Chunks of 5 tokens (small-batch kernels) for a bitwise diff against the
+  // token-by-token pass on identical inputs.
+  Pass chunk5("teacher_chunks_of_5");
+  const auto split_at = static_cast<std::uint32_t>(std::clamp<double>(
+      args.Num("--split", static_cast<double>(n * 2 / 5)), 1.0, n - 1.0));
+  for (Pass* pass : {&prefill, &decode, &split, &chunk5}) {
     session->Reset();
     const bool one_by_one = pass == &decode;
     for (std::uint32_t k = 0; k < layers; ++k) {
       const std::uint32_t il = first + k;
       std::vector<float> out(want);
       const double t0 = Now();
-      if (!one_by_one) {
+      if (pass == &chunk5) {
+        for (std::uint32_t t = 0; t < n; t += 5) {
+          const std::uint32_t len = std::min<std::uint32_t>(5, n - t);
+          std::span<const float> in(
+              inputs[k].data() + std::size_t{t} * l3::kHidden,
+              std::size_t{len} * l3::kHidden);
+          std::span<float> o(out.data() + std::size_t{t} * l3::kHidden,
+                             std::size_t{len} * l3::kHidden);
+          if (!session->RunBlock(il, t, in, o, &pass->dump, &error)) {
+            report.Set("status", "error");
+            report.Set("error", std::string(pass->name) + " layer " +
+                                    std::to_string(il) + ": " + error);
+            return 1;
+          }
+        }
+      } else if (pass == &split) {
+        const std::size_t cut = std::size_t{split_at} * l3::kHidden;
+        std::span<const float> in_all(inputs[k]);
+        std::span<float> out_all(out);
+        if (!session->RunBlock(il, 0, in_all.first(cut), out_all.first(cut),
+                               &pass->dump, &error) ||
+            !session->RunBlock(il, split_at, in_all.subspan(cut),
+                               out_all.subspan(cut), &pass->dump, &error)) {
+          report.Set("status", "error");
+          report.Set("error", std::string(pass->name) + " layer " +
+                                  std::to_string(il) + ": " + error);
+          return 1;
+        }
+      } else if (!one_by_one) {
         if (!session->RunBlock(il, 0, inputs[k], out, &pass->dump, &error)) {
           report.Set("status", "error");
           report.Set("error", std::string(pass->name) + " layer " +
@@ -514,20 +553,11 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
         // (h_out - h_mid: dense, or routed experts plus shared expert).
         auto c = json::Value::object();
         std::vector<float> rm;
-        std::vector<float> rh;
         const int layer = static_cast<int>(il);
         if (!self_mode &&
-            ReadF32Dump(LayerFile(ref_dir, "mixer_out", layer), &rm) &&
-            ReadF32Dump(LayerFile(ref_dir, "h_mid", layer), &rh)) {
+            ReadF32Dump(LayerFile(ref_dir, "mixer_out", layer), &rm)) {
           rm.resize(want);
-          rh.resize(want);
           const auto gm = pass->dump.Get("mixer_out", layer);
-          const auto gh = pass->dump.Get("h_mid", layer);
-          std::vector<float> gf(want), rf(want);
-          for (std::size_t i = 0; i < want; ++i) {
-            gf[i] = out[i] - gh[i];
-            rf[i] = expected[k][i] - rh[i];
-          }
           const auto last = [&](std::span<const float> a,
                                 std::span<const float> b) {
             return RelL2(
@@ -536,8 +566,22 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
           };
           c["mixer"] = ToJson(Compare(gm, rm));
           c["mixer_last_token"] = Round(last(gm, rm), 4);
-          c["ffn"] = ToJson(Compare(gf, rf, flipped));
-          c["ffn_last_token"] = Round(last(gf, rf), 4);
+          // The FFN contribution is compared directly, without residual-stream
+          // cancellation: the total, and routed and shared where dumped.
+          for (const char* name : {"ffn_out", "ffn_routed", "ffn_shared",
+                                   "ffn_in", "ffn_gate", "ffn_up", "ffn_act"}) {
+            std::vector<float> rf;
+            const auto gf = pass->dump.Get(name, layer);
+            if (!gf.empty() &&
+                ReadF32Dump(LayerFile(ref_dir, name, layer), &rf)) {
+              rf.resize(want);
+              const std::string key =
+                  std::string(name) == "ffn_out" ? "ffn" : name;
+              c[key] = ToJson(Compare(gf, rf, flipped));
+              if (key == "ffn")
+                c["ffn_last_token"] = Round(last(gf, rf), 4);
+            }
+          }
           c["h_out_last_token"] = Round(last(out, expected[k]), 4);
           c["last_token_routing_flipped"] = !flipped.empty() && flipped[n - 1];
         }
@@ -560,6 +604,8 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
   auto rows = json::Value::array();
   double worst_prefill = 0.0;
   double worst_decode = 0.0;
+  double worst_split = 0.0;
+  int worst_split_layer = -1;
   double worst_free = 0.0;
   int worst_prefill_layer = -1;
   int worst_decode_layer = -1;
@@ -573,6 +619,12 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
     row["teacher_decode"] = ToJson(decode.metrics[k]);
     row["components_prefill"] = prefill.comps[k];
     row["components_decode"] = decode.comps[k];
+    row["teacher_prefill_split"] = ToJson(split.metrics[k]);
+    row["components_prefill_split"] = split.comps[k];
+    if (split.metrics[k].rel >= worst_split) {
+      worst_split = split.metrics[k].rel;
+      worst_split_layer = static_cast<int>(il);
+    }
     if (prefill.metrics[k].rel >= worst_prefill) {
       worst_prefill = prefill.metrics[k].rel;
       worst_prefill_layer = static_cast<int>(il);
@@ -623,6 +675,9 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
   summary["teacher_prefill_worst_layer"] = worst_prefill_layer;
   summary["teacher_decode_worst_rel_l2"] = Round(worst_decode);
   summary["teacher_decode_worst_layer"] = worst_decode_layer;
+  summary["teacher_prefill_split_worst_rel_l2"] = Round(worst_split);
+  summary["teacher_prefill_split_worst_layer"] = worst_split_layer;
+  summary["split_at"] = U(split_at);
   if (!self_mode && free_run) {
     summary["free_running_worst_rel_l2"] = Round(worst_free);
   }
@@ -632,8 +687,8 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
   summary["gate_decode_lt"] = gate_decode;
   const bool finite =
       std::isfinite(worst_prefill) && std::isfinite(worst_decode);
-  const bool pass =
-      finite && worst_prefill < gate_prefill && worst_decode < gate_decode;
+  const bool pass = finite && worst_prefill < gate_prefill &&
+                    worst_decode < gate_decode && worst_split < gate_prefill;
   summary["gate_pass"] = pass;
   report.Set("summary", std::move(summary));
   report.Set("status", pass ? "pass" : "fail");

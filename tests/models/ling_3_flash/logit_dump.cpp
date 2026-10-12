@@ -126,7 +126,8 @@ private:
   std::vector<std::uint16_t> raw_;
 };
 
-/// log-softmax in double; returns the lowest index of the maximum.
+/// log-softmax in double (greedy log-prob comparison only, not the KL path);
+/// returns the lowest index of the maximum.
 std::int32_t LogSoftmax(std::span<const float> logits,
                         std::vector<double>* out) {
   out->resize(logits.size());
@@ -148,9 +149,64 @@ std::int32_t LogSoftmax(std::span<const float> logits,
   return best;
 }
 
+/// One scored position, exactly llama-perplexity's `log_softmax(n_vocab,
+/// logits, base_log_prob, tok, kld)` (tools/perplexity/perplexity.cpp,
+/// b11146): float32 per-term arithmetic, double accumulation, base log-prob
+/// `scale * code + min_log_prob`, no renormalisation, strict `> -16` filter,
+/// first argmax on both sides. `lp_base` is KlBase::Row()'s output.
+struct LlamaRow {
+  double kl;
+  float nll, nll_base, p_diff, lp_test_of_base_top1;
+  std::int32_t top_test, top_base;
+};
+
+LlamaRow LlamaKlRow(std::span<const float> logits,
+                    std::span<const float> lp_base, std::int32_t tok) {
+  float max_logit = logits[0];
+  std::int32_t imax = 0;
+  for (std::size_t i = 1; i < logits.size(); ++i) {
+    if (logits[i] > max_logit) {
+      max_logit = logits[i];
+      imax = static_cast<std::int32_t>(i);
+    }
+  }
+  double sum_exp = 0.0;
+  for (const float x : logits) {
+    sum_exp += expf(x - max_logit);
+  }
+  const float log_sum_exp = static_cast<float>(std::log(sum_exp));
+  const float nll = max_logit + log_sum_exp - logits[static_cast<size_t>(tok)];
+  const float nll_base = -lp_base[static_cast<size_t>(tok)];
+  max_logit += log_sum_exp;
+  double sum = 0.0;
+  std::int32_t imax_base = -1;
+  float p_log_base_max = 0.0F;
+  for (std::size_t i = 0; i < logits.size(); ++i) {
+    const float p_log_base = lp_base[i];
+    if (i == 0 || p_log_base > p_log_base_max) {
+      p_log_base_max = p_log_base;
+      imax_base = static_cast<std::int32_t>(i);
+    }
+    if (p_log_base > -16.0F) {
+      const float p_base = expf(p_log_base);
+      sum += p_base * (p_log_base - logits[i] + max_logit);
+    }
+  }
+  const float p_diff = expf(-nll) - expf(-nll_base);
+  return {sum,
+          nll,
+          nll_base,
+          p_diff,
+          logits[static_cast<std::size_t>(imax_base)] - max_logit,
+          imax,
+          imax_base};
+}
+
 struct KlRow {
   std::int32_t chunk, pos, top1_test, top1_base;
   double kl, lp_test_of_base_top1, nll_test, nll_base;
+  double nn, nbnb, nnb, p_diff2;  // llama's float products, kept as doubles
+  double p_diff;
 };
 
 double Percentile(std::vector<double> v, double q) {
@@ -164,33 +220,70 @@ double Percentile(std::vector<double> v, double q) {
   return v[lo] + (v[hi] - v[lo]) * (idx - static_cast<double>(lo));
 }
 
+/// llama-perplexity's mean_and_uncertainty.
+std::pair<double, double> MeanAndUncertainty(double sum, double sum2,
+                                             std::size_t count) {
+  if (count < 1) {
+    return {0.0, 0.0};
+  }
+  const double n = static_cast<double>(count);
+  const double f = sum / n;
+  double df = sum2 / n - f * f;
+  df = df > 0 && count > 10 ? std::sqrt(df / (n - 1)) : 0.0;
+  return {f, df};
+}
+
 json::Value KlSummary(const std::vector<KlRow>& rows, std::int32_t chunks_done,
                       const KlBase& base) {
   auto s = json::Value::object();
   std::vector<double> kl;
-  double sum = 0.0;
-  double nll_t = 0.0;
-  double nll_b = 0.0;
+  double sum = 0.0, sum2 = 0.0, nll_t = 0.0, nll_b = 0.0, nn = 0.0, nbnb = 0.0,
+         nnb = 0.0, pd = 0.0, pd2 = 0.0, pd4 = 0.0;
   std::size_t same = 0;
   for (const auto& r : rows) {
     kl.push_back(r.kl);
     sum += r.kl;
+    sum2 += r.kl * r.kl;
     nll_t += r.nll_test;
     nll_b += r.nll_base;
+    nn += r.nn;
+    nbnb += r.nbnb;
+    nnb += r.nnb;
+    pd += r.p_diff;
+    pd2 += r.p_diff2;
+    pd4 += r.p_diff2 * r.p_diff2;
     same += r.top1_test == r.top1_base ? 1 : 0;
   }
-  const double n = static_cast<double>(std::max<std::size_t>(rows.size(), 1));
-  const double mean = sum / n;
-  double var = 0.0;
-  for (const double k : kl) {
-    var += (k - mean) * (k - mean);
+  const std::size_t count = rows.size();
+  const double n = static_cast<double>(std::max<std::size_t>(count, 1));
+  const auto klm = MeanAndUncertainty(sum, sum2, count);
+  const double mean = klm.first;
+  const auto lp = MeanAndUncertainty(nll_t, nn, count);
+  const auto lpb = MeanAndUncertainty(nll_b, nbnb, count);
+  double cov = 0.0;
+  if (count >= 10) {
+    cov = (nnb / n - (nll_t / n) * (nll_b / n)) / (n - 1.0);
   }
+  const double top = static_cast<double>(same) / n;
+  const auto pdm = MeanAndUncertainty(pd2, pd4, count);
+  s["kl_mean_stderr_llama"] = Round(klm.second, 6);
+  s["top1_stderr"] =
+      Round(count > 1 ? std::sqrt(top * (1 - top) / (n - 1)) : 0.0, 5);
+  s["ppl_test"] = Round(std::exp(lp.first), 6);
+  s["ppl_base"] = Round(std::exp(lpb.first), 6);
+  s["ln_ppl_ratio"] = Round(lp.first - lpb.first, 6);
+  s["ln_ppl_ratio_stderr"] = Round(
+      std::sqrt(std::max(
+          lp.second * lp.second + lpb.second * lpb.second - 2.0 * cov, 0.0)),
+      6);
+  s["dp_mean"] = Round(MeanAndUncertainty(pd, pd2, count).first, 6);
+  s["dp_rms"] = Round(std::sqrt(pdm.first), 6);
   s["chunks_done"] = chunks_done;
   s["chunks_total"] = base.n_chunk;
   s["n_ctx"] = U(base.n_ctx);
   s["positions"] = rows.size();
   s["kl_mean"] = Round(mean, 6);
-  s["kl_mean_stderr"] = Round(std::sqrt(var / std::max(n - 1.0, 1.0) / n), 4);
+  s["kl_mean_stderr"] = Round(klm.second, 6);
   s["kl_median"] = Round(Percentile(kl, 0.5), 5);
   s["kl_p99"] = Round(Percentile(kl, 0.99), 5);
   s["kl_max"] =
@@ -239,7 +332,6 @@ bool RunKl(const Args& args, Report& report, l3::Model& model, KlBase& base) {
   std::vector<KlRow> rows;
   std::vector<float> logits;
   std::vector<float> lp_base;
-  std::vector<double> lp_test;
   for (std::int32_t c = 0; c < chunks; ++c) {
     const double t0 = Now();
     session->Reset();
@@ -270,28 +362,16 @@ bool RunKl(const Args& args, Report& report, l3::Model& model, KlBase& base) {
         report.Set("kl_error", "short read of the base file");
         return false;
       }
-      const std::int32_t top_test = LogSoftmax(row, &lp_test);
-      std::int32_t top_base = 0;
-      for (std::int32_t v = 1; v < base.n_vocab; ++v) {
-        if (lp_base[static_cast<std::size_t>(v)] >
-            lp_base[static_cast<std::size_t>(top_base)]) {
-          top_base = v;
-        }
-      }
-      double kl = 0.0;
-      for (std::int32_t v = 0; v < base.n_vocab; ++v) {
-        const double lb = lp_base[static_cast<std::size_t>(v)];
-        if (lb > -16.0) {
-          kl += std::exp(lb) * (lb - lp_test[static_cast<std::size_t>(v)]);
-        }
-      }
       const std::uint32_t pos = base.first + i;
       const std::int32_t target = tokens[pos + 1];
-      rows.push_back(
-          {c, static_cast<std::int32_t>(pos), top_test, top_base, kl,
-           lp_test[static_cast<std::size_t>(top_base)],
-           -lp_test[static_cast<std::size_t>(target)],
-           -static_cast<double>(lp_base[static_cast<std::size_t>(target)])});
+      const LlamaRow m = LlamaKlRow(row, lp_base, target);
+      rows.push_back({c, static_cast<std::int32_t>(pos), m.top_test, m.top_base,
+                      m.kl, m.lp_test_of_base_top1, m.nll, m.nll_base,
+                      static_cast<double>(m.nll * m.nll),
+                      static_cast<double>(m.nll_base * m.nll_base),
+                      static_cast<double>(m.nll * m.nll_base),
+                      static_cast<double>(m.p_diff * m.p_diff),
+                      static_cast<double>(m.p_diff)});
     }
     double sum = 0.0;
     for (const auto& r : rows) {
