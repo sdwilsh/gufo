@@ -13,6 +13,9 @@ if (ENGINE_ENABLE_HIP)
   # One translation unit per kernel group (kda, mla, moe, dense); each
   # workstream appends its own file here.
   set(LING_HIP_SOURCES)
+  # --- WS4a: kda ---
+  list(APPEND LING_HIP_SOURCES ${LING_ROCM_DIR}/kda.hip.cpp)
+  # --- end WS4a ---
   if (LING_HIP_SOURCES)
     target_sources(gufo_ling_3_flash PRIVATE ${LING_HIP_SOURCES})
     set_source_files_properties(${LING_HIP_SOURCES} PROPERTIES LANGUAGE HIP)
