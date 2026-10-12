@@ -41,3 +41,24 @@ if (ENGINE_ENABLE_HIP)
     SKIP_RETURN_CODE 77 TIMEOUT 600)
   # --- end WS4d ---
 endif()
+
+# Full-model checks. Built explicitly (target ling_3_flash_model_tests), never
+# by the default build. Each binary exits 77 without --model; the CTest entries
+# exist only when a model is named: -DGUFO_LING_MODEL=/path/first-shard.gguf.
+if (ENGINE_ENABLE_HIP)
+  set(LING_MODEL_BINARIES)
+  foreach(name IN ITEMS session_test logit_dump layer_check b2)
+    set(target ling_3_flash_${name})
+    add_executable(${target} EXCLUDE_FROM_ALL ${name}.cpp)
+    target_link_libraries(${target} PRIVATE gufo_ling_3_flash hip::host)
+    list(APPEND LING_MODEL_BINARIES ${target})
+    if (GUFO_LING_MODEL)
+      add_test(NAME ling_3_flash.model_${name}
+        COMMAND ${target} --model ${GUFO_LING_MODEL})
+      set_tests_properties(ling_3_flash.model_${name} PROPERTIES
+        LABELS "ling_3_flash;hip;gpu;gfx1151;model" SKIP_RETURN_CODE 77
+        TIMEOUT 3600)
+    endif()
+  endforeach()
+  add_custom_target(ling_3_flash_model_tests DEPENDS ${LING_MODEL_BINARIES})
+endif()

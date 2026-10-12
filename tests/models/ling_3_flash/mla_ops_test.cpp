@@ -460,6 +460,80 @@ void TestPrefill() {
   }
 }
 
+// Batch invariance: a token's attention output must not depend on how the
+// prompt was chunked or on whether it was computed by the prefill or the decode
+// kernel. Compared bit for bit over every split point and context length.
+std::size_t CountDiff(const float* a, const float* b, std::size_t n) {
+  std::size_t d = 0;
+  for (std::size_t i = 0; i < n; ++i)
+    d += std::memcmp(&a[i], &b[i], sizeof(float)) != 0;
+  return d;
+}
+
+void TestAttentionBatchInvariance() {
+  constexpr std::size_t kTok = kH * kLat;
+  for (const std::uint32_t total : {106U, 97U, 160U, 33U, 300U}) {
+    const std::vector<__half> cache = MakeCache(total, 91 + total);
+    const std::vector<float> q =
+        Normal(std::size_t{total} * kH * kW, 92 + total, 1.7F);
+    Dev<__half> d_cache(cache);
+    Dev<float> d_q(q);
+    Dev<float> d_one(std::size_t{total} * kTok);
+    Dev<float> d_two(std::size_t{total} * kTok);
+    mla::PrefillAttention(d_q.get(), d_cache.get(), 0, total, d_one.get(),
+                          nullptr, nullptr);
+    CheckHip(hipDeviceSynchronize(), "sync");
+    const auto one = d_one.Download();
+    std::size_t bad_splits = 0;
+    std::uint32_t first_bad = 0;
+    for (std::uint32_t s = 1; s < total; ++s) {
+      mla::PrefillAttention(d_q.get(), d_cache.get(), 0, s, d_two.get(),
+                            nullptr, nullptr);
+      mla::PrefillAttention(
+          d_q.get() + (std::size_t{s} * kH * kW), d_cache.get(), s, total - s,
+          d_two.get() + (std::size_t{s} * kTok), nullptr, nullptr);
+      CheckHip(hipDeviceSynchronize(), "sync");
+      const auto two = d_two.Download();
+      if (CountDiff(one.data(), two.data(), one.size()) != 0) {
+        if (bad_splits++ == 0)
+          first_bad = s;
+      }
+    }
+    std::printf("%-44s differing splits=%zu (first %u) %s\n",
+                ("Prefill split == single, N=" + std::to_string(total)).c_str(),
+                bad_splits, first_bad, bad_splits == 0 ? "PASS" : "FAIL");
+    g_failures += bad_splits == 0 ? 0 : 1;
+
+    // Decode of the last token of every context length vs prefill. Decode
+    // splits the key range in chunks of 256 and merges the partials, which
+    // reorders the sum, so the bits match only for a single split (<= 256).
+    Dev<std::uint8_t> d_scratch(mla::DecodeScratchBytes(total));
+    Dev<float> d_dec(kTok);
+    std::size_t bad_ctx = 0;
+    std::uint32_t first_ctx = 0;
+    for (std::uint32_t c = 1; c <= std::min(total, 256U); ++c) {
+      mla::PrefillAttention(d_q.get(), d_cache.get(), 0, c, d_two.get(),
+                            nullptr, nullptr);
+      mla::DecodeAttention(d_q.get() + (std::size_t{c - 1} * kH * kW),
+                           d_cache.get(), c, d_dec.get(), d_scratch.get(),
+                           nullptr);
+      CheckHip(hipDeviceSynchronize(), "sync");
+      const auto pre = d_two.Download();
+      const auto dec = d_dec.Download();
+      if (CountDiff(dec.data(), pre.data() + (std::size_t{c - 1} * kTok),
+                    kTok) != 0) {
+        if (bad_ctx++ == 0)
+          first_ctx = c;
+      }
+    }
+    std::printf(
+        "%-44s differing contexts=%zu (first %u) %s\n",
+        ("Decode == prefill last token, N=" + std::to_string(total)).c_str(),
+        bad_ctx, first_ctx, bad_ctx == 0 ? "PASS" : "FAIL");
+    g_failures += bad_ctx == 0 ? 0 : 1;
+  }
+}
+
 void TestVbUpProjGate() {
   const Q8Weights vb = MakeQ8(kV, kLat, 51, 0.05F);
   Dev<std::uint8_t> d_vb(vb.bytes);
@@ -655,6 +729,7 @@ int main() {
     TestVbUpProjGate();
     TestDecode();
     TestPrefill();
+    TestAttentionBatchInvariance();
     TestLayerCoreVsNonAbsorbed();
   } catch (const std::exception& e) {
     std::cerr << "error: " << e.what() << "\n";
