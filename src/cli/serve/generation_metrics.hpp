@@ -168,7 +168,9 @@ inline std::string GenerationLogDetails(
       << " plan=" << result.execution_plan
       << " draft_accepted=" << result.draft_accepted_tokens
       << " draft_proposed=" << result.draft_tokens
-      << " draft_rounds=" << result.draft_rounds;
+      << " draft_rounds=" << result.draft_rounds
+      << " draft_copied=" << result.draft_copied_tokens
+      << " draft_copied_accepted=" << result.draft_copied_accepted_tokens;
   if (result.draft_tokens > 0)
     out << " acceptance_pct="
         << 100.0 * result.draft_accepted_tokens / result.draft_tokens;

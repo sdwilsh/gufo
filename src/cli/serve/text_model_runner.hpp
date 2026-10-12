@@ -182,6 +182,9 @@ struct TextDecodeStep {
   std::size_t draft_rounds{0};
   std::size_t draft_tokens{0};
   std::size_t draft_accepted_tokens{0};
+  /// Of draft_tokens / draft_accepted_tokens, the prompt-lookup copies (Ling).
+  std::size_t draft_copied_tokens{0};
+  std::size_t draft_copied_accepted_tokens{0};
   bool stop{false};
   /// Execution actually used for this request, including model-owned subgroup
   /// dispatch. A runner's advertised maximum is not evidence of batching.

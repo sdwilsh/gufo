@@ -214,6 +214,10 @@ public:
     std::size_t draft_rounds{0};
     std::size_t draft_tokens{0};
     std::size_t draft_accepted_tokens{0};
+    /// Of draft_tokens / draft_accepted_tokens, the prompt-lookup copies
+    /// (Ling).
+    std::size_t draft_copied_tokens{0};
+    std::size_t draft_copied_accepted_tokens{0};
     std::size_t prefill_tokens{0};
     std::size_t prefill_chunks{0};
     std::size_t active_decode_prefill_chunks{0};

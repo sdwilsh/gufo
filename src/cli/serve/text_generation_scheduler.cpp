@@ -1373,6 +1373,9 @@ struct TextGenerationScheduler::Impl {
       request->result.draft_rounds += step.draft_rounds;
       request->result.draft_tokens += step.draft_tokens;
       request->result.draft_accepted_tokens += step.draft_accepted_tokens;
+      request->result.draft_copied_tokens += step.draft_copied_tokens;
+      request->result.draft_copied_accepted_tokens +=
+          step.draft_copied_accepted_tokens;
 
       CheckPreviewResult(request, step);
       for (const auto& selection : step.selections) {
@@ -1677,6 +1680,9 @@ struct TextGenerationScheduler::Impl {
       item.request->result.draft_rounds += step.draft_rounds;
       item.request->result.draft_tokens += step.draft_tokens;
       item.request->result.draft_accepted_tokens += step.draft_accepted_tokens;
+      item.request->result.draft_copied_tokens += step.draft_copied_tokens;
+      item.request->result.draft_copied_accepted_tokens +=
+          step.draft_copied_accepted_tokens;
 
       bool published = true;
       const auto publish_start = Clock::now();
