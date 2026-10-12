@@ -17,6 +17,7 @@ add_ling_3_flash_test(tokenizer gufo_ling_3_flash "cpu")
 target_compile_definitions(ling_3_flash_tokenizer_test PRIVATE
   GUFO_LING_VOCAB_GGUF="${LING_FIXTURES}/ling-vocab.gguf.fixture"
   GUFO_LING_TOKENIZER_GOLDENS="${LING_FIXTURES}/tokenizer_goldens.json")
+add_ling_3_flash_test(snapshot_format gufo_ling_3_flash "cpu")
 add_ling_3_flash_test(chat_template gufo_ling_3_flash "cpu")
 target_compile_definitions(ling_3_flash_chat_template_test PRIVATE
   GUFO_LING_VOCAB_GGUF="${LING_FIXTURES}/ling-vocab.gguf.fixture"
@@ -41,8 +42,8 @@ endif()
 # exist only when a model is named: -DGUFO_LING_MODEL=/path/first-shard.gguf.
 if (ENGINE_ENABLE_HIP)
   set(LING_MODEL_BINARIES)
-  foreach(name IN ITEMS session_test logit_dump layer_check b2 decode_digest
-                        handoff_study)
+  foreach(name IN ITEMS session_test snapshot_test logit_dump layer_check b2
+                       decode_digest handoff_study)
     set(target ling_3_flash_${name})
     add_executable(${target} EXCLUDE_FROM_ALL ${name}.cpp)
     target_link_libraries(${target} PRIVATE gufo_ling_3_flash hip::host)

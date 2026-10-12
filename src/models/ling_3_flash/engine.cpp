@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/device_model.hpp"
@@ -306,40 +308,109 @@ bool Session::Feed(std::span<const std::int32_t> tokens,
   return true;
 }
 
+std::size_t Session::SnapshotBytes() const noexcept {
+  return valid_ && !tokens_.empty() && !logits_.empty()
+             ? SnapshotPayloadBytes(static_cast<std::uint32_t>(tokens_.size()))
+             : 0;
+}
+
 std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
     std::string* error_msg) const {
-  if (!valid_) {
-    AssignError(error_msg, "session is invalid");
+  if (!valid_ || tokens_.empty() || logits_.size() != kVocab ||
+      tokens_.size() != session_->position()) {
+    AssignError(error_msg, "snapshot needs a valid, non-empty session");
     return nullptr;
   }
-  std::unique_ptr<SessionSnapshot> s(new SessionSnapshot());
-  s->recurrent_ = model_->executor_->SaveRecurrent(*session_, error_msg);
-  if (!s->recurrent_) {
+  const auto position = static_cast<std::uint32_t>(tokens_.size());
+  const SnapshotSections at = SnapshotLayout(position);
+  std::unique_ptr<SessionSnapshot> s(new SessionSnapshot(position, at.total));
+  std::uint8_t* base = s->data_.get();
+  const SnapshotHeader header{
+      .magic = {kSnapshotMagic[0], kSnapshotMagic[1], kSnapshotMagic[2],
+                kSnapshotMagic[3], kSnapshotMagic[4], kSnapshotMagic[5],
+                kSnapshotMagic[6], kSnapshotMagic[7]},
+      .version = kSnapshotPayloadVersion,
+      .header_bytes = static_cast<std::uint32_t>(kSnapshotHeaderBytes),
+      .vocab = kVocab,
+      .position = position,
+      .kda_layers = kKdaLayers,
+      .mla_layers = kMlaLayers,
+      .mla_width = kMlaCacheWidth,
+      .reserved = 0,
+      .kda_state_floats = kKdaStateFloats,
+      .kda_conv_floats = kKdaConvStateFloats,
+      .payload_bytes = at.total};
+  std::memcpy(base, &header, sizeof(header));
+  std::memcpy(base + at.tokens, tokens_.data(),
+              tokens_.size() * sizeof(std::int32_t));
+  std::memcpy(base + at.logits, logits_.data(), logits_.size() * sizeof(float));
+  if (!model_->executor_->SaveSnapshot(*session_, position,
+                                       {.kda_state = base + at.kda_state,
+                                        .kda_conv = base + at.kda_conv,
+                                        .mla = base + at.mla},
+                                       error_msg)) {
     return nullptr;
   }
-  s->tokens_ = tokens_;
-  s->logits_ = logits_;
   return s;
 }
 
 bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
                               std::string* error_msg) {
-  const auto& saved = snapshot.tokens_;
-  if (saved.size() > tokens_.size() ||
-      !std::equal(saved.begin(), saved.end(), tokens_.begin())) {
-    AssignError(error_msg,
-                "snapshot belongs to a different token history than this "
-                "session's cache");
+  return RestoreSnapshot(snapshot.bytes(), error_msg);
+}
+
+bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
+                              std::string* error_msg) {
+  SnapshotHeader h{};
+  if (payload.size() < sizeof(h)) {
+    AssignError(error_msg, "session snapshot is truncated");
     return false;
   }
-  if (!model_->executor_->RestoreRecurrent(*session_, *snapshot.recurrent_,
-                                           error_msg)) {
+  std::memcpy(&h, payload.data(), sizeof(h));
+  if (std::memcmp(h.magic, kSnapshotMagic.data(), kSnapshotMagic.size()) != 0 ||
+      h.version != kSnapshotPayloadVersion ||
+      h.header_bytes != kSnapshotHeaderBytes) {
+    AssignError(error_msg, "session snapshot format is not supported");
+    return false;
+  }
+  if (h.vocab != kVocab || h.kda_layers != kKdaLayers ||
+      h.mla_layers != kMlaLayers || h.mla_width != kMlaCacheWidth ||
+      h.kda_state_floats != kKdaStateFloats ||
+      h.kda_conv_floats != kKdaConvStateFloats || h.position == 0 ||
+      h.position > session_->capacity() ||
+      h.payload_bytes != SnapshotPayloadBytes(h.position) ||
+      payload.size() != h.payload_bytes) {
+    AssignError(error_msg, "session snapshot does not fit this session");
+    return false;
+  }
+  const SnapshotSections at = SnapshotLayout(h.position);
+  const std::uint8_t* base = payload.data();
+  std::vector<std::int32_t> tokens(h.position);
+  std::memcpy(tokens.data(), base + at.tokens,
+              tokens.size() * sizeof(std::int32_t));
+  std::vector<float> logits(kVocab);
+  std::memcpy(logits.data(), base + at.logits, logits.size() * sizeof(float));
+  // The payload may come from a disk file: refuse token ids outside the
+  // vocabulary and non-finite logits before the session is touched.
+  if (!std::ranges::all_of(tokens,
+                           [](std::int32_t t) {
+                             return t >= 0 &&
+                                    t < static_cast<std::int32_t>(kVocab);
+                           }) ||
+      !std::ranges::all_of(logits, [](float v) { return std::isfinite(v); })) {
+    AssignError(error_msg, "session snapshot holds invalid tokens or logits");
+    return false;
+  }
+  if (!model_->executor_->RestoreSnapshot(*session_, h.position,
+                                          {.kda_state = base + at.kda_state,
+                                           .kda_conv = base + at.kda_conv,
+                                           .mla = base + at.mla},
+                                          error_msg)) {
     valid_ = false;
     return false;
   }
-  session_->set_position(static_cast<std::uint32_t>(saved.size()));
-  tokens_ = saved;
-  logits_ = snapshot.logits_;
+  tokens_ = std::move(tokens);
+  logits_ = std::move(logits);
   valid_ = true;
   return true;
 }
@@ -365,12 +436,9 @@ bool Session::ReadMlaCache(std::uint32_t il, std::uint32_t rows,
 
 // ---- SessionSnapshot -------------------------------------------------------
 
-SessionSnapshot::SessionSnapshot() = default;
+SessionSnapshot::SessionSnapshot(std::uint32_t position, std::size_t size)
+    // Uninitialized: every byte is written by SaveSnapshot.
+    : data_(new std::uint8_t[size]), size_(size), position_(position) {}
 SessionSnapshot::~SessionSnapshot() = default;
-
-std::size_t SessionSnapshot::SizeBytes() const noexcept {
-  return SessionBytes(0).snapshot + tokens_.size() * sizeof(std::int32_t) +
-         logits_.size() * sizeof(float);
-}
 
 }  // namespace gufo::models::ling_3_flash
