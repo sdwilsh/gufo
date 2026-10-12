@@ -2823,7 +2823,8 @@ def main():
     )) as client:
         suites = {
             "messages-count-tokens": lambda: check_messages_count_tokens(
-                client, args.model, checks, args.context),
+                client, args.model, checks, args.context,
+                RETAINED_PROMPT_CONTEXT if min_retained else ""),
             "messages-image-counts": lambda: check_messages_image_counts(
                 client, args.model, checks, args.context, image_content,
                 args.expected_input_modalities.split(",")),

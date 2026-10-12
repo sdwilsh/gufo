@@ -7,6 +7,8 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -315,6 +317,48 @@ void TestTypedHistoricalArguments() {
   Expect(spaced.find(R"([{"oldText": "a", "newText": "b"}, 2])") !=
              std::string::npos,
          "typed arguments render in json.dumps spelling");
+}
+
+// Ling-3.0-flash reads text only. Messages admits images in user turns and
+// tool results (#510), Chat and Responses in tool results (#506): the
+// conversion itself must refuse any of them with the runner's capability
+// error (HTTP 400 invalid_prompt), never render the text without its image.
+void TestImagesAreRefused() {
+  namespace tok = gufo::tokenization;
+  tok::ChatMessage call(tok::ChatRole::kAssistant, "");
+  call.tool_calls.push_back(
+      {.id = "picture",
+       .name = "read_file",
+       .arguments = {{.name = "path", .value = "swatch.png"}}});
+  tok::ChatMessage result(tok::ChatRole::kTool, "pixels:");
+  result.tool_call_id = "picture";
+  const std::vector<tok::ChatMessage> plain{
+      {tok::ChatRole::kSystem, "Be brief."},
+      {tok::ChatRole::kUser, "look: what is it?"},
+      call,
+      result,
+      {tok::ChatRole::kUser, "which color?"}};
+  Expect(gufo::server::ToLingMessages(plain).size() == plain.size(),
+         "a text-only conversation converts");
+  for (const std::size_t index :
+       {std::size_t{1}, std::size_t{3}, std::size_t{4}}) {
+    for (const std::size_t offset : {std::size_t{0}, std::size_t{6}}) {
+      auto messages = plain;
+      messages[index].images.push_back(
+          {.offset = offset,
+           .bytes = std::make_shared<const std::vector<std::uint8_t>>(
+               std::vector<std::uint8_t>{1, 2, 3})});
+      std::string error;
+      try {
+        (void)gufo::server::ToLingMessages(messages);
+      } catch (const std::invalid_argument& exception) {
+        error = exception.what();
+      }
+      Expect(error == "model does not support image input",
+             "an image in message " + std::to_string(index) + " at offset " +
+                 std::to_string(offset) + " is refused, not dropped");
+    }
+  }
 }
 
 // Server-authored response_format framing (ChatMessage::framing_suffix) must
@@ -663,6 +707,8 @@ int main() {
   TestStableBoundaryPrecedesReplacedFinalUserTurn();
   TestCacheBoundaryMatchesFullRetokenization();
   TestFramingSuffix();
+  TestImagesAreRefused();
+  TestMidConversationSystemStaysInPlace();
   TestTypedHistoricalArguments();
   TestCloserInArgumentHistory();
   TestInjectedMarkup();
