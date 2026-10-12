@@ -1,0 +1,37 @@
+Break-even of Ling MTP on gfx1151 ([M] measured inputs, [E] estimated)
+AR step ms [M]: {0: 27.9, 16384: 28.95, 65536: 31.4}
+expert union per MoE layer for n tokens: {1: 8.0, 2: 13.2, 3: 17.6, 4: 21.7, 5: 25.4, 6: 29.0, 7: 32.3, 8: 35.5} (measured, CPU reference)
+
+depth    k  cycle ms [E]  tokens/ms AR   break-even acceptance (same at every depth)
+     0  1        38.0      35.8 t/s  0.36
+     0  2        47.0      35.8 t/s  0.47
+     0  3        55.5      35.8 t/s  0.54
+     0  4        63.9      35.8 t/s  0.60
+ 16384  1        40.1      34.5 t/s  0.38
+ 16384  2        50.0      34.5 t/s  0.49
+ 16384  3        59.6      34.5 t/s  0.56
+ 16384  4        68.9      34.5 t/s  0.62
+ 65536  1        45.5      31.8 t/s  0.45
+ 65536  2        58.4      31.8 t/s  0.55
+ 65536  3        70.9      31.8 t/s  0.62
+ 65536  4        83.2      31.8 t/s  0.68
+
+agent: measured conditional acceptance by depth [0.79, 0.46, 0.37, 0.18] (128 starts)
+  depth      0: k=1: 1.31x  k=2: 1.28x  k=3: 1.15x  k=4: 1.01x
+  depth  16384: k=1: 1.29x  k=2: 1.24x  k=3: 1.11x  k=4: 0.97x
+  depth  65536: k=1: 1.24x  k=2: 1.16x  k=3: 1.01x  k=4: 0.87x
+
+agent-think: measured conditional acceptance by depth [0.82, 0.55, 0.38, 0.45] (128 starts)
+  depth      0: k=1: 1.34x  k=2: 1.35x  k=3: 1.23x  k=4: 1.10x
+  depth  16384: k=1: 1.32x  k=2: 1.32x  k=3: 1.19x  k=4: 1.06x
+  depth  65536: k=1: 1.26x  k=2: 1.22x  k=3: 1.08x  k=4: 0.95x
+
+code: measured conditional acceptance by depth [0.96, 0.67, 0.52, 0.42] (128 starts)
+  depth      0: k=1: 1.44x  k=2: 1.55x  k=3: 1.48x  k=4: 1.34x
+  depth  16384: k=1: 1.42x  k=2: 1.51x  k=3: 1.43x  k=4: 1.29x
+  depth  65536: k=1: 1.35x  k=2: 1.40x  k=3: 1.30x  k=4: 1.16x
+
+prose: measured conditional acceptance by depth [0.66, 0.51, 0.23, 0.3] (128 starts)
+  depth      0: k=1: 1.22x  k=2: 1.19x  k=3: 1.04x  k=4: 0.92x
+  depth  16384: k=1: 1.20x  k=2: 1.16x  k=3: 1.01x  k=4: 0.88x
+  depth  65536: k=1: 1.15x  k=2: 1.08x  k=3: 0.92x  k=4: 0.79x

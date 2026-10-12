@@ -28,6 +28,10 @@ static_assert(std::endian::native == std::endian::little,
 ///             (the live F16 latent rows 0..position-1, packed: no capacity
 ///             padding, so a snapshot restores into a session of any context
 ///             size >= position)
+///   MTP only (header flag kSnapshotHasMtp in `reserved`; absent otherwise):
+///   MTP h     float  [kHidden]  output-normed trunk hidden of the last token
+///   MTP rows  uint16 [position - 1][kMlaCacheWidth]  MTP latent cache rows
+///             0..position-2 (row position-1 is written by the next forward)
 ///
 /// The WS12 expanded K/V cache is a pure function of the MLA rows and is never
 /// stored; restore invalidates it (rocm::Session::InvalidateDerived).
@@ -59,29 +63,38 @@ struct SnapshotHeader {
 inline constexpr std::size_t kSnapshotHeaderBytes = sizeof(SnapshotHeader);
 static_assert(kSnapshotHeaderBytes == 64);
 
+/// `SnapshotHeader::reserved` bit: the payload carries the MTP sections.
+inline constexpr std::uint32_t kSnapshotHasMtp = 1;
+
 struct SnapshotSections {
-  std::size_t tokens, logits, kda_state, kda_conv, mla, total;
+  std::size_t tokens, logits, kda_state, kda_conv, mla, mtp_h, mtp, total;
 };
 
 /// Byte offsets of the sections for `position` tokens.
 [[nodiscard]] constexpr SnapshotSections SnapshotLayout(
-    std::uint32_t position) noexcept {
+    std::uint32_t position, bool mtp = false) noexcept {
   SnapshotSections s{};
   s.tokens = kSnapshotHeaderBytes;
   s.logits = s.tokens + std::size_t{position} * sizeof(std::int32_t);
   s.kda_state = s.logits + std::size_t{kVocab} * sizeof(float);
   s.kda_conv = s.kda_state + kKdaLayers * kKdaStateFloats * sizeof(float);
   s.mla = s.kda_conv + kKdaLayers * kKdaConvStateFloats * sizeof(float);
-  s.total = s.mla + std::size_t{kMlaLayers} * position * kMlaCacheWidth *
-                        sizeof(std::uint16_t);
+  const std::size_t mla_end = s.mla + std::size_t{kMlaLayers} * position *
+                                          kMlaCacheWidth *
+                                          sizeof(std::uint16_t);
+  s.mtp_h = mla_end;
+  s.mtp = mla_end + (mtp ? kHidden * sizeof(float) : 0);
+  const std::size_t mtp_rows = position > 0 ? position - 1 : 0;
+  s.total =
+      s.mtp + (mtp ? mtp_rows * kMlaCacheWidth * sizeof(std::uint16_t) : 0);
   return s;
 }
 
 /// Exact payload size of a snapshot taken at `position`: about 75 MiB of
 /// recurrent state, 0.6 MiB of logits and 8068 bytes per token.
 [[nodiscard]] constexpr std::size_t SnapshotPayloadBytes(
-    std::uint32_t position) noexcept {
-  return SnapshotLayout(position).total;
+    std::uint32_t position, bool mtp = false) noexcept {
+  return SnapshotLayout(position, mtp).total;
 }
 
 /// Largest chunk of tokens of the small-batch numeric family (engine.hpp).

@@ -205,10 +205,26 @@ void RecurrentDecode(float* state, const float* q, const float* k,
 /// kernel's arithmetic (the small-batch numeric family, n <= 8: bit-identical
 /// to `n_tokens` RecurrentDecode calls). Inputs are `[t][4096]` rows (`ld_*`
 /// strides in floats), beta `[t][32]`; `state` is updated to the last token.
+///
+/// With `ckpt` not null the recurrent state after every token but the last is
+/// also stored, token t at `ckpt + t * ckpt_stride` (the live layout,
+/// kKdaStateFloats): rollback points for speculative verification. The
+/// outputs and the final state are unchanged.
 void RecurrentSequence(float* state, const float* q, std::uint32_t ld_q,
                        const float* k, std::uint32_t ld_k, const float* v,
                        std::uint32_t ld_v, const float* g, const float* beta,
-                       float* o, std::uint32_t n_tokens, hipStream_t stream);
+                       float* o, std::uint32_t n_tokens, hipStream_t stream,
+                       float* ckpt = nullptr, std::size_t ckpt_stride = 0);
+/// Conv window after every token but the last of an `n_tokens` chunk (token t
+/// at `ckpt + t * ckpt_stride`, layout of the live window,
+/// kKdaConvStateFloats). Launch before Conv3Prefill, which advances
+/// `conv_state`.
+void Conv3Checkpoint(const float* proj, const float* conv_state, float* ckpt,
+                     std::size_t ckpt_stride, std::uint32_t n_tokens,
+                     hipStream_t stream);
+/// Copies `floats` floats (multiple of 4) on the stream.
+void CopyFloats(const float* src, float* dst, std::size_t floats,
+                hipStream_t stream);
 /// The same recurrence, token-sequential, restructured for throughput (the
 /// prefill numeric family, n > 8; valid for any n >= 1). The result is a fixed
 /// function of the token sequence: any split into calls, at any token, is
@@ -431,6 +447,25 @@ void Combine(float* res, const float* expert_out, const float* weights,
              hipStream_t stream);
 
 }  // namespace moe
+
+// ===========================================================================
+// mtp: draft-block input stage and helpers (mtp.hip.cpp)
+// ===========================================================================
+namespace mtp {
+
+/// out[t] = [ rmsnorm(e[t]; enorm) | rmsnorm(h[t]; hnorm) ] (eps `eps`), the
+/// concatenation eh_proj consumes: e, h `[t][2560]`, out `[t][5120]`.
+void ConcatNormRows(const float* e, const float* h, const float* enorm,
+                    const float* hnorm, float* out, std::uint32_t n_rows,
+                    float eps, hipStream_t stream);
+/// positions[t] = base + t (device memory).
+void FillPositions(std::int32_t* positions, std::int32_t base, std::uint32_t n,
+                   hipStream_t stream);
+/// Per row, the index (lowest on ties) and value of the largest logit.
+void ArgmaxRows(const float* logits, std::uint32_t n_rows, std::uint32_t vocab,
+                std::int32_t* index, float* value, hipStream_t stream);
+
+}  // namespace mtp
 
 }  // namespace gufo::models::ling_3_flash::rocm
 

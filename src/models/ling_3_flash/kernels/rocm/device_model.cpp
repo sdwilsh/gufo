@@ -164,7 +164,8 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& w,
                                                  const core::GgufReader& reader,
                                                  std::uint32_t layer_first,
                                                  std::uint32_t layer_limit,
-                                                 std::string* error_msg) {
+                                                 std::string* error_msg,
+                                                 bool with_mtp) {
   const auto begin = std::chrono::steady_clock::now();
   std::unique_ptr<DeviceModel> m(new DeviceModel());
   m->config_ = w.config;
@@ -188,6 +189,20 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& w,
   m->token_embd_ = up.Copy(w.token_embd);
   m->output_norm_ = up.Copy(w.output_norm);
   m->output_ = up.Copy(w.output);
+  if (with_mtp) {
+    if (!w.mtp) {
+      if (error_msg != nullptr) {
+        *error_msg = "the artifact has no MTP block (blk.42)";
+      }
+      return nullptr;
+    }
+    m->mtp_.block = up.Layer(w.mtp->block);
+    m->mtp_.eh_proj = up.Copy(w.mtp->eh_proj);
+    m->mtp_.enorm = up.Copy(w.mtp->enorm);
+    m->mtp_.hnorm = up.Copy(w.mtp->hnorm);
+    m->mtp_.layer_output_norm = up.Copy(w.mtp->layer_output_norm);
+    m->has_mtp_ = true;
+  }
   m->layers_.reserve(count);
   for (std::size_t il = 0; il < count && up.ok; ++il) {
     m->layers_.push_back(up.Layer(w.layers[layer_first + il]));

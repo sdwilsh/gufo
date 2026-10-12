@@ -209,6 +209,69 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
     o["family"] = "prefill + prefill";
     check("continue_prefill_at_" + std::to_string(a) + "_vs_one_chunk", ok,
           std::move(o));
+
+    // The same, restored into a session that already holds a different
+    // history: its persistent expanded K/V rows (derived state) describe the
+    // old cache rows, so the restore hook must invalidate them
+    // (rocm::Session::OnStateReplaced), or this continuation would attend over
+    // stale expansions.
+    auto sdv = fresh();
+    if (!sdv || !sdv->Feed(other, {}, &error) ||
+        !sdv->RestoreSnapshot(*sn, &error) || !feed(*sdv, a, total)) {
+      return fail_with("continue after restore into a divergent session");
+    }
+    Capture got_divergent;
+    if (!Take(*sdv, layers, &got_divergent, &error)) {
+      return fail_with("capture divergent prefill continuation");
+    }
+    auto [ok_divergent, o_divergent] = exact(got_divergent, ref_prefill);
+    o_divergent["split_at"] = U(a);
+    o_divergent["family"] = "prefill + prefill, divergent session";
+    check("continue_prefill_at_" + std::to_string(a) +
+              "_divergent_session_vs_one_chunk",
+          ok_divergent, std::move(o_divergent));
+  }
+
+  // 3b. Expanded K/V reuse across a restore. The persistent expansion of a
+  //     cache row is a pure function of the row, so a restore into a session
+  //     whose history shares a prefix (same bytes) keeps the shared rows
+  //     expanded and re-expands only the rest; a divergent history loses all
+  //     of it. Either way the continuation equals the cold run bit for bit.
+  {
+    const std::uint32_t a = total / 2;
+    auto sp = fresh();
+    auto ss = fresh();
+    auto sdv = fresh();
+    if (!sp || !ss || !sdv || !feed(*sp, 0, a) || !feed(*ss, 0, total) ||
+        !sdv->Feed(other, {}, &error)) {
+      return fail_with("expansion reuse setup");
+    }
+    auto sn = sp->SaveSnapshot(&error);
+    const std::uint32_t before = ss->ExpandedRowsValid();
+    if (!sn || !ss->RestoreSnapshot(*sn, &error) ||
+        !sdv->RestoreSnapshot(*sn, &error)) {
+      return fail_with("expansion reuse restore");
+    }
+    const std::uint32_t shared_valid = ss->ExpandedRowsValid();
+    const std::uint32_t divergent_valid = sdv->ExpandedRowsValid();
+    auto o = json::Value::object();
+    o["split_at"] = U(a);
+    o["valid_before"] = U(before);
+    o["valid_after_shared_prefix"] = U(shared_valid);
+    o["valid_after_divergent"] = U(divergent_valid);
+    check("restore_keeps_shared_expansion",
+          before >= a && shared_valid == a && divergent_valid == 0,
+          std::move(o));
+    for (auto* s2 : {&*ss, &*sdv}) {
+      Capture got;
+      if (!feed(*s2, a, total) || !Take(*s2, layers, &got, &error)) {
+        return fail_with("continue after expansion reuse restore");
+      }
+      auto [ok, oo] = exact(got, ref_prefill);
+      check(s2 == &*ss ? "continue_after_shared_expansion_vs_one_chunk"
+                       : "continue_after_divergent_expansion_vs_one_chunk",
+            ok, std::move(oo));
+    }
   }
 
   // 4. Truncation to an earlier checkpoint after running past it: take

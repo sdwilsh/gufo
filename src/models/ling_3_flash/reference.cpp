@@ -185,12 +185,13 @@ ReferenceModel::ReferenceModel(const ModelWeights& weights,
 }
 
 void ReferenceModel::Reset() {
-  layer_pos_.assign(c_.num_layers, 0);
-  kda_state_.assign(c_.num_layers, {});
-  kda_state64_.assign(c_.num_layers, {});
-  kda_conv_.assign(c_.num_layers, {});
-  mla_cache_.assign(c_.num_layers, {});
-  for (std::uint32_t il = 0; il < c_.num_layers; ++il) {
+  const std::uint32_t layers = StateLayers();
+  layer_pos_.assign(layers, 0);
+  kda_state_.assign(layers, {});
+  kda_state64_.assign(layers, {});
+  kda_conv_.assign(layers, {});
+  mla_cache_.assign(layers, {});
+  for (std::uint32_t il = 0; il < layers; ++il) {
     if (c_.IsMla(il)) {
       mla_cache_[il].reserve(std::size_t{opt_.max_context} * kMlaCacheWidth);
     } else {
@@ -374,15 +375,68 @@ bool ReferenceModel::Step(std::int32_t token, std::span<float> logits,
   for (std::uint32_t il = 0; il < c_.num_layers; ++il) {
     Block(il, h, sink);
   }
+  last_hidden_.resize(kHidden);
+  cpu::RmsNorm(h, F32Data(w_.output_norm), c_.rms_eps, last_hidden_);
   if (!logits.empty()) {
-    std::vector<float> normed(kHidden);
-    cpu::RmsNorm(h, F32Data(w_.output_norm), c_.rms_eps, normed);
     if (sink != nullptr && sink->Wants("result_norm", -1)) {
-      sink->Float("result_norm", -1, pos, normed);
+      sink->Float("result_norm", -1, pos, last_hidden_);
     }
+    Mv(w_.output, 0, last_hidden_, logits);
+  }
+  return true;
+}
+
+bool ReferenceModel::MtpStep(std::int32_t token, std::span<const float> h,
+                             std::span<float> logits, std::span<float> h_next,
+                             DumpSink* sink, std::string* error_msg) {
+  const auto fail = [&](const char* message) {
+    if (error_msg != nullptr) {
+      *error_msg = message;
+    }
+    return false;
+  };
+  if (!w_.mtp) {
+    return fail("the artifact has no MTP block");
+  }
+  if (h.size() != kHidden || (!h_next.empty() && h_next.size() != kHidden)) {
+    return fail("MTP hidden rows must have the model width");
+  }
+  if (layer_pos_[kMtpBlock] >= opt_.max_context) {
+    return fail("max_context exceeded");
+  }
+  const MtpWeights& m = *w_.mtp;
+  std::vector<float> emb(kHidden);
+  if (!Embed(token, emb, error_msg)) {
+    return false;
+  }
+  // x = eh_proj([ rmsnorm(embed; enorm) | rmsnorm(h; hnorm) ]).
+  std::vector<float> cat(2 * std::size_t{kHidden});
+  cpu::RmsNorm(emb, F32Data(m.enorm), c_.rms_eps, {cat.data(), kHidden});
+  cpu::RmsNorm(h, F32Data(m.hnorm), c_.rms_eps,
+               {cat.data() + kHidden, kHidden});
+  std::vector<float> x(kHidden);
+  Mv(m.eh_proj, 0, cat, x);
+  Block(kMtpBlock, x, sink);
+  std::vector<float> normed(kHidden);
+  cpu::RmsNorm(x, F32Data(m.layer_output_norm), c_.rms_eps, normed);
+  if (sink != nullptr && sink->Wants("mtp_h_next", -1)) {
+    sink->Float("mtp_h_next", -1, layer_pos_[kMtpBlock] - 1, normed);
+  }
+  if (!h_next.empty()) {
+    std::copy(normed.begin(), normed.end(), h_next.begin());
+  }
+  if (!logits.empty()) {
     Mv(w_.output, 0, normed, logits);
   }
   return true;
+}
+
+void ReferenceModel::MtpRewind(std::uint32_t position) {
+  if (!w_.mtp || position >= layer_pos_[kMtpBlock]) {
+    return;
+  }
+  layer_pos_[kMtpBlock] = position;
+  mla_cache_[kMtpBlock].resize(std::size_t{position} * kMlaCacheWidth);
 }
 
 bool ReferenceModel::RunLayer(std::uint32_t il, std::span<const float> in,
@@ -407,7 +461,7 @@ bool ReferenceModel::RunLayer(std::uint32_t il, std::span<const float> in,
 
 void ReferenceModel::Block(std::uint32_t il, std::span<float> h,
                            DumpSink* sink) {
-  const LayerWeights& l = w_.layers[il];
+  const LayerWeights& l = Layer(il);
   const std::uint32_t token = layer_pos_[il];
   const int layer = static_cast<int>(il);
   std::vector<float> x(kHidden);
@@ -451,7 +505,7 @@ void ReferenceModel::Block(std::uint32_t il, std::span<float> h,
 void ReferenceModel::Kda(std::uint32_t il, std::span<const float> x,
                          std::span<float> out, std::uint32_t token,
                          DumpSink* sink) {
-  const LayerWeights& l = w_.layers[il];
+  const LayerWeights& l = Layer(il);
   constexpr std::size_t kInner = kKdaInner;
   std::vector<float> raw_q(kInner);
   std::vector<float> raw_k(kInner);
@@ -511,7 +565,7 @@ void ReferenceModel::Kda(std::uint32_t il, std::span<const float> x,
 void ReferenceModel::Mla(std::uint32_t il, std::span<const float> x,
                          std::span<float> out, std::uint32_t token,
                          DumpSink* sink) {
-  const LayerWeights& l = w_.layers[il];
+  const LayerWeights& l = Layer(il);
   std::vector<float> q(kMlaQRows);
   std::vector<float> kv(kMlaCacheWidth);
   Mv(l.attn_q, 0, x, q);
@@ -619,7 +673,7 @@ void ReferenceModel::Ffn(const TensorRef& gate, const TensorRef& up,
 void ReferenceModel::Moe(std::uint32_t il, std::span<const float> x,
                          std::span<float> out, std::uint32_t token,
                          DumpSink* sink) {
-  const LayerWeights& l = w_.layers[il];
+  const LayerWeights& l = Layer(il);
   cpu::Routing route{};
   if (opt_.f64) {
     std::vector<double> xd(x.begin(), x.end());

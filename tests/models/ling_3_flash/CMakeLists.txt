@@ -18,6 +18,7 @@ target_compile_definitions(ling_3_flash_tokenizer_test PRIVATE
   GUFO_LING_VOCAB_GGUF="${LING_FIXTURES}/ling-vocab.gguf.fixture"
   GUFO_LING_TOKENIZER_GOLDENS="${LING_FIXTURES}/tokenizer_goldens.json")
 add_ling_3_flash_test(snapshot_format gufo_ling_3_flash "cpu")
+add_ling_3_flash_test(mtp_policy gufo_ling_3_flash "cpu")
 add_ling_3_flash_test(chat_template gufo_ling_3_flash "cpu")
 target_compile_definitions(ling_3_flash_chat_template_test PRIVATE
   GUFO_LING_VOCAB_GGUF="${LING_FIXTURES}/ling-vocab.gguf.fixture"
@@ -42,8 +43,9 @@ endif()
 # exist only when a model is named: -DGUFO_LING_MODEL=/path/first-shard.gguf.
 if (ENGINE_ENABLE_HIP)
   set(LING_MODEL_BINARIES)
-  foreach(name IN ITEMS session_test snapshot_test logit_dump layer_check b2
-                       decode_digest handoff_study)
+  foreach(name IN ITEMS session_test snapshot_test interleave_test restore_tail_test
+                        logit_dump layer_check b2 decode_digest handoff_study
+                        reload_test)
     set(target ling_3_flash_${name})
     add_executable(${target} EXCLUDE_FROM_ALL ${name}.cpp)
     target_link_libraries(${target} PRIVATE gufo_ling_3_flash hip::host)
@@ -72,6 +74,22 @@ if (ENGINE_ENABLE_HIP)
       LABELS "ling_3_flash;hip;gpu;gfx1151;model" SKIP_RETURN_CODE 77
       TIMEOUT 3600)
   endif()
+  # Draft-block op test: light model (embedding, head, block 41, block 42), runs
+  # on any gfx11 GPU, compares with the CPU reference and its golden numbers.
+  add_executable(ling_3_flash_mtp_ops_test EXCLUDE_FROM_ALL mtp_ops_test.cpp)
+  target_link_libraries(ling_3_flash_mtp_ops_test PRIVATE
+    gufo_ling_3_flash_reference hip::host)
+  target_include_directories(ling_3_flash_mtp_ops_test PRIVATE
+    ${PROJECT_SOURCE_DIR})
+  list(APPEND LING_MODEL_BINARIES ling_3_flash_mtp_ops_test)
+  if (GUFO_LING_MODEL)
+    add_test(NAME ling_3_flash.model_mtp_ops
+      COMMAND ling_3_flash_mtp_ops_test --model ${GUFO_LING_MODEL}
+        --golden ${LING_FIXTURES}/mtp_reference_golden.txt)
+    set_tests_properties(ling_3_flash.model_mtp_ops PROPERTIES
+      LABELS "ling_3_flash;hip;gpu;gfx1151;model" SKIP_RETURN_CODE 77
+      TIMEOUT 1800)
+  endif()
   add_custom_target(ling_3_flash_model_tests DEPENDS ${LING_MODEL_BINARIES})
 endif()
 
@@ -87,3 +105,31 @@ set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2"
 add_executable(ling_3_flash_cpu_ops_test EXCLUDE_FROM_ALL cpu_ops_test.cpp)
 target_link_libraries(ling_3_flash_cpu_ops_test PRIVATE
   gufo_ling_3_flash_reference)
+
+# MTP draft-step reference on the real block-42 weights (synthetic hidden
+# inputs, no trunk): explicit target, runs only when a model is named.
+add_executable(ling_3_flash_mtp_reference_test EXCLUDE_FROM_ALL
+  mtp_reference_test.cpp)
+target_link_libraries(ling_3_flash_mtp_reference_test PRIVATE
+  gufo_ling_3_flash_reference)
+target_include_directories(ling_3_flash_mtp_reference_test PRIVATE
+  ${PROJECT_SOURCE_DIR})
+set_source_files_properties(mtp_reference_test.cpp PROPERTIES COMPILE_OPTIONS "-O2")
+if (GUFO_LING_MODEL)
+  add_test(NAME ling_3_flash.model_mtp_reference
+    COMMAND ling_3_flash_mtp_reference_test --model ${GUFO_LING_MODEL}
+      --golden ${LING_FIXTURES}/mtp_reference_golden.txt)
+  set_tests_properties(ling_3_flash.model_mtp_reference PROPERTIES
+    LABELS "ling_3_flash;cpu;model" SKIP_RETURN_CODE 77 TIMEOUT 1800)
+endif()
+
+# CPU-reference MTP acceptance and expert-union probe on real text (explicit
+# target; about 10 minutes per 100 generated tokens).
+add_executable(ling_3_flash_mtp_acceptance_probe EXCLUDE_FROM_ALL
+  mtp_acceptance_probe.cpp)
+target_link_libraries(ling_3_flash_mtp_acceptance_probe PRIVATE
+  gufo_ling_3_flash_reference)
+target_include_directories(ling_3_flash_mtp_acceptance_probe PRIVATE
+  ${PROJECT_SOURCE_DIR})
+set_source_files_properties(mtp_acceptance_probe.cpp PROPERTIES
+  COMPILE_OPTIONS "-O2")
