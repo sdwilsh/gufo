@@ -234,11 +234,13 @@ __global__ void OutputNormGateKernel(const float* __restrict__ o,
 }
 
 // ---------------------------------------------------------------------------
-// Decode (one token) fusion: conv + conv-state advance + SiLU + q/k L2 norm +
-// gate/beta prep in one launch. Same expressions as ConvKernel/ConvStateKernel/
-// L2NormKernel/GateBetaKernel for n_tokens == 1, so the results are identical.
-// A wave owns one 128-channel head of one stream (lane: 4 consecutive
-// channels); each channel's state is read and rewritten by its own lane only.
+// Decode-family fusion (1..8 tokens): conv + conv-state advance (+ the rollback
+// windows of a verify chunk) + SiLU + q/k L2 norm + gate/beta prep in one
+// launch. Same expressions as ConvKernel/ConvStateKernel/ConvCheckpointKernel/
+// L2NormKernel/GateBetaKernel, so the results are identical. A wave owns one
+// 128-channel head of one stream (lane: 4 consecutive channels) and slides
+// the window over the tokens in registers; each channel's state is read and
+// rewritten by its own lane only.
 // ---------------------------------------------------------------------------
 constexpr std::uint32_t kPrepWaves = 4;                             // per block
 constexpr std::uint32_t kConvHeadWaves = 3 * kHeads;                // 96
@@ -249,7 +251,8 @@ __global__ __launch_bounds__(kPrepWaves * 32) void PrepDecodeKernel(
     const float* __restrict__ w_k, const float* __restrict__ w_v,
     float* __restrict__ state, const float* __restrict__ ssm_a,
     const float* __restrict__ dt_bias, float* __restrict__ out,
-    float* __restrict__ g, float* __restrict__ beta) {
+    float* __restrict__ g, float* __restrict__ beta, std::uint32_t n_tokens,
+    float* __restrict__ ckpt, std::size_t ckpt_stride) {
   if (blockIdx.x < kConvBlocks) {
     const std::uint32_t wave_id = blockIdx.x * kPrepWaves + (threadIdx.x >> 5);
     const std::uint32_t stream = wave_id / kHeads;
@@ -257,50 +260,77 @@ __global__ __launch_bounds__(kPrepWaves * 32) void PrepDecodeKernel(
     const std::uint32_t lane = threadIdx.x & 31;
     const std::uint32_t c0 = head * kD + lane * 4;  // channel within stream
     const float* w = (stream == 0 ? w_q : stream == 1 ? w_k : w_v) + c0 * 4;
-    float* st = state + static_cast<std::size_t>(stream) * 3 * kInner + c0;
+    const std::size_t soff = static_cast<std::size_t>(stream) * 3 * kInner + c0;
+    float* st = state + soff;
     const float* col = proj + stream * kInner + c0;
-    float y[4];
-    float x0[4], x1[4], x2[4], x3[4];
+    float4 wv[4];
+    float x0[4], x1[4], x2[4];
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
+      wv[e] = *reinterpret_cast<const float4*>(w + e * 4);
       x0[e] = st[e];
       x1[e] = st[kInner + e];
       x2[e] = st[2 * kInner + e];
-      x3[e] = col[e];
+    }
+    for (std::uint32_t t = 0; t < n_tokens; ++t) {
+      float x3[4], y[4];
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        x3[e] = col[static_cast<std::size_t>(t) * kKdaProjRows + e];
+      }
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const float yy = ConvTaps(wv[e], x0[e], x1[e], x2[e], x3[e]);
+        y[e] = Silu(yy);
+      }
+      float4 v = make_float4(y[0], y[1], y[2], y[3]);
+      if (stream < 2) {
+        const float r = L2Scale(v);
+        v.x *= r;
+        v.y *= r;
+        v.z *= r;
+        v.w *= r;
+      }
+      reinterpret_cast<float4*>(
+          out + static_cast<std::size_t>(t) * kConvChannels +
+          static_cast<std::size_t>(stream) * kInner + c0)[0] = v;
+      // Slide: the window now holds raw tokens t - 2..t.
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        x0[e] = x1[e];
+        x1[e] = x2[e];
+        x2[e] = x3[e];
+      }
+      if (ckpt != nullptr && t + 1 < n_tokens) {
+        float* ck = ckpt + t * ckpt_stride + soff;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          ck[e] = x0[e];
+          ck[kInner + e] = x1[e];
+          ck[2 * kInner + e] = x2[e];
+        }
+      }
     }
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
-      const float4 wv = *reinterpret_cast<const float4*>(w + e * 4);
-      const float yy = ConvTaps(wv, x0[e], x1[e], x2[e], x3[e]);
-      y[e] = Silu(yy);
+      st[e] = x0[e];
+      st[kInner + e] = x1[e];
+      st[2 * kInner + e] = x2[e];
     }
-    // Advance the window: new positions are old 1, old 2 and the raw token.
-#pragma unroll
-    for (int e = 0; e < 4; ++e) {
-      st[e] = x1[e];
-      st[kInner + e] = x2[e];
-      st[2 * kInner + e] = x3[e];
-    }
-    float4 v = make_float4(y[0], y[1], y[2], y[3]);
-    if (stream < 2) {
-      const float r = L2Scale(v);
-      v.x *= r;
-      v.y *= r;
-      v.z *= r;
-      v.w *= r;
-    }
-    reinterpret_cast<float4*>(out + static_cast<std::size_t>(stream) * kInner +
-                              c0)[0] = v;
     return;
   }
   const std::uint32_t idx =
       (blockIdx.x - kConvBlocks) * blockDim.x + threadIdx.x;
-  if (idx < kInner) {
-    const float f = proj[kKdaFaRow + idx];
-    g[idx] = kKdaGateLowerBound * Sigmoid(ssm_a[idx / kD] * (f + dt_bias[idx]));
-  } else if (idx < kInner + kHeads) {
-    const std::uint32_t h = idx - kInner;
-    beta[h] = Sigmoid(proj[kKdaBetaRow + h]);
+  for (std::uint32_t t = 0; t < n_tokens; ++t) {
+    const float* pt = proj + static_cast<std::size_t>(t) * kKdaProjRows;
+    if (idx < kInner) {
+      const float f = pt[kKdaFaRow + idx];
+      g[static_cast<std::size_t>(t) * kInner + idx] =
+          kKdaGateLowerBound * Sigmoid(ssm_a[idx / kD] * (f + dt_bias[idx]));
+    } else if (idx < kInner + kHeads) {
+      const std::uint32_t h = idx - kInner;
+      beta[t * kHeads + h] = Sigmoid(pt[kKdaBetaRow + h]);
+    }
   }
 }
 
@@ -834,11 +864,16 @@ void OutputNormGate(const float* o, const float* proj, const float* ssm_norm,
 void PrepDecode(const float* proj, const float* w_q, const float* w_k,
                 const float* w_v, float* conv_state, const float* ssm_a,
                 const float* dt_bias, float* conv_out, float* g, float* beta,
-                hipStream_t stream) {
+                std::uint32_t n_tokens, float* conv_ckpt,
+                std::size_t ckpt_stride, hipStream_t stream) {
+  if (n_tokens == 0) {
+    return;
+  }
   constexpr std::uint32_t kGateBlocks =
       (kInner + kHeads + kPrepWaves * 32 - 1) / (kPrepWaves * 32);
   PrepDecodeKernel<<<kConvBlocks + kGateBlocks, kPrepWaves * 32, 0, stream>>>(
-      proj, w_q, w_k, w_v, conv_state, ssm_a, dt_bias, conv_out, g, beta);
+      proj, w_q, w_k, w_v, conv_state, ssm_a, dt_bias, conv_out, g, beta,
+      n_tokens, conv_ckpt, ckpt_stride);
 }
 
 void OutputNormGateQuant(const float* o, const float* proj,

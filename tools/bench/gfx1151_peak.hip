@@ -9,6 +9,7 @@
 // checksum. These are measured ceilings, not model throughput predictions.
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -238,6 +239,12 @@ double BenchSeconds(Launch&& launch, int iters = 3) {
   return static_cast<double>(ms) / 1e3 / iters;
 }
 
+// One store from the first thread: the kernel's cost is its launch.
+__global__ void LaunchProbe(std::uint32_t* sink, int i) {
+  if (blockIdx.x == 0 && threadIdx.x == 0)
+    sink[0] = static_cast<std::uint32_t>(i);
+}
+
 int main() {
   hipDeviceProp_t prop{};
   HIP_OK(hipGetDeviceProperties(&prop, 0));
@@ -392,5 +399,55 @@ int main() {
               "DRAM copy (read+write)", 2.0 * bytes / copy_s / 1e9);
   HIP_OK(hipFree(a));
   HIP_OK(hipFree(b));
+
+  // Fixed cost of one stream-ordered kernel: a decode step is hundreds of
+  // dependent small launches, so this bounds what fusing launches can save.
+  std::printf("\n-- kernel launch floor (stream-ordered, back to back) --\n");
+  hipStream_t stream{};
+  HIP_OK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+  constexpr int kLaunches = 256;
+  const auto floor = [&](const char* name, unsigned grid, bool graph) {
+    const auto enqueue = [&] {
+      for (int i = 0; i < kLaunches; ++i)
+        LaunchProbe<<<grid, kThreads, 0, stream>>>(sink, i);
+    };
+    hipGraphExec_t exec{};
+    if (graph) {
+      hipGraph_t g{};
+      HIP_OK(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal));
+      enqueue();
+      HIP_OK(hipStreamEndCapture(stream, &g));
+      HIP_OK(hipGraphInstantiate(&exec, g, nullptr, nullptr, 0));
+      HIP_OK(hipGraphDestroy(g));
+    }
+    hipEvent_t e0{}, e1{};
+    HIP_OK(hipEventCreate(&e0));
+    HIP_OK(hipEventCreate(&e1));
+    std::vector<float> per;
+    for (int r = 0; r < 9; ++r) {
+      HIP_OK(hipEventRecord(e0, stream));
+      if (graph)
+        HIP_OK(hipGraphLaunch(exec, stream));
+      else
+        enqueue();
+      HIP_OK(hipEventRecord(e1, stream));
+      HIP_OK(hipEventSynchronize(e1));
+      float ms = 0;
+      HIP_OK(hipEventElapsedTime(&ms, e0, e1));
+      if (r > 0)
+        per.push_back(ms * 1000.0F / kLaunches);
+    }
+    std::sort(per.begin(), per.end());
+    HIP_OK(hipEventDestroy(e0));
+    HIP_OK(hipEventDestroy(e1));
+    if (exec != nullptr)
+      HIP_OK(hipGraphExecDestroy(exec));
+    std::printf("  %-24s %10.2f us  [median per kernel, %d kernels]\n", name,
+                per[per.size() / 2], kLaunches);
+  };
+  floor("graph 1-block kernel", 1, true);
+  floor("graph full-GPU kernel", prop.multiProcessorCount * 2, true);
+  floor("eager 1-block kernel", 1, false);
+  HIP_OK(hipStreamDestroy(stream));
   HIP_OK(hipFree(sink));
 }
