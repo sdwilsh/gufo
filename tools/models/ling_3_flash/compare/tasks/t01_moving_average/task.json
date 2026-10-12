@@ -1,0 +1,5 @@
+{
+ "category": "bugfix",
+ "expected_tests": 7,
+ "prompt": "The test suite in this project has a failing test for stats.window.moving_average. Find the bug and fix it in the library code (do not change the tests). moving_average(values, window) must return the simple average of every full window of `window` consecutive values; if window is larger than len(values) it returns an empty list; window <= 0 raises ValueError."
+}
