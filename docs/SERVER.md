@@ -169,7 +169,8 @@ Greedy output matches AR, and sampled requests use p/q acceptance. Pass
 `--speculative off`, up to eight decoding requests (at most `--sessions`) share
 one forward pass per token. Each request's tokens, logits, and state stay
 bit-identical to decoding it alone, and one request keeps the single-session
-path. MTP requests still decode one at a time. Ling's tokenizer keeps the
+path. With MTP, cohorts of up to eight requests share draft steps and verify
+forwards in the same way. Ling's tokenizer keeps the
 tokens of up to 64 MiB of recent message text in process memory (least
 recently used first out, no expiry), so a repeated or continued conversation
 tokenizes only what changed.
