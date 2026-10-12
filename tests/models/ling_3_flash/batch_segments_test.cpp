@@ -18,6 +18,7 @@
 
 #include <cstring>
 #include <optional>
+#include <tuple>
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/device_model.hpp"
@@ -194,6 +195,170 @@ int Body(const Args& args, Report& report) {
       ++lane.segments;
     }
   }
+  // ---- MTP (--mtp): batched drafts and rollback verify segments -----------
+  auto mtp_checks = json::Value::array();
+  if (mtp) {
+    // (A) Draft chains of lengths {3, 2, 2, 1, 1, 0} (longest first, so each
+    // depth's lanes are a prefix), with the Q8_0 and the F16 draft head:
+    // every lane's logits rows, argmax and MTP rows equal MtpDraft alone.
+    const std::vector<std::uint32_t> chain_len = {3, 2, 2, 1, 1, 0};
+    for (const bool q8 : {true, false}) {
+      exec->SetMtpDraftHeadQ8(q8);
+      std::uint32_t mismatches = 0;
+      std::vector<std::vector<std::vector<float>>> batch_logits(lanes.size());
+      std::vector<std::vector<std::int32_t>> batch_argmax(lanes.size());
+      std::vector<std::uint32_t> pos(lanes.size());
+      for (std::uint32_t j = 0; j < 3; ++j) {
+        std::vector<rocm::DraftLane> step;
+        std::vector<std::vector<float>> out;
+        std::vector<std::size_t> who;
+        for (std::size_t i = 0; i < lanes.size(); ++i) {
+          if (chain_len[i] > j) {
+            who.push_back(i);
+          }
+        }
+        out.resize(who.size(), std::vector<float>(l3::kVocab));
+        for (std::size_t r = 0; r < who.size(); ++r) {
+          const std::size_t i = who[r];
+          if (j == 0) {
+            pos[i] = lanes[i].batch->position() - 1;
+          } else {
+            ++pos[i];
+          }
+          rocm::DraftLane d;
+          d.session = lanes[i].batch.get();
+          d.token = Tok(55000 + 31 * i + j);
+          d.position = pos[i];
+          d.chain = j > 0;
+          d.logits = out[r];
+          step.push_back(d);
+        }
+        if (!exec->MtpDraftBatch(step, &error)) {
+          return fatal("draft batch");
+        }
+        for (std::size_t r = 0; r < who.size(); ++r) {
+          batch_logits[who[r]].push_back(out[r]);
+          batch_argmax[who[r]].push_back(step[r].argmax);
+        }
+      }
+      for (std::size_t i = 0; i < lanes.size(); ++i) {
+        const std::uint32_t start = lanes[i].solo->position() - 1;
+        for (std::uint32_t j = 0; j < chain_len[i]; ++j) {
+          rocm::DraftRequest r;
+          r.token = Tok(55000 + 31 * i + j);
+          r.position = start + j;
+          r.chain = j > 0;
+          std::vector<float> want(l3::kVocab);
+          r.logits = want;
+          std::int32_t argmax = -1;
+          if (!exec->MtpDraft(*lanes[i].solo, r, &argmax, &error)) {
+            return fatal("solo draft");
+          }
+          if (!SameBytes(want, batch_logits[i][j]) ||
+              argmax != batch_argmax[i][j]) {
+            ++mismatches;
+            std::fprintf(stderr, "draft lane %zu depth %u (q8 %d) differs\n", i,
+                         j, q8 ? 1 : 0);
+          }
+        }
+        if (chain_len[i] > 0) {
+          const std::uint32_t rows = start + chain_len[i];
+          std::vector<std::uint16_t> a, b;
+          if (!exec->ReadMtpCache(*lanes[i].batch, rows, &a, &error) ||
+              !exec->ReadMtpCache(*lanes[i].solo, rows, &b, &error)) {
+            return fatal("read draft rows");
+          }
+          mismatches += SameBytes(a, b) ? 0 : 1;
+        }
+      }
+      auto o = json::Value::object();
+      o["name"] = std::string("draft_batch_equals_solo_") + (q8 ? "q8" : "f16");
+      o["mismatches"] = U(mismatches);
+      o["pass"] = mismatches == 0;
+      std::fprintf(stderr, "[check] %s: %s\n", o["name"].str().c_str(),
+                   mismatches == 0 ? "PASS" : "FAIL");
+      failures_seen += mismatches == 0 ? 0 : 1;
+      mtp_checks.push_back(std::move(o));
+    }
+    exec->SetMtpDraftHeadQ8(true);
+    // (B) Verify segments with rollback points, cut back per lane: logits,
+    // argmax and (at the end) the whole state equal Forward(rollback) +
+    // MtpRollback alone. Cohorts {3,2,3} (5 points), {4,4}, {2,1,1,4}.
+    using Verify = std::vector<std::tuple<std::size_t, std::uint32_t,
+                                          std::uint32_t>>;  // lane, n, keep
+    const std::vector<Verify> verifies = {
+        {{0, 3, 1}, {1, 2, 2}, {2, 3, 2}},
+        {{3, 4, 4}, {4, 4, 1}},
+        {{5, 2, 1}, {0, 1, 1}, {1, 1, 1}, {2, 4, 3}},
+    };
+    std::uint32_t mismatches = 0;
+    for (const Verify& v : verifies) {
+      std::vector<std::vector<std::int32_t>> toks(v.size());
+      std::vector<std::vector<float>> logits(v.size());
+      std::vector<std::vector<std::int32_t>> argmax(v.size());
+      std::vector<rocm::BatchSegment> segs(v.size());
+      std::vector<std::uint32_t> first(v.size());
+      for (std::size_t k = 0; k < v.size(); ++k) {
+        const auto [i, n, keep] = v[k];
+        for (std::uint32_t t = 0; t < n; ++t) {
+          toks[k].push_back(Tok(66000 + 97 * i + lanes[i].next + t));
+        }
+        first[k] = lanes[i].batch->position();
+        logits[k].resize(std::size_t{n} * l3::kVocab);
+        argmax[k].resize(n);
+        segs[k].session = lanes[i].batch.get();
+        segs[k].tokens = toks[k];
+        segs[k].logits = logits[k];
+        segs[k].logits_from = 0;
+        segs[k].argmax = argmax[k];
+        segs[k].rollback = n > 1;
+      }
+      if (!exec->ForwardBatch(segs, &error)) {
+        return fatal("verify batch");
+      }
+      for (std::size_t k = 0; k < v.size(); ++k) {
+        const auto [i, n, keep] = v[k];
+        Lane& lane = lanes[i];
+        if (segs[k].status != rocm::BatchSegment::Status::kDone) {
+          ++mismatches;
+          std::fprintf(stderr, "verify lane %zu: %s\n", i,
+                       segs[k].error.c_str());
+          continue;
+        }
+        if (n > 1 && !exec->MtpRollback(*lane.batch, first[k], n, keep, &error,
+                                        segs[k].placement)) {
+          return fatal("batched rollback");
+        }
+        rocm::ForwardRequest r;
+        r.tokens = toks[k];
+        std::vector<float> want(logits[k].size());
+        std::vector<std::int32_t> want_argmax(n);
+        r.logits = want;
+        r.logits_from = 0;
+        r.argmax = want_argmax;
+        r.rollback = n > 1;
+        if (!exec->Forward(*lane.solo, r, &error) ||
+            (n > 1 &&
+             !exec->MtpRollback(*lane.solo, first[k], n, keep, &error))) {
+          return fatal("solo verify");
+        }
+        if (!SameBytes(want, logits[k]) || want_argmax != argmax[k]) {
+          ++mismatches;
+          std::fprintf(stderr, "verify lane %zu n=%u: rows differ\n", i, n);
+        }
+        lane.next += n;
+      }
+    }
+    auto o = json::Value::object();
+    o["name"] = "rollback_verify_equals_solo";
+    o["mismatches"] = U(mismatches);
+    o["pass"] = mismatches == 0;
+    std::fprintf(stderr, "[check] rollback_verify_equals_solo: %s\n",
+                 mismatches == 0 ? "PASS" : "FAIL");
+    failures_seen += mismatches == 0 ? 0 : 1;
+    mtp_checks.push_back(std::move(o));
+  }
+  report.Set("mtp", mtp_checks);
   // Row budget: a segment past 8 rows is refused, its session untouched.
   {
     std::vector<std::int32_t> eight(8, Tok(1)), one(1, Tok(2));

@@ -571,8 +571,7 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
   // are still decoding when the last one starts), first one at a time, then
   // all at once. The concurrent answers must equal the serial ones; without
   // MTP every request must have decoded in batched cohorts (plan
-  // "batched-wN", widest 4). With MTP every request keeps the serial
-  // speculative cycle (no batched plan, width 1).
+  // "batched-wN", widest 4), with MTP too (shared draft and verify).
   {
     namespace server = gufo::server;
     constexpr std::size_t kUsers = 4;
@@ -619,7 +618,6 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
     }
     bool same = true;
     bool batched = true;
-    bool serial_plans = true;
     std::size_t widest = 0;
     auto plans = json::Value::array();
     for (std::size_t i = 0; i < kUsers; ++i) {
@@ -627,8 +625,6 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
              together[i].tokens == serial[i].tokens &&
              together[i].text == serial[i].text;
       batched = batched && together[i].execution_plan.starts_with("batched-w");
-      serial_plans =
-          serial_plans && together[i].execution_plan.starts_with("serial-");
       widest = std::max(widest, together[i].physical_execution_width);
       plans.push_back(together[i].execution_plan);
     }
@@ -639,9 +635,7 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
     o["same_answers"] = same;
     check(mtp ? "serving_concurrent_mtp_equals_serial"
               : "serving_concurrent_batched_equals_serial",
-          same &&
-              (mtp ? serial_plans && widest == 1 : batched && widest == kUsers),
-          std::move(o));
+          same && batched && widest == kUsers, std::move(o));
   }
 
   report.Set("checks", checks);

@@ -252,7 +252,8 @@ bool Executor::Init(std::string* error) {
       return false;
     }
     ok = f(&b.hn, (B + 1) * kHidden, "mtp hn") &&
-         f(&b.mtp_hn, kHidden, "mtp chain hidden") &&
+         f(&b.mtp_hn, std::size_t{kMaxDecodeTokens} * kHidden,
+           "mtp chain hidden") &&
          f(&b.kda_ckpt, std::size_t{kMaxDrafts} * kKdaLayers * kKdaStateFloats,
            "kda rollback points") &&
          f(&b.conv_ckpt,
@@ -578,6 +579,15 @@ void Executor::Kda(const DeviceLayer& l, std::span<const Lane> lanes,
                    GpuTensorSink* sink) {
   Buffers& b = *b_;
   const std::uint32_t k = KdaIndex(il);
+  // Rollback point t of a lane: checkpoint ckpt0 + t, this layer's slice.
+  const auto conv_ckpt_at = [k](const Lane& lane) {
+    return std::size_t{lane.ckpt0} * kKdaLayers * kKdaConvStateFloats +
+           std::size_t{k} * kKdaConvStateFloats;
+  };
+  const auto state_ckpt_at = [k](const Lane& lane) {
+    return std::size_t{lane.ckpt0} * kKdaLayers * kKdaStateFloats +
+           std::size_t{k} * kKdaStateFloats;
+  };
   if (fuse) {
     Q8Quantized({{&l.kda_proj, b.proj}}, b.xq, n, kHidden);
   } else {
@@ -595,22 +605,19 @@ void Executor::Kda(const DeviceLayer& l, std::span<const Lane> lanes,
     float* g = b.g + std::size_t{lane.row0} * kKdaInner;
     float* beta = b.beta + std::size_t{lane.row0} * kHeads;
     if (fuse) {
-      kda::PrepDecode(proj, l.conv_q.f32(), l.conv_k.f32(), l.conv_v.f32(),
-                      conv_state, l.ssm_a.f32(), l.ssm_dt.f32(), conv, g, beta,
-                      m,
-                      rollback_active_ && m > 1
-                          ? b.conv_ckpt + std::size_t{k} * kKdaConvStateFloats
-                          : nullptr,
-                      kKdaLayers * kKdaConvStateFloats, stream_);
+      kda::PrepDecode(
+          proj, l.conv_q.f32(), l.conv_k.f32(), l.conv_v.f32(), conv_state,
+          l.ssm_a.f32(), l.ssm_dt.f32(), conv, g, beta, m,
+          lane.rollback && m > 1 ? b.conv_ckpt + conv_ckpt_at(lane) : nullptr,
+          kKdaLayers * kKdaConvStateFloats, stream_);
       continue;
     }
     if (m == 1) {
       kda::Conv3Decode(proj, l.conv_q.f32(), l.conv_k.f32(), l.conv_v.f32(),
                        conv_state, conv, stream_);
     } else {
-      if (rollback_active_) {
-        kda::Conv3Checkpoint(proj, conv_state,
-                             b.conv_ckpt + std::size_t{k} * kKdaConvStateFloats,
+      if (lane.rollback) {
+        kda::Conv3Checkpoint(proj, conv_state, b.conv_ckpt + conv_ckpt_at(lane),
                              kKdaLayers * kKdaConvStateFloats, m, stream_);
       }
       kda::Conv3Prefill(proj, l.conv_q.f32(), l.conv_k.f32(), l.conv_v.f32(),
@@ -634,12 +641,10 @@ void Executor::Kda(const DeviceLayer& l, std::span<const Lane> lanes,
     if (m == 1) {
       kda::RecurrentDecode(state, q, kk, v, g, beta, o, stream_);
     } else if (m <= kMaxDecodeTokens) {
-      kda::RecurrentSequence(state, q, kQkvStride, kk, kQkvStride, v,
-                             kQkvStride, g, beta, o, m, stream_,
-                             rollback_active_
-                                 ? b.kda_ckpt + std::size_t{k} * kKdaStateFloats
-                                 : nullptr,
-                             kKdaLayers * kKdaStateFloats);
+      kda::RecurrentSequence(
+          state, q, kQkvStride, kk, kQkvStride, v, kQkvStride, g, beta, o, m,
+          stream_, lane.rollback ? b.kda_ckpt + state_ckpt_at(lane) : nullptr,
+          kKdaLayers * kKdaStateFloats);
     } else {
       kda::PrefillSequence(state, q, kQkvStride, kk, kQkvStride, v, kQkvStride,
                            g, beta, o, m, stream_);
@@ -1223,7 +1228,7 @@ bool Executor::ForwardGraph(Session& session, const ForwardRequest& r,
   }
   launch_.issue_ms = StepMs();
   ++graph_replays_;
-  return MtpAfterForward(session, n, first_pos, 0, error) &&
+  return MtpAfterForward(session, n, first_pos, 0, 0, error) &&
          FinishForward(session, r, n, from, layers, true, error);
 }
 
@@ -1321,11 +1326,13 @@ bool Executor::Forward(Session& session, const ForwardRequest& r,
   if (r.op_profile != nullptr) {
     BeginProfile();
   }
-  rollback_active_ = r.rollback;
-  const Lane lane{&session, first_pos, n, 0};
+  const Lane lane{.session = &session,
+                  .first_pos = first_pos,
+                  .n = n,
+                  .row0 = 0,
+                  .rollback = r.rollback};
   const bool trunk_ok =
       Trunk({&lane, 1}, n, /*head_from=*/n, true, r.sink, error);
-  rollback_active_ = false;
   launch_.issue_ms = StepMs();
   if (!trunk_ok) {
     profiling_ = false;
@@ -1334,7 +1341,7 @@ bool Executor::Forward(Session& session, const ForwardRequest& r,
   if (from < n && !Head(n, from, r.logits, r.argmax, error)) {
     return false;
   }
-  if (!MtpAfterForward(session, n, first_pos, 0, error)) {
+  if (!MtpAfterForward(session, n, first_pos, 0, 0, error)) {
     return false;
   }
   if (!FinishForward(session, r, n, from, layers, false, error)) {
@@ -1358,9 +1365,11 @@ bool Executor::ForwardBatch(std::span<BatchSegment> segments,
   std::vector<std::int32_t> tokens;
   std::vector<std::int32_t> positions;
   std::vector<std::uint32_t> froms;  // first logits row per member
+  std::vector<std::uint32_t> hn0s;   // MTP hidden rows per member
   lanes.reserve(segments.size());
   members.reserve(segments.size());
   std::uint32_t rows = 0;
+  std::uint32_t ckpts = 0;  // rollback points taken so far
   std::uint32_t head_from = UINT32_MAX;
   // Validation only reads host state: a refused segment's session is never
   // touched, and nothing is launched before every segment was checked.
@@ -1424,15 +1433,41 @@ bool Executor::ForwardBatch(std::span<BatchSegment> segments,
                 ".." + std::to_string(n);
       continue;
     }
+    if (!s.argmax.empty() && (from >= n || s.argmax.size() < n - from)) {
+      s.error = "argmax buffer too small for rows " + std::to_string(from) +
+                ".." + std::to_string(n);
+      continue;
+    }
+    // Rollback points of the segments follow each other in the checkpoint
+    // scratch (kMaxDrafts points, enough for any 8-row step).
+    if (s.rollback && (!options_.mtp || n < 2 || ckpts + n - 1 > kMaxDrafts)) {
+      s.error = "rollback points need MTP, 2..8 tokens and free checkpoints";
+      continue;
+    }
+    // MTP hidden rows: the carry and n rows per segment (MtpRollback).
+    const std::uint32_t hn0 = rows + static_cast<std::uint32_t>(lanes.size());
+    if (options_.mtp && hn0 + n + 1 > options_.max_batch + 1) {
+      s.error = "batched forward exceeds the MTP hidden rows";
+      continue;
+    }
     s.status = Status::kPending;
-    lanes.push_back({s.session, first_pos, n, rows});
+    lanes.push_back({.session = s.session,
+                     .first_pos = first_pos,
+                     .n = n,
+                     .row0 = rows,
+                     .rollback = s.rollback,
+                     .ckpt0 = ckpts});
+    if (s.rollback) {
+      ckpts += n - 1;
+    }
     members.push_back(&s);
     froms.push_back(from);
+    hn0s.push_back(hn0);
     for (std::uint32_t t = 0; t < n; ++t) {
       tokens.push_back(s.tokens[t]);
       positions.push_back(static_cast<std::int32_t>(first_pos + t));
     }
-    if (!s.logits.empty()) {
+    if (!s.logits.empty() || !s.argmax.empty()) {
       head_from = std::min(head_from, rows + from);
     }
     rows += n;
@@ -1441,6 +1476,16 @@ bool Executor::ForwardBatch(std::span<BatchSegment> segments,
     return true;
   }
   head_from = std::min(head_from, rows);  // rows: no segment wants logits
+  bool argmax = false;
+  for (std::size_t i = 0; i < members.size(); ++i) {
+    BatchSegment& s = *members[i];
+    argmax = argmax || !s.argmax.empty();
+    s.placement = {.ckpt0 = lanes[i].ckpt0,
+                   .hn0 = hn0s[i],
+                   .logit_row = s.logits.empty() && s.argmax.empty()
+                                    ? 0
+                                    : lanes[i].row0 + froms[i] - head_from};
+  }
   std::string message;
   bool launched = false;  // the trunk is queued: members' state is in flight
   const auto fail = [&]() {
@@ -1477,8 +1522,21 @@ bool Executor::ForwardBatch(std::span<BatchSegment> segments,
   }
   launch_.issue_ms = StepMs();
   Buffers& b = *b_;
+  if (argmax) {
+    // Row-wise, as the single-session head's argmax of its rows.
+    mtp::ArgmaxRows(b.logits, rows - head_from, kVocabRows, b.argmax_idx,
+                    b.argmax_val, stream_);
+  }
   for (std::size_t i = 0; i < members.size(); ++i) {
     BatchSegment& s = *members[i];
+    if (!s.argmax.empty() &&
+        !Check(hipMemcpyAsync(s.argmax.data(),
+                              b.argmax_idx + s.placement.logit_row,
+                              (lanes[i].n - froms[i]) * sizeof(std::int32_t),
+                              hipMemcpyDeviceToHost, stream_),
+               "copy argmax", &message)) {
+      return fail();
+    }
     if (s.logits.empty()) {
       continue;
     }
@@ -1495,7 +1553,7 @@ bool Executor::ForwardBatch(std::span<BatchSegment> segments,
   // Ascending rows (MtpAfterForward overwrites the rows below row0).
   for (std::size_t i = 0; i < lanes.size(); ++i) {
     if (!MtpAfterForward(*members[i]->session, lanes[i].n, lanes[i].first_pos,
-                         lanes[i].row0, &message)) {
+                         lanes[i].row0, hn0s[i], &message)) {
       return fail();
     }
   }
@@ -1536,7 +1594,7 @@ bool Executor::ForwardBatch(std::span<BatchSegment> segments,
 
 bool Executor::MtpAfterForward(Session& session, std::uint32_t n,
                                std::uint32_t first_pos, std::uint32_t row0,
-                               std::string* error) {
+                               std::uint32_t hn0, std::string* error) {
   SessionState& st = session.state_;
   if (st.mtp_cache == nullptr) {
     return true;
@@ -1546,16 +1604,17 @@ bool Executor::MtpAfterForward(Session& session, std::uint32_t n,
   }
   const DeviceMtp& m = *model_.mtp();
   Buffers& b = *b_;
+  float* const hn = b.hn + std::size_t{hn0} * kHidden;
   // hn[0] = h of position first_pos - 1 (the carry), hn[1 + t] = the
   // output-normed trunk row row0 + t. Row r of the fill pairs hn[skip + r]
   // with the token of trunk row row0 + skip + r: MTP cache row q = (h_q,
   // token_{q + 1}).
   if (first_pos > 0) {
-    (void)hipMemcpyAsync(b.hn, st.mtp_h, kHidden * sizeof(float),
+    (void)hipMemcpyAsync(hn, st.mtp_h, kHidden * sizeof(float),
                          hipMemcpyDeviceToDevice, stream_);
   }
   dense::RmsNormRows(b.h + std::size_t{row0} * kHidden,
-                     model_.output_norm().f32(), b.hn + kHidden, n, kHidden, 1,
+                     model_.output_norm().f32(), hn + kHidden, n, kHidden, 1,
                      kRmsEps, stream_);
   Mark("mtp.hidden_norm", 0);
   const std::uint32_t skip = first_pos == 0 ? 1U : 0U;
@@ -1563,7 +1622,7 @@ bool Executor::MtpAfterForward(Session& session, std::uint32_t n,
   if (rows > 0) {
     dense::EmbedQ4K(model_.token_embd().data, b.tokens + row0 + skip, b.ga,
                     rows, kHidden, stream_);
-    mtp::ConcatNormRows(b.ga, b.hn + std::size_t{skip} * kHidden, m.enorm.f32(),
+    mtp::ConcatNormRows(b.ga, hn + std::size_t{skip} * kHidden, m.enorm.f32(),
                         m.hnorm.f32(), b.gb, rows, kRmsEps, stream_);
     Q8(m.eh_proj, b.gb, b.h, rows);
     dense::RmsNormRows(b.h, m.block.attn_norm.f32(), b.x, rows, kHidden, 1,
@@ -1578,7 +1637,7 @@ bool Executor::MtpAfterForward(Session& session, std::uint32_t n,
                      rows, stream_);
     Mark("mtp.cache_fill", 0);
   }
-  (void)hipMemcpyAsync(st.mtp_h, b.hn + std::size_t{n} * kHidden,
+  (void)hipMemcpyAsync(st.mtp_h, hn + std::size_t{n} * kHidden,
                        kHidden * sizeof(float), hipMemcpyDeviceToDevice,
                        stream_);
   session.mtp_valid_ = true;
@@ -1699,9 +1758,127 @@ bool Executor::MtpDraft(Session& session, const DraftRequest& r,
   return true;
 }
 
+bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
+  const auto fail = [&](const std::string& message) {
+    if (error != nullptr) {
+      *error = message;
+    }
+    return false;
+  };
+  const auto count = static_cast<std::uint32_t>(lanes.size());
+  if (!options_.mtp || count == 0 || count > batch_row_limit()) {
+    return fail("MTP draft batch needs an MTP executor and 1..8 lanes");
+  }
+  for (std::size_t i = 0; i < lanes.size(); ++i) {
+    const DraftLane& d = lanes[i];
+    if (d.session == nullptr || d.session->state_.mtp_cache == nullptr ||
+        !d.session->mtp_valid_ ||
+        std::any_of(lanes.begin(), lanes.begin() + i, [&](const DraftLane& o) {
+          return o.session == d.session;
+        })) {
+      return fail("MTP draft batch needs distinct sessions with valid caches");
+    }
+    if (d.token < 0 || static_cast<std::uint32_t>(d.token) >= kVocab ||
+        d.position >= d.session->capacity() ||
+        (!d.logits.empty() && d.logits.size() < kVocabRows)) {
+      return fail("MTP draft batch request is out of range");
+    }
+  }
+  const DeviceMtp& m = *model_.mtp();
+  Buffers& b = *b_;
+  step_start_ = std::chrono::steady_clock::now();
+  launch_ = {};
+  std::vector<std::int32_t> tokens(count);
+  std::vector<std::int32_t> positions(count);
+  std::vector<Lane> block_lanes(count);
+  for (std::uint32_t i = 0; i < count; ++i) {
+    tokens[i] = lanes[i].token;
+    positions[i] = static_cast<std::int32_t>(lanes[i].position);
+    block_lanes[i] = {.session = lanes[i].session,
+                      .first_pos = lanes[i].position,
+                      .n = 1,
+                      .row0 = i};
+  }
+  std::string message;
+  if (!UploadRows(tokens, positions, &message)) {
+    return fail(message);
+  }
+  (void)hipEventRecord(draft_events_[0], stream_);
+  // The launches of MtpDraft over `count` rows: row-wise kernels and GEMVs
+  // whose rows do not depend on each other; the hidden input per lane.
+  dense::EmbedQ4K(model_.token_embd().data, b.tokens, b.ga, count, kHidden,
+                  stream_);
+  for (std::uint32_t i = 0; i < count; ++i) {
+    const float* h_in = lanes[i].chain ? b.mtp_hn + std::size_t{i} * kHidden
+                                       : lanes[i].session->state_.mtp_h;
+    mtp::ConcatNormRows(b.ga + std::size_t{i} * kHidden, h_in, m.enorm.f32(),
+                        m.hnorm.f32(), b.gb + std::size_t{i} * 2 * kHidden, 1,
+                        kRmsEps, stream_);
+  }
+  Q8(m.eh_proj, b.gb, b.h, count);
+  const bool fuse = dense::GemvQ8_0Fits(count, kHidden);
+  if (!BlockOf(m.block, block_lanes, kMtpBlock, count, nullptr, fuse, false,
+               nullptr, &message)) {
+    (void)hipStreamSynchronize(stream_);
+    (void)hipStreamSynchronize(branch_stream_);
+    return fail(message);
+  }
+  dense::RmsNormRows(b.h, m.layer_output_norm.f32(), b.mtp_hn, count, kHidden,
+                     1, kRmsEps, stream_);
+  if (draft_head_q8_) {
+    dense::GemvQ8_0(m.draft_head.data, b.mtp_hn, b.logits, count, kHidden,
+                    kVocabRows, b.scratch, stream_);
+  } else {
+    dense::GemvF16(model_.output().f16(), b.mtp_hn, b.logits, count, kHidden,
+                   kVocabRows, b.scratch, stream_);
+  }
+  mtp::ArgmaxRows(b.logits, count, kVocabRows, b.argmax_idx, b.argmax_val,
+                  stream_);
+  (void)hipEventRecord(draft_events_[1], stream_);
+  launch_.issue_ms = StepMs();
+  std::vector<std::int32_t> index(count, -1);
+  bool ok = Check(
+      hipMemcpyAsync(index.data(), b.argmax_idx, count * sizeof(std::int32_t),
+                     hipMemcpyDeviceToHost, stream_),
+      "copy draft argmax", &message);
+  for (std::uint32_t i = 0; ok && i < count; ++i) {
+    ok = lanes[i].logits.empty() ||
+         Check(hipMemcpyAsync(lanes[i].logits.data(),
+                              b.logits + std::size_t{i} * kVocabRows,
+                              std::size_t{kVocabRows} * sizeof(float),
+                              hipMemcpyDeviceToHost, stream_),
+               "copy draft logits", &message);
+  }
+  for (std::uint32_t i = 0; i < count; ++i) {
+    (void)hipEventRecord(lanes[i].session->forward_done_, stream_);
+  }
+  if (!ok || !Check(hipStreamSynchronize(stream_), "draft batch", &message) ||
+      !Check(hipGetLastError(), "draft batch", &message)) {
+    (void)hipStreamSynchronize(stream_);
+    (void)hipStreamSynchronize(branch_stream_);
+    return fail(message);
+  }
+  if (draft_failure_in_ > 0 && --draft_failure_in_ == 0) {
+    return fail("MTP draft batch: injected failure after launch (test hook)");
+  }
+  launch_.wall_ms = StepMs();
+  {
+    float ms = 0.0F;
+    (void)hipEventElapsedTime(&ms, draft_events_[0], draft_events_[1]);
+    launch_.device_ms = ms;
+  }
+  for (std::uint32_t i = 0; i < count; ++i) {
+    if (index[i] < 0) {
+      return fail("MTP draft logits are not comparable");
+    }
+    lanes[i].argmax = index[i];
+  }
+  return true;
+}
+
 bool Executor::MtpRollback(Session& session, std::uint32_t first_pos,
                            std::uint32_t n, std::uint32_t keep,
-                           std::string* error) {
+                           std::string* error, BatchSegment::Placement at) {
   const auto fail = [&](const std::string& message) {
     if (error != nullptr) {
       *error = message;
@@ -1709,7 +1886,7 @@ bool Executor::MtpRollback(Session& session, std::uint32_t first_pos,
     return false;
   };
   if (!options_.mtp || keep == 0 || keep > n || n > kMaxDecodeTokens ||
-      session.position() != first_pos + n) {
+      at.ckpt0 + n - 1 > kMaxDrafts || session.position() != first_pos + n) {
     return fail("rollback does not match the last verify step");
   }
   if (keep == n) {
@@ -1719,14 +1896,15 @@ bool Executor::MtpRollback(Session& session, std::uint32_t first_pos,
   SessionState& st = session.state_;
   const std::size_t state_floats = kKdaLayers * kKdaStateFloats;
   const std::size_t conv_floats = kKdaLayers * kKdaConvStateFloats;
-  kda::CopyFloats(b.kda_ckpt + std::size_t{keep - 1} * state_floats,
-                  st.kda_state, state_floats, stream_);
-  kda::CopyFloats(b.conv_ckpt + std::size_t{keep - 1} * conv_floats,
-                  st.kda_conv, conv_floats, stream_);
+  const std::size_t point = std::size_t{at.ckpt0} + keep - 1;
+  kda::CopyFloats(b.kda_ckpt + point * state_floats, st.kda_state, state_floats,
+                  stream_);
+  kda::CopyFloats(b.conv_ckpt + point * conv_floats, st.kda_conv, conv_floats,
+                  stream_);
   if (st.mtp_cache != nullptr) {
-    (void)hipMemcpyAsync(st.mtp_h, b.hn + std::size_t{keep} * kHidden,
-                         kHidden * sizeof(float), hipMemcpyDeviceToDevice,
-                         stream_);
+    (void)hipMemcpyAsync(
+        st.mtp_h, b.hn + (std::size_t{at.hn0} + keep) * kHidden,
+        kHidden * sizeof(float), hipMemcpyDeviceToDevice, stream_);
   }
   (void)hipEventRecord(session.forward_done_, stream_);
   if (!Check(hipStreamSynchronize(stream_), "rollback", error) ||

@@ -1,6 +1,6 @@
 #!/usr/bin/python3
-"""Ling-3.0-flash batching M1 validation on gfx1151 (artifacts BATCHING-DESIGN.md
-section 5, M1/M6). One JSON object per line on stdout; progress on stderr
+"""Ling-3.0-flash batching (M1 batched AR, M2 batched MTP) validation on gfx1151
+(artifacts BATCHING-DESIGN.md section 5, M1/M2/M6). One JSON object per line on stdout; progress on stderr
 ([m1]). Writes only under --work (default $HOME = /work).
 
 usage: ling-batch-m1 [--stages tests,serve] [--model PATH] [--work DIR]
@@ -13,6 +13,8 @@ Stages:
            lane of a batched step byte-identical to the same session alone;
          ling_3_flash_batch_segments_test (and --mtp): 1..8-token segments of
            mixed widths vs Forward of the same chunks alone;
+         ling_3_flash_batch_mtp_test: batched MTP cycles (greedy == AR, seeded
+           sampled == solo, mixed and split cohorts, failures);
          ling_3_flash_decode_digest (--graph-compare, --mtp --graph-compare,
            and the 24,570-token long form) for the candidate and the parent
            (base build): the C1 "digests" must be identical, batch_vs_solo_differ 0;
@@ -20,10 +22,11 @@ Stages:
            mtp_test (unchanged contracts on the changed solo forward code).
   serve  tests/functional/run.py --suite batch --suite cache-concurrency against
          `gufo serve llm --sessions 4 --speculative off` (batch: four
-         concurrent rows reach physical width 4 and replay identically), then
-         --suite cache-concurrency --suite stream-start with --speculative mtp,
-         then tests/functional/device_loss.py (injected HIP errors, each case
-         restarting a two-session --speculative off server).
+         concurrent rows reach physical width 4 and replay identically), the
+         same plus --suite stream-start with --speculative mtp (batched MTP
+         cycles), then tests/functional/device_loss.py for both modes
+         (injected HIP errors, each case restarting a two-session server; the
+         batched-* cases fault a batched step).
   c1     gufo bench -p 2048 -n 128 -d DEPTHS -r 3 for the parent and the
          candidate alternately (P C P C), --speculative off, and with
          --speculative mtp on the real-text corpus: per (mode, depth, phase)
@@ -34,13 +37,16 @@ Stages:
          8), each mode in --modes: per depth, 8 distinct real-text prompts are
          cached once (max_tokens 1); each prompt then runs alone --rounds
          times (the C=1 reference text and per-request serve timings, compared
-         per request and phase between the binaries, 5 % / 3 ms), then for
+         per request and phase between the binaries, 5 % / 3 ms; all depths'
+         references run before any concurrent round, so both binaries reach
+         them with the same session-slot history, and a request whose prefill
+         or restored tokens differ between binaries is inconclusive), then for
          each concurrency C, --rounds rounds of C simultaneous streamed chat
          completions (greedy, thinking off, at most --tokens tokens; chat
-         usage carries the plan). Per round: the all-decoding window
+         usage carries the plan and the draft counts). Per round: the all-decoding window
          aggregate (chunks streamed while every request decodes / window),
          the wall aggregate, the summed per-request decode rates, each
-         request's plan/width, and whether every text equals the same
+         request's plan/width and draft acceptance, and whether every text equals the same
          prompt's C=1 text. A false texts_equal_c1, an error or a timing flag
          fails the run.
 """
@@ -128,6 +134,7 @@ def stage_tests(a, work):
     tool("batch_test_mtp", [t("batch_test"), "--model", M, "--mtp"])
     tool("batch_segments_test", [t("batch_segments_test"), "--model", M])
     tool("batch_segments_test_mtp", [t("batch_segments_test"), "--model", M, "--mtp"])
+    tool("batch_mtp_test", [t("batch_mtp_test"), "--model", M])
     digests = []
     for label, extra in (("default", ["--graph-compare"]),
                          ("mtp", ["--mtp", "--graph-compare"]),
@@ -162,7 +169,7 @@ def stage_tests(a, work):
 def stage_serve(a, work):
     ok, rows = True, []
     for mode, suites, sessions in (("off", ["batch", "cache-concurrency"], 4),
-                                   ("mtp", ["cache-concurrency", "stream-start"], 4)):
+                                   ("mtp", ["batch", "cache-concurrency", "stream-start"], 4)):
         # run.py creates its output directory and refuses an existing one.
         d = os.path.join(work, "functional-" + mode)
         cmd = [sys.executable, FUNCTIONAL + "/run.py", "--record-baseline", "--sampling-preset", "ling3"]
@@ -187,23 +194,25 @@ def stage_serve(a, work):
             row["stdout_tail"], row["stderr_tail"] = tail(out), tail(err)
         rows.append(row)
     # Injected HIP errors (device_loss.py, ws23): every case restarts the
-    # server; with two sessions and --speculative off the decode runs batched.
-    d = os.path.join(work, "device-loss")
-    cmd = [sys.executable, FUNCTIONAL + "/device_loss.py", "--fault-library", FAULT_LIB,
-           "--output", d, "--startup-timeout", "1800", "--request-timeout", "120",
-           "--case-timeout", "2400", "--", GUFO, "serve", "llm", "--model", a.model,
-           "--sessions", "2", "--context", "4096", "--think", "off", "--speculative", "off"]
-    code, secs, out, err = run(cmd, work, "device-loss", 6 * 3600)
-    row = {"mode": "off", "suites": ["device_loss"], "exit_code": code, "seconds": secs}
-    try:
-        rep = json.load(open(os.path.join(d, "report.json")))
-        row["cases"] = {c["case"]: c["status"] for c in rep["cases"]}
-    except (OSError, ValueError, KeyError) as e:
-        row["report_error"] = str(e)
-    if code != 0:
-        ok = False
-        row["stdout_tail"], row["stderr_tail"] = tail(out), tail(err)
-    rows.append(row)
+    # server; with two sessions the batched-* cases fault a batched step (AR
+    # with --speculative off, draft/verify with mtp).
+    for mode in ("off", "mtp"):
+        d = os.path.join(work, "device-loss-" + mode)
+        cmd = [sys.executable, FUNCTIONAL + "/device_loss.py", "--fault-library", FAULT_LIB,
+               "--output", d, "--startup-timeout", "1800", "--request-timeout", "120",
+               "--case-timeout", "2400", "--", GUFO, "serve", "llm", "--model", a.model,
+               "--sessions", "2", "--context", "4096", "--think", "off", "--speculative", mode]
+        code, secs, out, err = run(cmd, work, "device-loss-" + mode, 6 * 3600)
+        row = {"mode": mode, "suites": ["device_loss"], "exit_code": code, "seconds": secs}
+        try:
+            rep = json.load(open(os.path.join(d, "report.json")))
+            row["cases"] = {c["case"]: c["status"] for c in rep["cases"]}
+        except (OSError, ValueError, KeyError) as e:
+            row["report_error"] = str(e)
+        if code != 0:
+            ok = False
+            row["stdout_tail"], row["stderr_tail"] = tail(out), tail(err)
+        rows.append(row)
     emit({"stage": "serve", "pass": ok, "runs": rows})
     return ok
 
@@ -407,12 +416,18 @@ def round_metrics(results, tokens):
         "agg_window_tps": round(inside / (hi - lo), 2) if hi > lo else None,
         "agg_wall_tps": round(total / span, 2) if span > 0 else None,
         "summed_rate_tps": round(summed, 2),
-        "per_request": [{"plan": x.get("execution_plan"), "width": x.get("physical_execution_width"),
+        # Per-request rates at this concurrency: a C8 request decodes slower
+        # than a C1 one by design; compare aggregates across concurrencies.
+        "per_request_at_this_concurrency": [{"plan": x.get("execution_plan"), "width": x.get("physical_execution_width"),
                          "prompt_tokens": r[1].get("prompt_tokens"),
                          "cached_tokens": (r[1].get("prompt_tokens_details") or {}).get("cached_tokens"),
                          "completion_tokens": r[1].get("completion_tokens"),
                          "prefill_ms": x.get("prefill_ms"), "decode_ms": x.get("decode_ms"),
-                         "ttft_ms": x.get("ttft_ms"), "draft_tokens": x.get("draft_tokens")}
+                         "ttft_ms": x.get("ttft_ms"),
+                         "draft_tokens": r[1].get("draft_tokens"),
+                         "draft_tokens_accepted": r[1].get("draft_tokens_accepted"),
+                         "acceptance": (round(r[1]["draft_tokens_accepted"] / r[1]["draft_tokens"], 4)
+                                        if r[1].get("draft_tokens") else None)}
                         for r, x in zip(results, g)],
     }
 
@@ -424,6 +439,7 @@ def stage_agg(a, work):
     repetitions). Fails on any texts_equal_c1 false, server error or flag."""
     levels = [int(c) for c in a.concurrency.split(",")]
     port, ok = 18480, True
+    summary = []  # aggregate t/s per (mode, binary, depth, C): reported first
     c1 = {}  # (mode, depth, prompt) -> binary -> {phase: [ms per repetition]}
     for mode in a.modes.split(","):
         for who, binary in (("parent", PARENT_GUFO), ("candidate", GUFO)):
@@ -431,6 +447,15 @@ def stage_agg(a, work):
             name = "agg-%s-%s" % (mode, who)
             try:
                 with Server(binary, a, mode, port, work, name):
+                    # Every warm-up and C=1 reference first (all depths), then
+                    # the concurrent rounds: both binaries reach the C=1
+                    # references after the same serial requests, so they lease
+                    # session slots with the same history. A restore into a
+                    # slot that held the same prompt keeps its expanded K/V
+                    # (longer restore, short tail prefill); into another slot
+                    # it re-expands the context in the tail prefill, so slot
+                    # history alone moves prefill_ms by tens of ms at depth.
+                    per_depth = {}
                     for depth in [int(d) for d in a.depths.split(",")]:
                         text, specs = prompts_for(port, depth, max(levels))
                         prompts = []
@@ -447,8 +472,8 @@ def stage_agg(a, work):
                                     spec = (spec[0], spec[1], int(spec[2] * 0.9))
                             prompts.append(p)
                         warm_s = round(time.monotonic() - t0, 1)
-                        # C=1: every prompt alone; the reference texts and the
-                        # per-request serve timings.
+                        # C=1 reference text of every prompt (one request at a
+                        # time) and the per-request serve timings.
                         reference = []
                         for rep in range(a.rounds):
                             for i, p in enumerate(prompts):
@@ -460,10 +485,15 @@ def stage_agg(a, work):
                                     ok = False
                                     log("C1 repeat differs: %s %s d%d prompt %d" % (mode, who, depth, i))
                                 phases = c1.setdefault((mode, depth, i), {}).setdefault(who, {})
-                                for ph in ("prefill_ms", "decode_ms", "ttft_ms"):
+                                for ph in ("cache_restore_ms", "prefill_ms", "decode_ms", "ttft_ms"):
                                     phases.setdefault(ph, []).append(g.get(ph))
                                 phases.setdefault("completion_tokens", []).append(
                                     r[1].get("completion_tokens"))
+                                phases.setdefault("work", []).append(
+                                    [g.get("prefill_tokens"),
+                                     (r[1].get("prompt_tokens_details") or {}).get("cached_tokens")])
+                        per_depth[depth] = (prompts, reference, warm_s)
+                    for depth, (prompts, reference, warm_s) in per_depth.items():
                         for c in levels:
                             for rnd in range(a.rounds):
                                 results = [None] * c
@@ -485,6 +515,10 @@ def stage_agg(a, work):
                                        "concurrency": c, "round": rnd, "warm_s": warm_s,
                                        "texts_equal_c1": same}
                                 row.update(round_metrics(results, a.tokens))
+                                summary.append({k: row[k] for k in (
+                                    "mode", "binary", "depth", "concurrency", "round",
+                                    "agg_window_tps", "agg_wall_tps", "summed_rate_tps",
+                                    "texts_equal_c1")})
                                 emit(row)
                                 log("%s %s d%d C%d r%d: window %s t/s, wall %s t/s, same %s" % (
                                     mode, who, depth, c, rnd, row["agg_window_tps"],
@@ -497,24 +531,31 @@ def stage_agg(a, work):
     for (mode, depth, i), by in sorted(c1.items()):
         if "parent" not in by or "candidate" not in by:
             continue
-        for ph in ("prefill_ms", "decode_ms", "ttft_ms"):
+        # Same prefill and restored tokens in every repetition, or the
+        # requests did different work and their timings do not compare.
+        same_work = by["parent"]["work"] == by["candidate"]["work"]
+        for ph in ("cache_restore_ms", "prefill_ms", "decode_ms", "ttft_ms"):
             pr = [x for x in by["parent"][ph] if x is not None]
             cr = [x for x in by["candidate"][ph] if x is not None]
             if not pr or not cr:
                 continue
             flagged, p_med, c_med = flag(pr, cr)
-            ok = ok and not flagged
+            ok = ok and not flagged and same_work
             rows.append({"mode": mode, "depth": depth, "prompt": i, "phase": ph,
+                         "same_work": same_work,
+                         "work_prefill_cached": [by["parent"]["work"], by["candidate"]["work"]],
+                         "inconclusive": not same_work,
                          "parent_reps_ms": pr, "candidate_reps_ms": cr,
                          "parent_median_ms": p_med, "candidate_median_ms": c_med,
                          "completion_tokens": [by["parent"]["completion_tokens"],
                                                by["candidate"]["completion_tokens"]],
                          "regression_flag": flagged})
-    flags = [r for r in rows if r["regression_flag"]]
+    flags = [r for r in rows if r["regression_flag"] or r["inconclusive"]]
     for r in flags:
         log("C1 serve FLAG %s d%d prompt %d %s: parent %s candidate %s" % (
             r["mode"], r["depth"], r["prompt"], r["phase"], r["parent_reps_ms"],
             r["candidate_reps_ms"]))
+    emit({"stage": "agg_summary", "aggregate_decode": summary})
     emit({"stage": "agg_c1_serve", "pass": ok, "rows": rows, "flags": flags})
     return ok
 

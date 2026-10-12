@@ -1,10 +1,13 @@
 #ifndef GUFO_MODELS_LING_3_FLASH_ENGINE_HPP_
 #define GUFO_MODELS_LING_3_FLASH_ENGINE_HPP_
 
+#include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -14,6 +17,7 @@
 #include "src/models/ling_3_flash/config.hpp"
 #include "src/models/ling_3_flash/gpu_dump.hpp"
 #include "src/models/ling_3_flash/mtp.hpp"
+#include "src/models/ling_3_flash/mtp_sampling.hpp"
 #include "src/models/ling_3_flash/snapshot_format.hpp"
 #include "src/models/ling_3_flash/tokenizer.hpp"
 
@@ -163,6 +167,9 @@ public:
   /// trunk launches. Host bookkeeping only: no device fault is injected.
   void FailBatchesForTest(std::uint32_t count,
                           bool before_wait = false) noexcept;
+  /// Test hook: the batched draft step after the next `skip` ones fails after
+  /// launch (Session::DecodeBatch; bookkeeping only).
+  void FailDraftBatchForTest(std::uint32_t skip) noexcept;
 
 private:
   Model() = default;
@@ -173,6 +180,9 @@ private:
   std::unique_ptr<LingTokenizer> tokenizer_;
   std::unique_ptr<rocm::DeviceModel> device_;
   std::unique_ptr<rocm::Executor> executor_;
+  /// Draft width of the greedy lanes of batched cycles (Session::DecodeBatch;
+  /// sessions of one model are used from one thread at a time).
+  MtpCohortController cohort_;
   double load_seconds_{0.0};
 
   friend class Session;
@@ -379,6 +389,40 @@ public:
                                 std::string* error_msg = nullptr,
                                 bool stop_at_eos = true);
   [[nodiscard]] const DraftStats& Statistics() const noexcept { return stats_; }
+
+  /// One lane of DecodeBatch: DecodeStep's arguments and outcome.
+  struct BatchDecode {
+    Session* session{nullptr};
+    std::size_t max_tokens{0};
+    sampling::SamplerState* sampler{nullptr};
+    bool stop_at_eos{true};
+    DecodeResult result;  ///< Out.
+    bool ok{false};       ///< Out: as DecodeStep's return value.
+    /// Out: not run for a batch-only reason (a snapshot transfer in flight,
+    /// no room in the step); nothing was committed and the sampler is as
+    /// given to the lane's draw (callers pass a copy and DecodeStep alone).
+    bool deferred{false};
+    std::string error;  ///< Out, when !ok.
+    /// Out: wall time of the device steps this lane took part in (shared
+    /// draft and verify steps count in full; waiting for steps of other lanes
+    /// does not), plus its host work: what a serial DecodeStep would report
+    /// for its own cycle.
+    double ms{0.0};
+    /// Out: the most lanes that shared one forward with this lane (1 = it
+    /// ran alone).
+    std::uint32_t width{1};
+  };
+  /// DecodeStep for several sessions of one model, sharing the draft steps and
+  /// the verify forward (at most 8 rows per forward; a cohort that needs more
+  /// splits into several verify forwards). Every lane's committed tokens,
+  /// logits, state and sampler effects equal its own DecodeStep's (batch
+  /// invariance): greedy lanes take a common draft width from the model's
+  /// cohort controller (greedy tokens do not depend on it), sampled lanes the
+  /// width of their own history (MtpLengthController, prior costs), never cut
+  /// to fit a step. Draft counters (Statistics) are outside the contract.
+  /// A lane DecodeStep would refuse fails alone; a pass that fails after
+  /// launch fails its lanes and empties their sessions without device calls.
+  static void DecodeBatch(std::span<BatchDecode> lanes);
   /// Forgets the acceptance history (a new request over retained state).
   void ResetDraftPolicy() noexcept;
   /// Largest number of drafts per step (1..7, default 7).
@@ -392,6 +436,9 @@ public:
     std::function<std::int32_t(std::span<const std::int32_t>)> source;
     /// Test seam, called between Verify() and Rollback() (may throw).
     std::function<void()> after_verify;
+    /// Also a stop token for decoding with stop_at_eos (tests: a stop at a
+    /// chosen point of a truncated trunk's text); -1 = none.
+    std::int32_t stop_token{-1};
   };
   void SetDraftHooks(DraftHooks hooks) { hooks_ = std::move(hooks); }
   /// True when drafting is possible: an MTP model and a consistent MTP state.
@@ -491,11 +538,34 @@ private:
     std::uint32_t first_pos{0};
     std::uint32_t n{0};
     bool have_rows{false};
+    /// Where a batched verify left this lane's rollback points, MTP hidden
+    /// rows and head rows (rocm::BatchSegment::Placement; 0 for Verify).
+    std::uint32_t ckpt0{0};
+    std::uint32_t hn0{0};
+    std::uint32_t logit_row{0};
   };
+  /// A drafted cycle up to its verify (DecodeStep, DecodeBatch).
+  struct Cycle {
+    std::int32_t anchor{0};
+    std::vector<std::int32_t> chain;
+    std::array<std::int32_t, kMaxVerifyTokens> argmax{};
+    bool sampled{false};
+    bool greedy_fast{false};
+    bool stop_at_eos{true};
+    std::optional<MtpProposer> proposer;
+  };
+  /// After a verify of `c.chain`: acceptance with `sampler`, Rollback, the
+  /// result, statistics and the length controller (ObserveCost from `begin`
+  /// when given: serial cycles only).
+  [[nodiscard]] bool IsStop(std::int32_t token) const noexcept;
+  bool FinishCycle(Cycle& c, sampling::SamplerState& sampler,
+                   DecodeResult* result, std::string* error_msg,
+                   const std::chrono::steady_clock::time_point* begin);
   PendingVerify pending_;
   std::vector<float> verify_rows_;
   std::vector<float> draft_logits_;
-  std::uint32_t draft_position_{0};
+  /// Position of the last draft step (UINT32_MAX: none since Invalidate).
+  std::uint32_t draft_position_{UINT32_MAX};
   MtpLengthController draft_length_;
   DraftStats stats_;
   DraftHooks hooks_;

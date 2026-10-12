@@ -212,6 +212,22 @@ struct BatchSegment {
   std::span<float> logits;
   /// First token row whose logits are wanted (UINT32_MAX = last row only).
   std::uint32_t logits_from{UINT32_MAX};
+  /// When not empty, the device argmax of each row from `logits_from` on (the
+  /// head runs even if `logits` is empty), as ForwardRequest::argmax.
+  std::span<std::int32_t> argmax;
+  /// Records rollback points of this segment (2..8 tokens; an MTP executor),
+  /// so it can be cut back with MtpRollback(..., rollback_at), as a
+  /// Forward(rollback = true) of these tokens alone.
+  bool rollback{false};
+  /// Out (status kDone): where this segment's rollback points, MTP hidden
+  /// rows and head rows live until the next forward or draft. Pass it to
+  /// MtpRollback and ReadLogitRow (logit_row is the row of logits_from).
+  struct Placement {
+    std::uint32_t ckpt0{0};
+    std::uint32_t hn0{0};
+    std::uint32_t logit_row{0};
+  };
+  Placement placement{};
   enum class Status : std::uint8_t {
     kPending,
     kDone,      ///< Ran; the session advanced by its tokens.
@@ -220,6 +236,22 @@ struct BatchSegment {
   };
   Status status{Status::kPending};  ///< Out.
   std::string error;                ///< Out: why it was rejected or failed.
+};
+
+/// One session's draft step inside Executor::MtpDraftBatch (DraftRequest
+/// without the test hooks).
+struct DraftLane {
+  Session* session{nullptr};
+  std::int32_t token{0};
+  std::uint32_t position{0};
+  /// The hidden input is the previous draft's own output (chain) or the
+  /// session's trunk-hidden carry. A chained lane reads the output row it
+  /// wrote at the same index of the previous MtpDraftBatch call, so callers
+  /// keep each chain at a fixed index and let shorter chains drop off the end.
+  bool chain{false};
+  /// Host destination of the draft logits (vocab floats); empty = argmax only.
+  std::span<float> logits;
+  std::int32_t argmax{-1};  ///< Out.
 };
 
 /// Single-stream layer loop of the Ling-3.0-flash trunk (PLAN section 1) over
@@ -278,10 +310,17 @@ public:
   [[nodiscard]] bool ForwardBatch(std::span<BatchSegment> segments,
                                   std::string* error_msg = nullptr);
   /// Most rows (and so sessions of one token) one ForwardBatch takes: the
-  /// decode family's 8, within max_batch and one output-head group.
+  /// decode family's 8, within max_batch and one output-head group, and with
+  /// MTP within the hidden rows (rows + segments <= max_batch + 1).
   [[nodiscard]] std::uint32_t batch_row_limit() const noexcept {
     return std::min(
-        {std::uint32_t{8}, options_.max_batch, options_.logit_group});
+        {std::uint32_t{8}, options_.max_batch, options_.logit_group,
+         options_.mtp ? (options_.max_batch + 1) / 2 : std::uint32_t{8}});
+  }
+  /// Test hook: the MtpDraftBatch call after the next `skip` ones fails after
+  /// its launches (host bookkeeping only: no device fault).
+  void FailDraftBatchForTest(std::uint32_t skip) noexcept {
+    draft_failure_in_ = skip + 1;
   }
   /// Where a FailBatchesForTest failure is reported.
   enum class BatchFailurePoint : std::uint8_t {
@@ -363,13 +402,25 @@ public:
   [[nodiscard]] bool MtpDraft(Session& session, const DraftRequest& request,
                               std::int32_t* argmax,
                               std::string* error_msg = nullptr);
+  /// MtpDraft for up to 8 sessions in one pass: the draft block's weights,
+  /// the eh_proj and the draft head are read once; each lane uses its own MTP
+  /// cache, position and hidden input. Every lane's logits, argmax and MTP
+  /// cache row are bit-identical to MtpDraft of that lane alone. All lanes
+  /// must be mtp_valid sessions (checked; false and nothing launched
+  /// otherwise). A failure after launch leaves the lanes' MTP rows at their
+  /// draft positions undefined (past the committed frontier: the next forward
+  /// rewrites them); the trunk state and the MTP carry are not touched.
+  [[nodiscard]] bool MtpDraftBatch(std::span<DraftLane> lanes,
+                                   std::string* error_msg = nullptr);
   /// Cuts the last Forward(rollback = true) of `n` tokens from `first_pos` back
   /// to its first `keep` rows (1 <= keep <= n): restores the KDA state and conv
   /// window after row keep - 1, sets the position and the MTP carry. MLA
-  /// caches need no restore (the position truncates them).
+  /// caches need no restore (the position truncates them). For a segment of a
+  /// ForwardBatch, `at` is its BatchSegment::placement.
   [[nodiscard]] bool MtpRollback(Session& session, std::uint32_t first_pos,
                                  std::uint32_t n, std::uint32_t keep,
-                                 std::string* error_msg = nullptr);
+                                 std::string* error_msg = nullptr,
+                                 BatchSegment::Placement at = {});
   /// Copies row `row` of the logits left by the last head launch (a Forward
   /// with logits or argmax, or MtpDraft) to the host.
   [[nodiscard]] bool ReadLogitRow(std::uint32_t row, std::span<float> out,
@@ -434,6 +485,9 @@ private:
     std::uint32_t first_pos{0};
     std::uint32_t n{0};
     std::uint32_t row0{0};
+    /// Rollback points after each row but the last, from checkpoint `ckpt0`.
+    bool rollback{false};
+    std::uint32_t ckpt0{0};
   };
   /// One block over the lanes' `n` rows in all. `fuse` (decode family only)
   /// selects the fused launches; with `x_ready` the attention norm of this
@@ -449,12 +503,13 @@ private:
                std::string* error_msg);
   /// After a forward of n tokens from first_pos, rows row0.. of the pass:
   /// advances the MTP cache and the trunk-hidden carry (no-op without MTP).
-  /// Overwrites activation rows [0, n) of `h`, so lanes of one pass are filled
-  /// in ascending row order (a lane's rows lie at or past row0 >= the rows
-  /// the earlier lanes overwrote).
+  /// Uses hidden rows [hn0, hn0 + n + 1) (the carry, then the normed rows;
+  /// MtpRollback reads them). Overwrites activation rows [0, n) of `h`, so
+  /// lanes of one pass are filled in ascending row order (a lane's rows lie
+  /// at or past row0 >= the rows the earlier lanes overwrote).
   bool MtpAfterForward(Session& session, std::uint32_t n,
                        std::uint32_t first_pos, std::uint32_t row0,
-                       std::string* error_msg);
+                       std::uint32_t hn0, std::string* error_msg);
   void Kda(const DeviceLayer& l, std::span<const Lane> lanes, std::uint32_t il,
            std::uint32_t n, bool fuse, GpuTensorSink* sink);
   void Mla(const DeviceLayer& l, std::span<const Lane> lanes, std::uint32_t il,
@@ -529,7 +584,6 @@ private:
   std::chrono::steady_clock::time_point step_start_{};
   hipEvent_t draft_events_[2]{nullptr, nullptr};  ///< draft device span
   bool graphs_enabled_{true};
-  bool rollback_active_{false};  ///< Kda() stores rollback points this step
   bool capture_invalidated_{false};
   bool capturing_{false};  ///< Trunk() is being recorded into a graph
   hipStream_t branch_stream_{nullptr};  ///< parallel branch inside a capture
@@ -547,6 +601,7 @@ private:
   std::uint64_t capture_invalidations_{0};
   std::uint32_t capture_breaks_for_test_{0};
   std::uint32_t batch_failures_for_test_{0};
+  std::uint32_t draft_failure_in_{0};
   BatchFailurePoint batch_failure_point_{BatchFailurePoint::kAfterSync};
   /// Pinned staging for the per-step host inputs of graph replays (tokens,
   /// positions).
