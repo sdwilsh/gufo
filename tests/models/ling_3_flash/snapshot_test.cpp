@@ -104,6 +104,11 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
       !Take(*s_gen, layers, &ref_gen, &error)) {
     return fail_with("capture references");
   }
+  // The persistent expanded K/V budget is shared by every live session, so
+  // sessions are released as soon as their last use has passed; at large
+  // contexts the later expansion checks would otherwise find the pool empty.
+  s_ref.reset();
+  s_gen.reset();
 
   // Snapshot at N after a prefill-family run.
   auto s_a = fresh();
@@ -192,6 +197,10 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
               "_vs_uninterrupted",
           ok, std::move(o));
   }
+  s_a.reset();
+  s_b.reset();
+  s_c.reset();
+  s_d.reset();
 
   // 3. Prefill-family continuation: snapshots at several prefill positions,
   //    each continued by a prefill-family chunk (> 8 tokens) == one chunk.
@@ -255,6 +264,47 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
     if (!sp || !ss || !sdv || !feed(*sp, 0, a) || !feed(*ss, 0, total) ||
         !sdv->Feed(other, {}, &error)) {
       return fail_with("expansion reuse setup");
+    }
+    // Precondition: ss must have a store covering the whole prompt (whole
+    // 2048-row blocks), or its expansion is never built and the check below
+    // would measure the shared budget rather than the restore.
+    constexpr std::uint32_t kBlockRows = 2048;
+    constexpr std::uint64_t kBlockBytes =
+        std::uint64_t{kBlockRows} * 7 * 16384;  // 7 MLA layers, 16 KiB/row
+    const std::uint32_t needed_rows =
+        (total + kBlockRows - 1) / kBlockRows * kBlockRows;
+    const std::uint32_t first_layer =
+        static_cast<std::uint32_t>(args.Num("--layer-first", 0));
+    bool mla_resident = false;
+    for (std::uint32_t il = first_layer; il < first_layer + layers; ++il) {
+      mla_resident =
+          mla_resident || (il + 1) % 6 == 0;  // MLA blocks 5, 11, ...
+    }
+    if (!mla_resident) {
+      std::fprintf(stderr,
+                   "snapshot_test: no MLA layer resident (layers=%u, "
+                   "layer_first=%u); expansion checks need at least 6 layers\n",
+                   layers, first_layer);
+      auto o = json::Value::object();
+      o["layers"] = U(layers);
+      o["layer_first"] = U(first_layer);
+      o["error"] = "no MLA layer resident; expansion checks need 6 layers";
+      check("mla_layer_resident", false, std::move(o));
+    }
+    const std::uint32_t store_rows = ss->ExpandedStoreRows();
+    if (store_rows < needed_rows) {
+      std::fprintf(stderr,
+                   "snapshot_test: expanded K/V store too small: "
+                   "store_rows=%u, needed_rows=%u; raise --expanded-kv-bytes "
+                   "to at least %llu MiB for the live sessions\n",
+                   store_rows, needed_rows,
+                   static_cast<unsigned long long>(
+                       (3 * needed_rows / kBlockRows * kBlockBytes) >> 20));
+      auto o = json::Value::object();
+      o["store_rows"] = U(store_rows);
+      o["needed_rows"] = U(needed_rows);
+      o["error"] = "expanded K/V store too small; raise --expanded-kv-bytes";
+      check("expanded_store_covers_prompt", false, std::move(o));
     }
     auto sn = sp->SaveSnapshot(&error);
     const std::uint32_t before = ss->ExpandedRowsValid();
