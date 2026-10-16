@@ -44,6 +44,7 @@
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/ling_3_flash/chat_template.hpp"
 #include "src/models/ling_3_flash/continuation_adapter.hpp"
+#include "src/models/ling_3_flash/device_probe_latch.hpp"
 #include "src/models/ling_3_flash/engine.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/executor.hpp"
 #include "src/models/ling_3_flash/weights.hpp"
@@ -920,21 +921,22 @@ public:
   }
 
   [[nodiscard]] bool DeviceUsable() const override {
+    return ProbeDevice() != DeviceProbeStatus::kLost;
+  }
+
+protected:
+  /// The bounded probe of DeviceUsable(): kUsable or kLost when conclusive,
+  /// kPending when the 5 s bound passed first (reported as usable by
+  /// DeviceUsable(), but an inconclusive result).
+  [[nodiscard]] DeviceProbeStatus ProbeDevice() const {
     constexpr auto kTimeout = std::chrono::seconds(5);
-    const auto deadline = Clock::now() + kTimeout;
-    for (;;) {
-      const auto status = PollDevice();
-      if (status == DeviceProbeStatus::kUsable)
-        return true;
-      if (status == DeviceProbeStatus::kLost)
-        return false;
-      if (Clock::now() >= deadline) {
-        Logger::Warn("scheduler", "event=device_probe_timeout timeout_s=" +
-                                      std::to_string(kTimeout.count()));
-        return true;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+    const auto status = BoundedDeviceProbe(
+        [this] { return PollDevice(); },
+        std::chrono::duration_cast<std::chrono::milliseconds>(kTimeout));
+    if (status == DeviceProbeStatus::kPending)
+      Logger::Warn("scheduler", "event=device_probe_timeout timeout_s=" +
+                                    std::to_string(kTimeout.count()));
+    return status;
   }
 
 private:
@@ -3268,15 +3270,12 @@ public:
   }
   // The probe drives the adapter's device-suspect latch: a lost device stops
   // every further cache transfer (borrowers are retired, release cannot wait
-  // on it), and a usable probe ends the latch, so an injected or transient
-  // HIP failure does not keep cache transfers refused.
+  // on it), and a probe that reports usable ends the latch, so an injected or
+  // transient HIP failure does not keep cache transfers refused. A probe
+  // timeout is inconclusive: it leaves the latch as it is, so a hung device
+  // keeps refusing transfers (a release would otherwise block on it).
   [[nodiscard]] bool DeviceUsable() const override {
-    const bool usable = HipTextModelRunner::DeviceUsable();
-    if (usable)
-      models::ling_3_flash::rocm::Executor::ClearDeviceSuspect();
-    else
-      models::ling_3_flash::rocm::Executor::NoteDeviceError();
-    return usable;
+    return models::ling_3_flash::ApplyDeviceProbe(ProbeDevice());
   }
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {

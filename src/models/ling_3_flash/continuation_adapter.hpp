@@ -44,6 +44,9 @@ public:
   /// this slot kept, in the MLA layer that kept the most (all resident layers
   /// agree; tests; 0 when none).
   [[nodiscard]] std::uint32_t KeptExpansionRows(const cache::Slot&) const;
+  /// Test hook: the next `count` pre-launch HIP calls of the adapter (the slot
+  /// constructor and BeginRestore preparation) fail as if out of memory.
+  static void FailPreLaunchForTest(std::uint32_t count) noexcept;
 
   [[nodiscard]] cache::Capabilities GetCapabilities() const override;
   [[nodiscard]] std::span<const cache::ComponentDescriptor> Components()

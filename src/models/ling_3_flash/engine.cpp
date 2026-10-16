@@ -1359,6 +1359,14 @@ void Session::DecodeBatch(std::span<BatchDecode> lanes) {
         w.live = false;
         continue;
       }
+      if (step[i].failed) {
+        // This lane alone was refused (slot not ready, hook refused); its
+        // peers' drafts stand.
+        draft_position[i] = step[i].position;
+        fail(*w.d, step[i].error);
+        w.live = false;
+        continue;
+      }
       const auto t1 = Clock::now();
       draft_position[i] = step[i].position;
       w.s->draft_position_ = step[i].position;

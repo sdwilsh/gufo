@@ -21,6 +21,7 @@
 #include <tuple>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/ling_3_flash/continuation_hooks.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/device_model.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/executor.hpp"
 #include "src/models/ling_3_flash/weights.hpp"
@@ -39,6 +40,18 @@ bool SameBytes(const std::vector<T>& a, const std::vector<T>& b) {
   return a.size() == b.size() &&
          std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0;
 }
+
+// Stands in for a slot that is not ready (or whose guard refuses).
+struct NotReadyHooks final : l3::ContinuationHooks {
+  bool ready{false};
+  bool throws{false};
+  [[nodiscard]] bool Ready() const noexcept override { return ready; }
+  void BeforeWrite(std::uint32_t, std::uint32_t, std::uint32_t,
+                   std::uint32_t) override {
+    if (throws)
+      throw std::runtime_error("refused");
+  }
+};
 
 struct Lane {
   std::uint32_t depth{0};
@@ -281,6 +294,69 @@ int Body(const Args& args, Report& report) {
       mtp_checks.push_back(std::move(o));
     }
     exec->SetMtpDraftHeadQ8(true);
+    // (A2) A lane whose hooks refuse (not ready, or a throwing guard) fails
+    // alone: the call succeeds, the peers equal MtpDraft alone, and the
+    // refused lane's session is untouched.
+    for (const bool throws : {false, true}) {
+      NotReadyHooks hooks;
+      hooks.ready = throws;  // not ready, or ready but BeforeWrite throws
+      hooks.throws = throws;
+      const std::vector<std::size_t> who = {0, 2, 3};
+      Lane& refused = lanes[2];
+      std::vector<std::uint16_t> rows_before, rows_after;
+      const std::uint32_t refused_rows = refused.batch->position();
+      if (!exec->ReadMtpCache(*refused.batch, refused_rows, &rows_before,
+                              &error)) {
+        return fatal("read refused rows");
+      }
+      refused.batch->SetContinuationHooksForTest(&hooks);
+      std::vector<std::vector<float>> out(who.size(),
+                                          std::vector<float>(l3::kVocab));
+      std::vector<rocm::DraftLane> step;
+      for (std::size_t r = 0; r < who.size(); ++r) {
+        rocm::DraftLane d;
+        d.session = lanes[who[r]].batch.get();
+        d.token = Tok(77000 + 13 * who[r]);
+        d.position = d.session->position() - 1;
+        d.logits = out[r];
+        step.push_back(d);
+      }
+      const bool ran = exec->MtpDraftBatch(step, &error);
+      refused.batch->SetContinuationHooksForTest(nullptr);
+      std::uint32_t bad = 0;
+      if (!ran || step[0].failed || !step[1].failed || step[1].error.empty() ||
+          step[2].failed || step[1].argmax != -1) {
+        ++bad;
+      }
+      for (const std::size_t r : {std::size_t{0}, std::size_t{2}}) {
+        rocm::DraftRequest req;
+        req.token = step[r].token;
+        req.position = step[r].position;
+        std::vector<float> want(l3::kVocab);
+        req.logits = want;
+        std::int32_t argmax = -1;
+        if (!exec->MtpDraft(*lanes[who[r]].solo, req, &argmax, &error)) {
+          return fatal("solo draft of a peer");
+        }
+        if (!SameBytes(want, out[r]) || argmax != step[r].argmax) {
+          ++bad;
+        }
+      }
+      if (!exec->ReadMtpCache(*refused.batch, refused_rows, &rows_after,
+                              &error)) {
+        return fatal("read refused rows");
+      }
+      bad += SameBytes(rows_before, rows_after) ? 0 : 1;
+      auto o = json::Value::object();
+      o["name"] = throws ? "draft_batch_refusing_hook_fails_alone"
+                         : "draft_batch_not_ready_lane_fails_alone";
+      o["mismatches"] = U(bad);
+      o["pass"] = bad == 0;
+      std::fprintf(stderr, "[check] %s: %s\n", o["name"].str().c_str(),
+                   bad == 0 ? "PASS" : "FAIL");
+      failures_seen += bad == 0 ? 0 : 1;
+      mtp_checks.push_back(std::move(o));
+    }
     // (B) Verify segments with rollback points, cut back per lane: logits,
     // argmax and (at the end) the whole state equal Forward(rollback) +
     // MtpRollback alone. Cohorts {3,2,3} (5 points), {4,4}, {2,1,1,4}.
