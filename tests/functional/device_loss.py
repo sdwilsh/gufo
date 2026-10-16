@@ -22,6 +22,9 @@ CASES = {
     "loss-stream-chat": ("loss", "/v1/chat/completions", True),
     "loss-stream-responses": ("loss", "/v1/responses", True),
     "idle-loss": ("loss", "/v1/completions", False),
+    # Component cache: a cached request leaves borrowed checkpoint rows that
+    # the idle slot preserves in the background when the loss is detected.
+    "idle-spill-loss": ("loss", "/v1/completions", False),
     "idle-pending-arrival": ("timeout", "/v1/completions", False),
     "loss-after-token-chat": ("loss", "/v1/chat/completions", True),
     "blocked-writer-watchdog": ("loss", "/v1/completions", True),
@@ -189,10 +192,20 @@ def run_case(args, name):
             body = generation(path, stream, model)
             record["request"] = {"path": path, "body": body}
             if name.startswith("idle-"):
+                if name == "idle-spill-loss":
+                    # About 1,600 cached tokens: complete latent-row
+                    # chunks are borrowed, then copied while the slot idles.
+                    record["cached"] = request(port, "POST", "/v1/completions", {
+                        "prompt": "Count from one to a thousand, spelling each "
+                                  "number. " * 120,
+                        "max_tokens": 4, "temperature": 0, "cache_prompt": True,
+                    })
+                    require(record["cached"]["status"] == 200,
+                            "cached request before the idle loss failed")
                 (output / "probe_only").touch()
                 started = time.monotonic()
                 (output / "armed").touch()
-                if name == "idle-loss":
+                if name in ("idle-loss", "idle-spill-loss"):
                     # No inference, health traffic or disconnect initiates exit.
                     record["exit_code"] = process.wait(timeout=13)
                     record["exit_after_arm_s"] = time.monotonic() - started

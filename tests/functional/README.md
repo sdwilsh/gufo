@@ -226,7 +226,9 @@ python3 tests/functional/device_loss.py \
 ```
 
 It checks recoverable HIP errors, a pending probe's five-second timeout,
-buffered/streaming error contracts, idle loss without any HTTP traffic, arrival
+buffered/streaming error contracts, idle loss without any HTTP traffic (also
+right after a cached request, while a component-cache slot preserves its
+borrowed rows in the background), arrival
 while an idle probe stays pending, cleanup avoidance and exit status 75.
 Buffered failures return JSON 503. Streams commit HTTP 200 at admission, so a
 failure during prefill or after the first token emits a terminal SSE error. A

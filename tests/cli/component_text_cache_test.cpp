@@ -34,6 +34,8 @@ public:
   bool in_pass{};
   bool partial{};
   std::size_t private_blocks{128};
+  std::size_t tail{0};
+  mutable std::vector<std::size_t> steps;
   mutable std::size_t through_calls{};
   bool UsesComponentCache() const override { return true; }
   TextRunnerDescriptor Descriptor() const override {
@@ -46,7 +48,8 @@ public:
                              .final_token_advance_required = false,
                              .prefix_reuse = true,
                              .in_pass_checkpoint = in_pass,
-                             .partial_prefill_retention = partial}};
+                             .partial_prefill_retention = partial,
+                             .min_checkpoint_tail_tokens = tail}};
   }
   TextRunnerResourceClaim ResourceClaim() const override {
     return {.state_capacity_bytes = 1ULL << 30,
@@ -164,6 +167,7 @@ public:
     const auto count = std::min(budget, prompt.size() - offset);
     s.adapter.Append(s.slot, prompt.subspan(offset, count),
                      prompt.subspan(offset, count));
+    steps.push_back(count);
     return {count, offset + count == prompt.size()};
   }
   std::optional<std::size_t> PrefillCheckpointBytes(
@@ -246,6 +250,38 @@ void BudgetUsesAllocatedSlotsInsteadOfLazyStateClaim() {
       (void)request.Prefill(8);
     assert(request.SelectNext().token != 0);
   }
+}
+// A model whose numerics depend on chunk size (Ling: 1..8-token chunks run a
+// different numeric family) sets min_checkpoint_tail_tokens. On the component
+// path no planned cut point (stable boundary, grid capture, prompt end) may
+// then leave a prefill pass of 1..8 tokens; without the rule one does.
+void CheckpointTailKeepsPassesInOneFamily() {
+  const auto passes = [](std::size_t tail, std::size_t stable,
+                         TextRunnerToken base) {
+    auto runner = std::make_shared<Runner>();
+    runner->tail = tail;
+    TextRunnerPool pool(runner, 1);
+    std::vector<TextRunnerToken> prompt(4095);
+    std::iota(prompt.begin(), prompt.end(), base);
+    auto request =
+        pool.Acquire(prompt, sampling::SamplingConfig{}, {}, {}, true, stable);
+    while (!request.prefill_complete())
+      (void)request.Prefill(4096);
+    request.Invalidate();
+    return runner->steps;
+  };
+  const auto small = [](const std::vector<std::size_t>& steps) {
+    return std::ranges::any_of(steps, [](auto n) { return n >= 1 && n <= 8; });
+  };
+  // Stable boundary 3 before the 2048 grid point, 4 after it, and 5 before
+  // the prompt end.
+  TextRunnerToken base = 10;
+  for (const std::size_t stable : {2045ULL, 2052ULL, 4090ULL}) {
+    const auto steps = passes(9, stable, base += 5000);
+    assert(!small(steps));
+    assert(std::accumulate(steps.begin(), steps.end(), std::size_t{0}) == 4095);
+  }
+  assert(small(passes(0, 2045, base + 5000)));
 }
 void Prefill(TextRunnerPool::Request& request) {
   while (!request.prefill_complete())
@@ -1776,6 +1812,7 @@ void UnbackedDeepRowsSurviveDiskRestart() {
 }
 }  // namespace
 int main() {
+  CheckpointTailKeepsPassesInOneFamily();
   PublishedResidentCheckpointKeepsDiskStep();
   CancelledPrefillKeepsCompletedSteps();
   SharedPeerReusesTheCurrentStableCapture();
