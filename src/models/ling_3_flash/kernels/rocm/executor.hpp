@@ -175,6 +175,10 @@ public:
   [[nodiscard]] const ContinuationHooks* continuation_hooks() const noexcept {
     return continuation_hooks_;
   }
+  /// Test hook: installs executor-level callbacks without an adapter.
+  void SetContinuationHooksForTest(ContinuationHooks* hooks) noexcept {
+    continuation_hooks_ = hooks;
+  }
 
 private:
   friend class Executor;
@@ -326,6 +330,11 @@ struct DraftLane {
   /// Host destination of the draft logits (vocab floats); empty = argmax only.
   std::span<float> logits;
   std::int32_t argmax{-1};  ///< Out.
+  /// Out: this lane alone was refused before launch (its slot is not ready or
+  /// its hook refused). It wrote nothing to its session; `error` says why and
+  /// the other lanes ran. The call still returns true.
+  bool failed{false};
+  std::string error;
 };
 
 /// Single-stream layer loop of the Ling-3.0-flash trunk (PLAN section 1) over
@@ -489,8 +498,10 @@ public:
   /// Process-wide: a HIP call of a forward, draft, rollback or cache transfer
   /// failed since the last successful forward. The component cache then
   /// submits no further device work for borrowed rows (they are retired),
-  /// so release paths cannot wait on a lost device. Cleared by the next
-  /// successful forward or by a usable device probe.
+  /// so release paths cannot wait on a lost device. Set only by post-launch
+  /// failures (never by a pre-launch refusal or allocation failure). Cleared
+  /// by the next successful forward or by a probe that reports usable (not by
+  /// a probe timeout, which is inconclusive).
   [[nodiscard]] static bool DeviceSuspect() noexcept;
   static void NoteDeviceError() noexcept;
   static void ClearDeviceSuspect() noexcept;
@@ -524,9 +535,11 @@ public:
   /// cache, position and hidden input. Every lane's logits, argmax and MTP
   /// cache row are bit-identical to MtpDraft of that lane alone. All lanes
   /// must be mtp_valid sessions (checked; false and nothing launched
-  /// otherwise). A failure after launch leaves the lanes' MTP rows at their
-  /// draft positions undefined (past the committed frontier: the next forward
-  /// rewrites them); the trunk state and the MTP carry are not touched.
+  /// otherwise). A lane whose continuation hooks refuse is marked
+  /// DraftLane::failed and the rest still run. A failure after launch leaves
+  /// the lanes' MTP rows at their draft positions undefined (past the committed
+  /// frontier: the next forward rewrites them); the trunk state and the MTP
+  /// carry are not touched.
   [[nodiscard]] bool MtpDraftBatch(std::span<DraftLane> lanes,
                                    std::string* error_msg = nullptr);
   /// Cuts the last Forward(rollback = true) of `n` tokens from `first_pos` back

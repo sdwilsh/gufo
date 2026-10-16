@@ -1,6 +1,7 @@
 #ifndef GUFO_SERVER_TEXT_MODEL_RUNNER_HPP_
 #define GUFO_SERVER_TEXT_MODEL_RUNNER_HPP_
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -13,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "src/cache/adapter.hpp"
@@ -611,6 +613,25 @@ private:
     const ChatRequest& request, const TextModelRunner& runner,
     sampling::SamplingConfig* sampling,
     std::optional<sampling::JsonConstraint::ToolFormat>* tool_format = nullptr);
+
+/// Calls `poll` (a PollDevice-like callable) until it is conclusive or
+/// `timeout` passes. kUsable and kLost are conclusive; kPending at the bound
+/// means the probe did not finish, which is inconclusive and must not be read
+/// as usable.
+template<class Poll>
+[[nodiscard]] TextModelRunner::DeviceProbeStatus BoundedDeviceProbe(
+    Poll&& poll, std::chrono::milliseconds timeout) {
+  using Status = TextModelRunner::DeviceProbeStatus;
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (;;) {
+    const Status status = poll();
+    if (status != Status::kPending)
+      return status;
+    if (std::chrono::steady_clock::now() >= deadline)
+      return Status::kPending;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
 
 }  // namespace gufo::server
 
