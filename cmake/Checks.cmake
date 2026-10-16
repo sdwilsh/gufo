@@ -26,7 +26,7 @@ set(gufo_pr_targets
   qwen38_flash_next_config_test qwen38_flash_next_mtp_sampling_test
   qwen38_flash_next_continuation_layout_test
   ds4_sampling_test ds4_chat_template_test ds4_cli_test
-  ling_3_flash_chat_template_test
+  ling_3_flash_chat_template_test ling_3_flash_continuation_layout_test
   qwen3_asr_config_test qwen3_asr_audio_api_test
   qwen3_tts_config_test qwen3_tts_audio_api_test
   qwen_image_21_test
@@ -36,12 +36,12 @@ list(REMOVE_ITEM gufo_pr_tests
   qwen38_flash_next_config_test qwen38_flash_next_mtp_sampling_test
   qwen38_flash_next_continuation_layout_test
   ds4_sampling_test ds4_chat_template_test ds4_cli_test
-  ling_3_flash_chat_template_test)
+  ling_3_flash_chat_template_test ling_3_flash_continuation_layout_test)
 list(APPEND gufo_pr_tests
   "qwen38_flash_next\\.config" "qwen38_flash_next\\.mtp_sampling"
   "qwen38_flash_next\\.continuation_layout"
   "ds4\\.sampling" "ds4\\.template" "ds4\\.cli"
-  "ling_3_flash\\.chat_template"
+  "ling_3_flash\\.chat_template" "ling_3_flash\\.continuation_layout"
   gufo_version gufo_help serve_cli_test eval_http_test functional_runner_test
   cache_workloads_test cache_disk_faults_test
   cache_boundary_test

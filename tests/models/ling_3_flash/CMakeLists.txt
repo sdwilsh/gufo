@@ -18,6 +18,9 @@ target_compile_definitions(ling_3_flash_tokenizer_test PRIVATE
   GUFO_LING_VOCAB_GGUF="${LING_FIXTURES}/ling-vocab.gguf.fixture"
   GUFO_LING_TOKENIZER_GOLDENS="${LING_FIXTURES}/tokenizer_goldens.json")
 add_ling_3_flash_test(snapshot_format gufo_ling_3_flash "cpu")
+# Component-cache layout, pass plan and the package's chunk handling.
+add_ling_3_flash_test(continuation_layout gufo_ling_3_flash "cpu")
+target_link_libraries(ling_3_flash_continuation_layout_test PRIVATE gufo_cache)
 add_ling_3_flash_test(host_copy_pool gufo_ling_3_flash "cpu")
 add_ling_3_flash_test(mtp_policy gufo_ling_3_flash "cpu")
 add_ling_3_flash_test(prompt_lookup gufo_ling_3_flash "cpu")
