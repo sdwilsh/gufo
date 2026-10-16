@@ -3107,12 +3107,13 @@ private:
   cache::Identity component_identity_;
 };
 
-// Ling-3.0-flash: one device session per request state. Snapshots are
-// complete host copies (KDA state, conv windows, MLA latent rows, tokens and
-// logits; see src/models/ling_3_flash/snapshot_format.hpp) restorable into any
-// session, so the runner takes part in the RAM cache, the disk cache, shared
-// prefix learning and forking like the Qwen hybrid runners. The WS12 expanded
-// K/V cache is derived from the latent rows and is never captured.
+// Ling-3.0-flash: one device session per component-cache slot
+// (src/models/ling_3_flash/continuation_adapter.hpp). Checkpoints hold the
+// recurrent state and logits as private components and the MLA/MTP latent rows
+// as shared append rows, restorable into any slot, so the runner takes part in
+// the RAM cache, the disk cache, shared prefix learning and forking like
+// Flash-Next. The WS12 expanded K/V cache is derived from the latent rows and
+// is never captured.
 constexpr std::string_view kLingStateAbi = "ling-3-flash-rocm-session-v2";
 // Sessions of an MTP model also carry the MTP block's latent cache and hidden
 // carry (their snapshots include them), a different state ABI.
@@ -3160,36 +3161,18 @@ std::vector<std::uint8_t> LingCompatibilityIdentity(
 
 class LingTextRunnerState final : public TextRunnerState {
 public:
-  LingTextRunnerState(const std::shared_ptr<LingModel>& model,
-                      std::uint32_t max_context,
-                      std::uint32_t max_draft_tokens) {
-    std::string error;
-    owned_ = model->CreateSession(max_context, &error);
-    if (owned_ == nullptr) {
-      throw std::runtime_error("Failed to create Ling-3.0-flash session: " +
-                               error);
-    }
-    owned_->Reset();
-    if (model->HasMtp()) {
-      owned_->SetMaxDrafts(max_draft_tokens);
-    }
-    session_ = owned_.get();
-  }
   /// Bound to a component-cache slot, which owns the session.
   LingTextRunnerState(LingSession& session, cache::Adapter& adapter,
                       cache::Slot& slot)
       : session_(&session), adapter_(&adapter), slot_(&slot) {}
 
-  // No device call: invalidation follows failed work units, and after a GPU
-  // loss any device cleanup can block forever before the scheduler has
-  // classified the failure. The next prefill zeroes the recurrent state. A
-  // component slot first releases its borrowed rows (host only once a HIP
-  // call failed: the adapter retires them instead of copying).
+  // No device call of its own: invalidation follows failed work units, and
+  // after a GPU loss any device cleanup can block forever before the
+  // scheduler has classified the failure. The slot releases its borrowed rows
+  // (once a HIP call failed the adapter retires them instead of copying) and
+  // the next prefill zeroes the recurrent state.
   void Invalidate() noexcept override {
-    if (adapter_ != nullptr)
-      (void)adapter_->Invalidate(*slot_);
-    else
-      session_->Invalidate();
+    (void)adapter_->Invalidate(*slot_);
     position_ = 0;
   }
   [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
@@ -3203,40 +3186,10 @@ public:
   void set_position(std::size_t position) noexcept { position_ = position; }
 
 private:
-  std::unique_ptr<LingSession> owned_;
   LingSession* session_{nullptr};
   cache::Adapter* adapter_{nullptr};
   cache::Slot* slot_{nullptr};
   std::size_t position_{0};
-};
-
-class LingTextRunnerSnapshot final : public TextRunnerSnapshot {
-public:
-  LingTextRunnerSnapshot(
-      std::shared_ptr<LingModel> model,
-      std::unique_ptr<models::ling_3_flash::SessionSnapshot> snapshot)
-      : model(std::move(model)), snapshot(std::move(snapshot)) {}
-
-  [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
-    return snapshot == nullptr ? 0 : snapshot->SizeBytes();
-  }
-  // The latent rows are copied in the background after capture; restoring
-  // or serializing waits for them, and a failed copy leaves nothing to use.
-  [[nodiscard]] bool Usable() const noexcept override {
-    return snapshot != nullptr && !snapshot->Failed();
-  }
-  /// The complete payload. Waits for the background copy.
-  [[nodiscard]] std::span<const std::uint8_t> Payload() const {
-    std::string error;
-    if (snapshot == nullptr || !snapshot->Wait(&error)) {
-      throw std::runtime_error("Ling-3.0-flash snapshot copy failed: " + error);
-    }
-    return snapshot->bytes();
-  }
-
-  // Declared before `snapshot`: destroyed after its copy thread is joined.
-  std::shared_ptr<LingModel> model;
-  std::unique_ptr<models::ling_3_flash::SessionSnapshot> snapshot;
 };
 
 LingTextRunnerState& RequireLingState(TextRunnerState& state) {
@@ -3481,8 +3434,8 @@ public:
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    return std::make_unique<LingTextRunnerState>(model_, max_context_,
-                                                 max_draft_tokens_);
+    throw std::logic_error(
+        "Ling-3.0-flash execution slots are owned by the component cache");
   }
 
   void PreparePrefixReuse(
@@ -3746,81 +3699,6 @@ public:
     return RequireLingState(state).position();
   }
 
-  [[nodiscard]] std::size_t SnapshotPayloadBytes(
-      const TextRunnerState& state) const override {
-    const std::size_t bytes = RequireLingState(state).session().SnapshotBytes();
-    if (bytes == 0)
-      throw std::runtime_error("Ling-3.0-flash snapshot size is unavailable");
-    return bytes;
-  }
-
-  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
-      const TextRunnerState& state) const override {
-    const auto& ling = RequireLingState(state);
-    std::string error;
-    auto snapshot = ling.session().SaveSnapshot(&error);
-    if (snapshot == nullptr)
-      throw std::runtime_error("Ling-3.0-flash snapshot failed: " + error);
-    if (snapshot->Position() != ling.position())
-      throw std::logic_error("Ling-3.0-flash snapshot position mismatch");
-    return std::make_unique<LingTextRunnerSnapshot>(model_,
-                                                    std::move(snapshot));
-  }
-
-  void RestoreOrFork(TextRunnerState& state,
-                     const TextRunnerSnapshot& snapshot) const override {
-    const auto& saved = RequireLingSnapshot(snapshot);
-    auto& restored = RequireLingState(state);
-    std::string error;
-    if (!restored.session().RestoreSnapshot(*saved.snapshot, &error)) {
-      restored.Invalidate();
-      throw std::runtime_error("Ling-3.0-flash snapshot restore failed: " +
-                               error);
-    }
-    restored.set_position(saved.snapshot->Position());
-  }
-
-  [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
-      const TextRunnerSnapshot& snapshot) const override {
-    return RequireLingSnapshot(snapshot).PayloadBytes();
-  }
-
-  [[nodiscard]] std::size_t SerializePersistentSnapshot(
-      const TextRunnerSnapshot& snapshot,
-      std::span<std::uint8_t> destination) const override {
-    const auto bytes = RequireLingSnapshot(snapshot).Payload();
-    if (destination.size() != bytes.size()) {
-      throw std::invalid_argument(
-          "Ling-3.0-flash persistent snapshot serialization failed");
-    }
-    std::ranges::copy(bytes, destination.begin());
-    return destination.size();
-  }
-
-  void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
-                                const SnapshotSink& sink) const override {
-    sink(RequireLingSnapshot(snapshot).Payload());
-  }
-
-  void RestorePersistentSnapshot(
-      TextRunnerState& state,
-      std::span<const std::uint8_t> payload) const override {
-    auto& restored = RequireLingState(state);
-    std::string error;
-    if (!restored.session().RestoreSnapshot(payload, &error)) {
-      restored.Invalidate();
-      throw std::runtime_error(
-          "Ling-3.0-flash persistent snapshot restore failed: " + error);
-    }
-    const std::uint32_t position = restored.session().Position();
-    if (position == 0 || position > max_context_) {
-      restored.Invalidate();
-      throw std::runtime_error(
-          "Ling-3.0-flash persistent snapshot restored an invalid position");
-    }
-    restored.set_position(position);
-  }
-
 private:
   /// Advance of each state by its token in one Session::EvaluateBatch pass.
   /// Returns one failure per lane (null on success); a failed lane's state is
@@ -3865,17 +3743,6 @@ private:
           "Ling-3.0-flash decode failed: " + lanes[j].error));
     }
     return failures;
-  }
-
-  const LingTextRunnerSnapshot& RequireLingSnapshot(
-      const TextRunnerSnapshot& snapshot) const {
-    const auto* ling = dynamic_cast<const LingTextRunnerSnapshot*>(&snapshot);
-    if (ling == nullptr || ling->model.get() != model_.get() ||
-        ling->snapshot == nullptr) {
-      throw std::invalid_argument(
-          "Ling-3.0-flash snapshot does not belong to this model");
-    }
-    return *ling;
   }
 
   // The Bailing V3 template knows thinking on/off only; the default is on.
