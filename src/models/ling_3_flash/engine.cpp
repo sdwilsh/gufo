@@ -15,6 +15,7 @@
 #include <thread>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/ling_3_flash/continuation_hooks.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/device_model.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/executor.hpp"
 #include "src/models/ling_3_flash/mtp_sampling.hpp"
@@ -326,6 +327,11 @@ void Session::EvaluateBatch(std::span<BatchLane> lanes) {
     // Evaluate's own checks (Feed), in its order and with its effects.
     if (!s->valid_) {
       lane.error = "session is invalid after an earlier failure";
+      continue;
+    }
+    if (const auto* hooks = s->session_->continuation_hooks();
+        hooks != nullptr && !hooks->Ready()) {
+      lane.error = "session slot is not ready for execution";
       continue;
     }
     if (s->reset_pending_) {
@@ -1156,6 +1162,13 @@ void Session::DecodeBatch(std::span<BatchDecode> lanes) {
     const auto t0 = Clock::now();
     if (!s->valid_ || s->pending_.active) {
       fail(d, "session needs a successful Sync after a failed operation");
+      continue;
+    }
+    // Readiness per lane at admission (component cache): a slot that cannot
+    // execute fails alone, before any shared draft or verify step.
+    if (const auto* hooks = s->session_->continuation_hooks();
+        hooks != nullptr && !hooks->Ready()) {
+      fail(d, "session slot is not ready for execution");
       continue;
     }
     if (d.max_tokens == 0 || s->tokens_.empty() ||
