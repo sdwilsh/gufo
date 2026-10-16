@@ -170,9 +170,9 @@ Greedy output matches AR, and sampled requests use p/q acceptance. Pass
 one forward pass per token. Each request's tokens, logits, and state stay
 bit-identical to decoding it alone, and one request keeps the single-session
 path. With MTP, cohorts of up to eight requests share draft steps and verify
-forwards in the same way. Ling's tokenizer keeps the
-tokens of up to 64 MiB of recent message text in process memory (least
-recently used first out, no expiry), so a repeated or continued conversation
+forwards in the same way. The Ling-3.0-Flash tokenizer keeps the tokens of up to
+64 MiB of recent message text in process memory, evicting the least recently
+used first, with no expiry. A repeated or continued conversation therefore
 tokenizes only what changed.
 Request decoding leaves EOS and later speculative tokens out of the reusable
 checkpoint. Fixed-length benchmarks may continue through EOS.
@@ -197,30 +197,34 @@ the
 and [Qwen3.8 Flash-Next](models/qwen3.8-flash-next/README.md) for the memory
 cost.
 
-Ling-3.0-flash (`bailingmoe3`) snapshots are complete host copies: KDA state and
-conv windows (75.5 MiB), the F16 MLA latent rows (8068 bytes per token, tokens
-included) and the last logits. They restore bit for bit into any session, so the
-RAM cache, learned shared prefixes, forks and `--cache-disk` work as for the
-Qwen hybrids; a 60k-token snapshot is about 0.55 GiB, so size
-`--cache-ram-bytes` for the contexts you serve. The snapshot never stores
-derived data (the expanded K/V cache, whose device budget is
-`--expanded-kv-bytes`, 12 GiB by default, 0 disables; a restore invalidates it
-and it is rebuilt lazily from the latent rows with identical bits). A
-restored request equals the cold run iff each later token is computed in the
-numeric family it has cold (prefill chunks above 8 tokens, decode and 1-8 token
-chunks in the small-batch family; see the reproducibility contract in
+Ling-3.0-Flash (`bailingmoe3`) uses the component continuation cache, as
+Flash-Next does. A checkpoint holds the KDA state and conv windows, the last
+logits and metadata (75.5 MiB, copied), and the F16 MLA latent rows and MTP
+rows (8068 bytes per token with MTP off, tokens included). The checkpoints of
+one execution share those rows in 512-row chunks and borrow them from the
+session until it overwrites them. Checkpoints restore bit for bit into any
+session, so the RAM cache, learned shared prefixes, forks, and `--cache-disk`
+work as for Flash-Next. Size `--cache-ram-bytes` for the contexts you serve.
+
+Checkpoints never store derived data, such as the expanded K/V cache, whose
+device budget is `--expanded-kv-bytes` (12 GiB by default, 0 disables). A
+restore keeps the expansion of the latent rows it leaves bit-identical, and
+Gufo rebuilds the rest lazily with identical bits. A restored request equals the
+cold run exactly when each later token is computed in the numeric family it has
+cold (prefill chunks above 8 tokens, decode and 1-8 token chunks in the
+small-batch family; see the reproducibility contract in
 `src/models/ling_3_flash/engine.hpp`). Planned checkpoints stay at least 9
-tokens before the prompt end and the prefill never leaves a 1-8 token tail
-before one when it can rebalance. The disk-cache identity covers
-the GGUF digest, chat template, snapshot payload version and numerics id, so
-files from another artifact or numeric revision are never loaded. The numerics
-id is a CMake-derived SHA-256 of the kernel sources, HIP compiler version and
-flags, target architectures, ROCm release and prefill batch; the payload
-version covers only the byte layout. Every pair of planned checkpoints stays at
-least 9 tokens apart and `--prefill-chunk` is raised to 18 for Ling, so restored
-runs keep the numerics of uncached ones (only prompts or suffixes under 9
-tokens, and decode, differ, as always). Prompts under 128 tokens are not
-retained (a snapshot is 75.5 MiB before the first token).
+tokens before the prompt end, and the prefill never leaves a 1-8 token tail
+before one when it can rebalance. The disk-cache identity covers the GGUF
+digest, chat template, component layout, and numerics id, so Gufo never loads
+files from another artifact or numeric revision. The numerics id is a
+CMake-derived SHA-256 of the kernel sources, HIP compiler version and flags,
+target architectures, ROCm release, and prefill batch. Every pair of planned
+checkpoints stays at least 9 tokens apart, and Gufo raises `--prefill-chunk` to
+18 for Ling-3.0-Flash, so restored runs keep the numerics of uncached ones. Only
+prompts or suffixes under 9 tokens, and decode, differ, as always. Prompts under
+128 tokens are not retained (the private state is 75.5 MiB before the first
+token).
 
 The GGUF identity reads the whole artifact (about 69 GiB) once and caches the
 digest under `$XDG_CACHE_HOME/gufo/gguf-sha256-v1` (default `~/.cache`). The

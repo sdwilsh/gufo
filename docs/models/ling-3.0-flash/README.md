@@ -112,9 +112,11 @@ expanded K/V store, the sessions, and the working buffers.
   so Q5_K_M should peak near 90 GiB (AR) and 92 GiB (MTP) there; this
   Q5_K_M figure is an estimate, not a measurement.
 - **AD-Q4_K_S** fits both a 96 and a 108 GiB limit at the defaults.
-- **RAM cache:** a snapshot is 79.19 MB plus 8,068 B per token with MTP off
-  (measured) and about 9.2 KB per token with MTP (estimate), so a 196,608-token
-  conversation is about 1.67 GB and about 1.89 GB. Size `--cache-ram-bytes` for
+- **RAM cache:** a checkpoint is 79.19 MB of private state plus 8,068 B per
+  token with MTP off and 9,220 B per token with MTP, so a 196,608-token
+  conversation is about 1.67 GB and about 1.89 GB. Checkpoints of one
+  conversation share their latent rows in 512-row chunks, so later checkpoints
+  cost mostly their private state. Size `--cache-ram-bytes` for
   the contexts you serve; about 15 GB suits four 196k-token conversations with
   several checkpoints each.
 
@@ -150,17 +152,17 @@ expanded K/V store, the sessions, and the working buffers.
 
 Tool calls use the Bailing syntax with a grammar, and the reasoning block is
 split from the answer. The default sampling preset (`ling3`) is temperature
-0.6, top-p 0.95, top-k 20. The RAM and disk continuation caches keep
-self-contained snapshots with a 9-token checkpoint tail and a minimum snapshot
-of 128 tokens.
+0.6, top-p 0.95, top-k 20. The RAM and disk continuation caches use the
+component cache (shared latent-row chunks, copied recurrent state) with a
+9-token checkpoint tail and a minimum checkpoint of 128 tokens.
 
 ## Known limits
 
-- **Cache adapter (card 19).** Ling snapshots use the engine's own
-  capture/restore path. When upstream switches every model to the new cache
-  (card 19, not yet landed when this card was written), that path is removed,
-  and Ling needs a cache adapter (a large change that needs GPU requalification)
-  or it loses its prompt cache.
+- **Component cache.** Ling serves from the component cache (src/cache), with
+  its adapter in `src/models/ling_3_flash/continuation_adapter.*`. Disk cache
+  directories written by the earlier snapshot format are rebuilt cold. The
+  benchmark and functional figures on this card were measured on the earlier
+  snapshot cache and are being requalified.
 - **Tool-call streaming.** The Bailing parser publishes a tool call only after
   its first argument value opens or an argument finishes. A header-only call (a
   function name with no argument) is never published, and an end of stream there
