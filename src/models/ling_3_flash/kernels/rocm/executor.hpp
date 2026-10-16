@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
 #include <iterator>
 #include <map>
@@ -24,6 +25,11 @@
 #include "src/models/ling_3_flash/kernels/rocm/device_model.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/host_copy_pool.hpp"
 #include "src/models/ling_3_flash/layout.hpp"
+
+namespace gufo::models::ling_3_flash {
+class ContinuationAdapter;
+class ContinuationHooks;
+}  // namespace gufo::models::ling_3_flash
 
 namespace gufo::models::ling_3_flash::rocm {
 
@@ -165,12 +171,20 @@ public:
   [[nodiscard]] std::uint32_t expanded_store_rows() const noexcept {
     return state_.expanded_rows;
   }
+  /// Component-cache callbacks of this session (null outside that cache).
+  [[nodiscard]] const ContinuationHooks* continuation_hooks() const noexcept {
+    return continuation_hooks_;
+  }
 
 private:
   friend class Executor;
+  friend class ::gufo::models::ling_3_flash::ContinuationAdapter;
   Session() = default;
   void DestroyGraphs() noexcept;
   SessionState state_;
+  /// Component-cache adapter callbacks (continuation_hooks.hpp); null for
+  /// sessions outside the component cache.
+  ContinuationHooks* continuation_hooks_{nullptr};
   /// Decode steps (1..8 tokens) captured as HIP graphs, keyed by (n << 4 |
   /// first logits row): at most 44 keys per session (n tokens x n + 1 head
   /// layouts), a few MB each. Graphs stay valid across Reset() (the state
@@ -464,6 +478,22 @@ public:
   [[nodiscard]] bool RestoreSnapshot(Session& session, std::uint32_t rows,
                                      const ConstSnapshotBuffers& in,
                                      std::string* error_msg = nullptr) const;
+
+  /// Runs `submit` on the host once the session's last forward completed and
+  /// while no decode graph is being captured on the executor stream (the
+  /// component cache submits its transfers on its own streams from other
+  /// threads). False, without running `submit`, when the wait fails.
+  [[nodiscard]] bool WithSessionIdle(const Session& session,
+                                     const std::function<void()>& submit,
+                                     std::string* error_msg = nullptr) const;
+  /// Process-wide: a HIP call of a forward, draft, rollback or cache transfer
+  /// failed since the last successful forward. The component cache then
+  /// submits no further device work for borrowed rows (they are retired),
+  /// so release paths cannot wait on a lost device. Cleared by the next
+  /// successful forward or by a usable device probe.
+  [[nodiscard]] static bool DeviceSuspect() noexcept;
+  static void NoteDeviceError() noexcept;
+  static void ClearDeviceSuspect() noexcept;
 
   /// Copies one KDA layer's state / one MLA layer's cache rows to the host
   /// (tests compare them across chunkings).

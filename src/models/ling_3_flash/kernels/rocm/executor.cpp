@@ -8,15 +8,19 @@
 #include <cstring>
 #include <thread>
 
+#include "src/models/ling_3_flash/continuation_hooks.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/kernels.hpp"
 
 namespace gufo::models::ling_3_flash::rocm {
 namespace {
 
+std::atomic<bool> g_device_suspect{false};
+
 bool Check(hipError_t status, const char* what, std::string* error) {
   if (status == hipSuccess) {
     return true;
   }
+  g_device_suspect.store(true, std::memory_order_release);
   if (error != nullptr) {
     *error = std::string(what) + ": " + hipGetErrorString(status);
   }
@@ -1143,6 +1147,7 @@ bool Executor::FinishForward(Session& session, const ForwardRequest& r,
   launch_.device_ms = total;
   launch_.graph = graph;
   session.set_position(first_pos + n);
+  ClearDeviceSuspect();
   return true;
 }
 
@@ -1307,6 +1312,17 @@ bool Executor::Forward(Session& session, const ForwardRequest& r,
   for (const std::int32_t t : r.tokens) {
     if (t < 0 || static_cast<std::uint32_t>(t) >= kVocab) {
       return fail("token id " + std::to_string(t) + " outside the vocabulary");
+    }
+  }
+  if (session.continuation_hooks_ != nullptr) {
+    // Before anything is launched or replayed: a refusal leaves the session
+    // untouched. MTP rows q = first_pos - 1 .. first_pos + n - 2 are rewritten.
+    try {
+      session.continuation_hooks_->BeforeWrite(
+          first_pos, first_pos + n, first_pos > 0 ? first_pos - 1 : 0,
+          first_pos + n - 1);
+    } catch (const std::exception& e) {
+      return fail(e.what());
     }
   }
   const std::uint32_t layers = layer_count();
@@ -1481,6 +1497,22 @@ bool Executor::ForwardBatch(std::span<BatchSegment> segments,
       s.error = "batched forward exceeds the MTP hidden rows";
       continue;
     }
+    if (ContinuationHooks* hooks = s.session->continuation_hooks_) {
+      // Per segment, before any launch: a slot that is not ready, or a
+      // refused preservation, rejects only this segment.
+      if (!hooks->Ready()) {
+        s.error = "session slot is not ready for execution";
+        continue;
+      }
+      try {
+        hooks->BeforeWrite(first_pos, first_pos + n,
+                           first_pos > 0 ? first_pos - 1 : 0,
+                           first_pos + n - 1);
+      } catch (const std::exception& e) {
+        s.error = e.what();
+        continue;
+      }
+    }
     s.status = Status::kPending;
     lanes.push_back({.session = s.session,
                      .first_pos = first_pos,
@@ -1620,6 +1652,7 @@ bool Executor::ForwardBatch(std::span<BatchSegment> segments,
     members[i]->session->set_position(lanes[i].first_pos + lanes[i].n);
     members[i]->status = Status::kDone;
   }
+  ClearDeviceSuspect();
   return true;
 }
 
@@ -1697,6 +1730,14 @@ bool Executor::MtpDraft(Session& session, const DraftRequest& r,
     return fail("MTP draft request is out of range");
   }
   session.AwaitRowHolds(r.position + 1);  // MTP row `position`
+  if (session.continuation_hooks_ != nullptr) {
+    try {
+      session.continuation_hooks_->BeforeWrite(0, 0, r.position,
+                                               r.position + 1);
+    } catch (const std::exception& e) {
+      return fail(e.what());
+    }
+  }
   const DeviceMtp& m = *model_.mtp();
   Buffers& b = *b_;
   step_start_ = std::chrono::steady_clock::now();
@@ -1816,6 +1857,17 @@ bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
       return fail("MTP draft batch request is out of range");
     }
     d.session->AwaitRowHolds(d.position + 1);  // MTP row `position`
+    // Draft rows lie at or past the MTP frontier and need no preservation;
+    // DecodeBatch admits only ready lanes, so this never refuses in serving.
+    if (ContinuationHooks* hooks = d.session->continuation_hooks_) {
+      try {
+        if (!hooks->Ready())
+          return fail("MTP draft lane slot is not ready for execution");
+        hooks->BeforeWrite(0, 0, d.position, d.position + 1);
+      } catch (const std::exception& e) {
+        return fail(e.what());
+      }
+    }
   }
   const DeviceMtp& m = *model_.mtp();
   Buffers& b = *b_;
@@ -1983,6 +2035,14 @@ bool Executor::RunBlock(Session& session, std::uint32_t il,
   if (n > options_.max_batch || first_pos + n > session.capacity()) {
     return fail("block batch exceeds the executor or session limits");
   }
+  if (session.continuation_hooks_ != nullptr) {
+    try {
+      session.continuation_hooks_->BeforeWrite(first_pos, first_pos + n,
+                                               first_pos, first_pos + n);
+    } catch (const std::exception& e) {
+      return fail(e.what());
+    }
+  }
   Buffers& b = *b_;
   if (!UploadInputs({}, n, first_pos, error) ||
       !Check(hipMemcpyAsync(b.h, in.data(), in.size_bytes(),
@@ -2070,6 +2130,30 @@ bool Executor::ReadMtpHidden(const Session& session, std::vector<float>* out,
   return Check(hipMemcpy(out->data(), session.state_.mtp_h,
                          kHidden * sizeof(float), hipMemcpyDeviceToHost),
                "read MTP hidden", error);
+}
+
+bool Executor::WithSessionIdle(const Session& session,
+                               const std::function<void()>& submit,
+                               std::string* error) const {
+  const std::lock_guard<std::mutex> lock(capture_mutex_);
+  if (!Check(hipEventSynchronize(session.forward_done_),
+             "wait for the session's last forward", error)) {
+    return false;
+  }
+  submit();
+  return true;
+}
+
+bool Executor::DeviceSuspect() noexcept {
+  return g_device_suspect.load(std::memory_order_acquire);
+}
+
+void Executor::NoteDeviceError() noexcept {
+  g_device_suspect.store(true, std::memory_order_release);
+}
+
+void Executor::ClearDeviceSuspect() noexcept {
+  g_device_suspect.store(false, std::memory_order_release);
 }
 
 }  // namespace gufo::models::ling_3_flash::rocm

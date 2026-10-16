@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/models/ling_3_flash/continuation_hooks.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/executor.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/host_copy_pool.hpp"
 
@@ -372,6 +373,17 @@ bool Executor::RestoreSnapshot(Session& session, std::uint32_t rows,
   // The restore rewrites rows a background copy may still be reading. Wait
   // before taking the transfer mutex, which that copy needs.
   session.AwaitRowHolds(0);
+  if (session.continuation_hooks_ != nullptr) {
+    // A component-cache slot preserves its borrowed rows before they change.
+    try {
+      session.continuation_hooks_->BeforeWrite(0, session.capacity(), 0,
+                                               session.capacity());
+    } catch (const std::exception& e) {
+      if (error_msg != nullptr)
+        *error_msg = e.what();
+      return false;
+    }
+  }
   const TransferScope in_flight(session.transfers_);
   const TransferLock lock(transfer_mutex_, transfers_waiting_);
   const Staging staging = MakeStaging(transfer_stream_, *copy_pool_,
