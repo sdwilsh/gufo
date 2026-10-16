@@ -184,30 +184,32 @@ correction; greedy verification follows target argmax. Draft and verification
 work can batch across ready requests. See the
 [Flash-Next benchmark and quality contract](models/qwen3.8-flash-next/BENCHMARKS.md).
 
-Ling-3.0-flash (`bailingmoe3`) snapshots are complete host copies: KDA state and
-conv windows (75.5 MiB), the F16 MLA latent rows (8068 bytes per token, tokens
-included) and the last logits. They restore bit for bit into any session, so the
-RAM cache, learned shared prefixes, forks and `--cache-disk` work as for the
-Qwen hybrids; a 60k-token snapshot is about 0.55 GiB, so size
-`--cache-ram-bytes` for the contexts you serve. The snapshot never stores
-derived data (the expanded K/V cache, whose device budget is
-`--expanded-kv-bytes`, 12 GiB by default, 0 disables; a restore invalidates it
-and it is rebuilt lazily from the latent rows with identical bits). A
-restored request equals the cold run iff each later token is computed in the
-numeric family it has cold (prefill chunks above 8 tokens, decode and 1-8 token
-chunks in the small-batch family; see the reproducibility contract in
-`src/models/ling_3_flash/engine.hpp`). Planned checkpoints stay at least 9
-tokens before the prompt end and the prefill never leaves a 1-8 token tail
-before one when it can rebalance. The disk-cache identity covers
-the GGUF digest, chat template, snapshot payload version and numerics id, so
-files from another artifact or numeric revision are never loaded. The numerics
-id is a CMake-derived SHA-256 of the kernel sources, HIP compiler version and
-flags, target architectures, ROCm release and prefill batch; the payload
-version covers only the byte layout. Every pair of planned checkpoints stays at
-least 9 tokens apart and `--prefill-chunk` is raised to 18 for Ling, so restored
-runs keep the numerics of uncached ones (only prompts or suffixes under 9
-tokens, and decode, differ, as always). Prompts under 128 tokens are not
-retained (a snapshot is 75.5 MiB before the first token).
+Ling-3.0-flash (`bailingmoe3`) uses the component continuation cache, as
+Flash-Next does. A checkpoint holds the KDA state and conv windows, the last
+logits and metadata (75.5 MiB, copied) and the F16 MLA latent rows and MTP
+rows (8068 bytes per token with MTP off, tokens included), shared in
+512-row chunks between the checkpoints of one execution and borrowed from the
+session until it overwrites them. Checkpoints restore bit for bit into any
+session, so the RAM cache, learned shared prefixes, forks and `--cache-disk`
+work as for Flash-Next; size `--cache-ram-bytes` for the contexts you serve.
+Checkpoints never store derived data (the expanded K/V cache, whose device
+budget is `--expanded-kv-bytes`, 12 GiB by default, 0 disables); a restore
+keeps the expansion of latent rows it leaves bit-identical and the rest is
+rebuilt lazily with identical bits. A restored request equals the cold run iff
+each later token is computed in the numeric family it has cold (prefill chunks
+above 8 tokens, decode and 1-8 token chunks in the small-batch family; see the
+reproducibility contract in `src/models/ling_3_flash/engine.hpp`). Planned
+checkpoints stay at least 9 tokens before the prompt end and the prefill never
+leaves a 1-8 token tail before one when it can rebalance. The disk-cache
+identity covers the GGUF digest, chat template, component layout and numerics
+id, so files from another artifact or numeric revision are never loaded. The
+numerics id is a CMake-derived SHA-256 of the kernel sources, HIP compiler
+version and flags, target architectures, ROCm release and prefill batch. Every
+pair of planned checkpoints stays at least 9 tokens apart and
+`--prefill-chunk` is raised to 18 for Ling, so restored runs keep the numerics
+of uncached ones (only prompts or suffixes under 9 tokens, and decode, differ,
+as always). Prompts under 128 tokens are not retained (the private state is
+75.5 MiB before the first token).
 
 The GGUF identity reads the whole artifact (about 69 GiB) once and caches the
 digest under `$XDG_CACHE_HOME/gufo/gguf-sha256-v1` (default `~/.cache`), keyed by
