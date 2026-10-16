@@ -2,6 +2,7 @@
 add_library(gufo_ling_3_flash STATIC
   chat_template.cpp
   config.cpp
+  continuation_layout.cpp
   gpu_dump.cpp
   tokenizer.cpp
   weights.cpp)
