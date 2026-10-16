@@ -100,6 +100,7 @@ struct FeedOptions {
 
 class Session;
 class SessionSnapshot;
+class ContinuationAdapter;
 
 /// Gufo-owned API over the ROCm runtime: one resident model, sessions with
 /// independent context state.
@@ -193,6 +194,7 @@ private:
   double load_seconds_{0.0};
 
   friend class Session;
+  friend class ContinuationAdapter;
 };
 
 /// Reproducibility contract (numeric families).
@@ -554,6 +556,7 @@ public:
 
 private:
   friend class Model;
+  friend class ContinuationAdapter;
   [[nodiscard]] std::unique_ptr<SessionSnapshot> SaveSnapshotImpl(
       std::string* error_msg, bool synchronous) const;
   Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);

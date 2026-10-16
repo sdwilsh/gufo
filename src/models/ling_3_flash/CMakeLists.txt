@@ -51,11 +51,14 @@ if (ENGINE_ENABLE_HIP)
     ${LING_ROCM_DIR}/device_model.cpp
     ${LING_ROCM_DIR}/executor.cpp
     ${LING_ROCM_DIR}/state_io.cpp
+    ${LING_ROCM_DIR}/snapshot_copy.hip
+    continuation_adapter.cpp
     engine.cpp)
   set_source_files_properties(${LING_HIP_SOURCES} PROPERTIES LANGUAGE HIP)
   target_compile_options(gufo_ling_3_flash PRIVATE
     "$<$<COMPILE_LANGUAGE:HIP>:${LING_HIP_COMPILE_OPTIONS}>")
-  target_link_libraries(gufo_ling_3_flash PUBLIC hip::host roc::hipblas)
+  target_link_libraries(gufo_ling_3_flash PUBLIC gufo_cache_hip hip::host
+    roc::hipblas)
 endif()
 
 # Scalar float32 oracle; built only by explicit validation targets, never by
