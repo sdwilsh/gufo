@@ -43,7 +43,9 @@
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/ling_3_flash/chat_template.hpp"
+#include "src/models/ling_3_flash/continuation_adapter.hpp"
 #include "src/models/ling_3_flash/engine.hpp"
+#include "src/models/ling_3_flash/kernels/rocm/executor.hpp"
 #include "src/models/ling_3_flash/weights.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
@@ -3162,22 +3164,32 @@ public:
                       std::uint32_t max_context,
                       std::uint32_t max_draft_tokens) {
     std::string error;
-    session_ = model->CreateSession(max_context, &error);
-    if (session_ == nullptr) {
+    owned_ = model->CreateSession(max_context, &error);
+    if (owned_ == nullptr) {
       throw std::runtime_error("Failed to create Ling-3.0-flash session: " +
                                error);
     }
-    session_->Reset();
+    owned_->Reset();
     if (model->HasMtp()) {
-      session_->SetMaxDrafts(max_draft_tokens);
+      owned_->SetMaxDrafts(max_draft_tokens);
     }
+    session_ = owned_.get();
   }
+  /// Bound to a component-cache slot, which owns the session.
+  LingTextRunnerState(LingSession& session, cache::Adapter& adapter,
+                      cache::Slot& slot)
+      : session_(&session), adapter_(&adapter), slot_(&slot) {}
 
   // No device call: invalidation follows failed work units, and after a GPU
   // loss any device cleanup can block forever before the scheduler has
-  // classified the failure. The next prefill zeroes the recurrent state.
+  // classified the failure. The next prefill zeroes the recurrent state. A
+  // component slot first releases its borrowed rows (host only once a HIP
+  // call failed: the adapter retires them instead of copying).
   void Invalidate() noexcept override {
-    session_->Invalidate();
+    if (adapter_ != nullptr)
+      (void)adapter_->Invalidate(*slot_);
+    else
+      session_->Invalidate();
     position_ = 0;
   }
   [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
@@ -3191,7 +3203,10 @@ public:
   void set_position(std::size_t position) noexcept { position_ = position; }
 
 private:
-  std::unique_ptr<LingSession> session_;
+  std::unique_ptr<LingSession> owned_;
+  LingSession* session_{nullptr};
+  cache::Adapter* adapter_{nullptr};
+  cache::Slot* slot_{nullptr};
   std::size_t position_{0};
 };
 
@@ -3266,7 +3281,49 @@ public:
               artifact_fingerprint, max_context_, use_mtp_),
           .payload_version = models::ling_3_flash::kSnapshotPayloadVersion,
       };
+      component_identity_ = persistence_->compatibility_identity;
+    } else {
+      // RAM-only caching needs no file fingerprint: the immutable loaded
+      // model instance is an exact process-local identity. Durable caches
+      // require the validated artifact fingerprint above.
+      std::ostringstream identity;
+      identity << "schema=gufo-process-text-continuation-v1\n"
+               << "model_kind=ling-3-flash\n"
+               << "model_instance=" << model_.get() << '\n'
+               << "context_tokens=" << max_context_ << '\n'
+               << "mtp=" << use_mtp_ << '\n';
+      const auto canonical = identity.str();
+      component_identity_.assign(canonical.begin(), canonical.end());
     }
+  }
+
+  // Component cache (src/cache): one adapter-owned session per slot.
+  [[nodiscard]] bool UsesComponentCache() const override { return true; }
+  [[nodiscard]] std::unique_ptr<ComponentCacheResources>
+  CreateComponentCacheResources(cache::ResourceLedger& ledger,
+                                std::size_t ram) const override;
+  [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
+      cache::Adapter& adapter, cache::Slot& slot) const override {
+    auto& ling =
+        dynamic_cast<models::ling_3_flash::ContinuationAdapter&>(adapter);
+    return std::make_unique<LingTextRunnerState>(ling.GetSession(slot), adapter,
+                                                 slot);
+  }
+  void ReconcileComponentState(TextRunnerState& state,
+                               std::size_t position) const override {
+    RequireLingState(state).set_position(position);
+  }
+  // The probe drives the adapter's device-suspect latch: a lost device stops
+  // every further cache transfer (borrowers are retired, release cannot wait
+  // on it), and a usable probe ends the latch, so an injected or transient
+  // HIP failure does not keep cache transfers refused.
+  [[nodiscard]] bool DeviceUsable() const override {
+    const bool usable = HipTextModelRunner::DeviceUsable();
+    if (usable)
+      models::ling_3_flash::rocm::Executor::ClearDeviceSuspect();
+    else
+      models::ling_3_flash::rocm::Executor::NoteDeviceError();
+    return usable;
   }
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
@@ -3835,7 +3892,185 @@ private:
   std::uint32_t max_draft_tokens_;
   std::size_t max_batch_width_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
+  cache::Identity component_identity_;
 };
+
+// The Flash-Next provider (committed 64 KiB shared pages, pooled transfer
+// streams, fixed pinned staging), with Ling's adapter and backing plan. To be
+// replaced by the shared CreateHipComponentCacheResources helper of #540 once
+// it lands.
+std::unique_ptr<ComponentCacheResources>
+LingTextRunner::CreateComponentCacheResources(cache::ResourceLedger& ledger,
+                                              std::size_t ram) const {
+  struct Backing {
+    hip::TransferPool streams{64};
+    std::unique_ptr<hip::CommittedBackingPool> pool;
+    std::map<std::uint32_t, std::size_t> component_classes;
+  };
+  auto result = std::make_unique<ComponentCacheResources>();
+  auto adapter = std::make_unique<models::ling_3_flash::ContinuationAdapter>(
+      model_, max_context_, max_draft_tokens_, component_identity_);
+  (void)ram;  // Backing sizing follows actual slot allocation below.
+  result->adapter = std::move(adapter);
+  auto backing = std::make_shared<Backing>();
+  result->transfer_batch_size = 16;
+  const auto rounded = [](std::size_t bytes) {
+    return (bytes + 4095) / 4096 * 4096;
+  };
+  for (const auto& d : result->adapter->Components()) {
+    const auto bytes = rounded(d.kind == cache::ComponentKind::kPrivateState
+                                   ? d.state_bytes
+                                   : d.row_bytes * d.rows_per_chunk);
+    backing->component_classes.emplace(d.id.value, bytes);
+  }
+  // The remainder belongs to index, histories, disk catalog and queue
+  // metadata. The pools charge their own per-block allocator headroom.
+  result->commit_backing = [backing, &ledger, adapter = result->adapter.get(),
+                            width = static_cast<std::uint32_t>(
+                                max_batch_width_)](std::size_t budget) {
+    const auto plan =
+        static_cast<models::ling_3_flash::ContinuationAdapter*>(adapter)
+            ->BackingPlan(budget, width);
+    if (plan.size() != 1)
+      throw std::invalid_argument("insufficient component backing budget");
+    const auto& allocation = plan.front();
+    // Pages commit as captures need them. A payload cannot span segments,
+    // so equal segments of about 1 GiB bound stranded edge space and fit at
+    // least two payloads of the largest component. Completed append rows
+    // prepare more backing; private and tail copies commit only when needed.
+    // Pinning ahead after a final private copy can delay decoder launches.
+    // Growth stops when the host keeps less than its reserve.
+    std::size_t largest = 0;
+    for (const auto& [id, bytes] : backing->component_classes)
+      largest = std::max(largest, bytes);
+    const auto block = allocation.block_bytes;
+    const auto target =
+        std::max<std::size_t>(std::size_t{1} << 30, 2 * largest) / block;
+    const auto parts =
+        std::max<std::size_t>((allocation.blocks + target - 1) / target, 1);
+    const auto segment = (allocation.blocks + parts - 1) / parts * block;
+    struct Limited {
+      std::mutex mutex;
+      std::chrono::steady_clock::time_point refused;
+      bool active{};
+    };
+    backing->pool = std::make_unique<hip::CommittedBackingPool>(
+        ledger,
+        hip::BackingPoolConfig{
+            allocation.blocks * allocation.block_bytes +
+                allocation.metadata_bytes,
+            allocation.block_bytes, allocation.metadata_bytes, segment,
+            [limited = std::make_shared<Limited>()](std::size_t bytes) {
+              const std::lock_guard lock(limited->mutex);
+              const auto now = std::chrono::steady_clock::now();
+              // Pressure retries ask once per capture; recheck at most
+              // once a second while the host is short.
+              if (limited->active &&
+                  now - limited->refused < std::chrono::seconds(1))
+                return false;
+              const auto ceiling = HostSnapshotCeilingBytes();
+              // Pinned host pages come out of the same device heap that
+              // session and scratch allocations draw on; keep its dispatch
+              // reserve so they do not fall back to managed memory.
+              std::size_t heap_free = 0, heap_total = 0;
+              const bool heap_fits =
+                  hipMemGetInfo(&heap_free, &heap_total) == hipSuccess &&
+                  hip::HeapFitsAboveReserve(heap_free, bytes);
+              if (ceiling >= bytes && heap_fits) {
+                limited->active = false;
+                return true;
+              }
+              if (!limited->active)
+                Logger::Warn(
+                    "cache",
+                    "schema=component-cache-v1 "
+                    "event=backing_limited reason=" +
+                        std::string(heap_fits ? "host_reserve "
+                                              : "device_heap_reserve ") +
+                        "segment_bytes=" + std::to_string(bytes) +
+                        " host_headroom_bytes=" + std::to_string(ceiling) +
+                        " device_heap_free_bytes=" + std::to_string(heap_free));
+              limited->active = true;
+              limited->refused = now;
+              return false;
+            }});
+    // Prepare a bounded reserve before readiness. The first shared-prefix
+    // capture needs more than one segment; preparing both avoids moving
+    // registration onto that request's capture or decode path.
+    backing->pool->GrowAhead(2);
+    backing->pool->WaitForGrowth();
+  };
+  result->prepare_prefill = [backing] { backing->pool->GrowAhead(2); };
+  result->can_capture = [backing](auto payloads) {
+    return backing->pool->CanFit(payloads);
+  };
+  result->owner = backing;
+  result->stream = [backing]() -> std::unique_ptr<cache::Stream> {
+    return backing->streams.TryAcquire();
+  };
+  result->allocate = [backing](const cache::PayloadRequest& request) {
+    // Bound the logical capture, then assign whole shared backing pages.
+    const auto capacity =
+        backing->component_classes.at(request.component.value);
+    if (request.bytes > capacity)
+      throw std::logic_error("component capture exceeds its backing class");
+    const auto category =
+        request.category == cache::ResourceCategory::kBackingAssigned
+            ? cache::ResourceCategory::kBackingAssigned
+            : request.category;
+    const auto segments = backing->pool->PageCommitAllocations();
+    const auto started = std::chrono::steady_clock::now();
+    auto block = backing->pool->TryAcquire(category, request.bytes);
+    if (backing->pool->PageCommitAllocations() != segments)
+      Logger::Info(
+          "cache",
+          "schema=component-cache-v1 event=backing_grown committed_bytes=" +
+              std::to_string(backing->pool->CommittedBytes()) + " segments=" +
+              std::to_string(backing->pool->PageCommitAllocations()) +
+              " acquire_ms=" +
+              std::to_string(std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - started)
+                                 .count()));
+    if (!block)
+      throw cache::ResourceExhausted();
+    // Completed append rows prepare backing for subsequent prefill/guard
+    // work. Final private-state and partial-tail copies must not start
+    // speculative pinning that delays the next decode step.
+    if (request.category == cache::ResourceCategory::kBackingAssigned)
+      backing->pool->GrowAhead();
+    auto owner = std::make_shared<hip::BackingBlock>(std::move(*block));
+    return ComponentCaptureBuffer{
+        owner->Bytes(),
+        [owner] {
+          owner->Convert();
+          return std::move(*owner).TakePayload();
+        },
+        backing->pool.get(),
+        [owner, request](cache::SlotLease& lease, auto source) {
+          return cache::Payload::Borrowed(
+              std::move(*owner).Borrow(lease, request.component, request.first,
+                                       request.end, request.bytes, source));
+        }};
+  };
+  result->staging = [](std::size_t bytes) {
+    void* data = nullptr;
+    const auto status = hipHostMalloc(&data, bytes, hipHostMallocCoherent);
+    if (status != hipSuccess)
+      throw std::runtime_error(hipGetErrorString(status));
+    auto owner = std::shared_ptr<void>(
+        data, [](void* value) { (void)hipHostFree(value); });
+    std::memset(data, 0, bytes);
+    return cache::StagingAllocation{std::move(owner),
+                                    {static_cast<std::uint8_t*>(data), bytes}};
+  };
+  result->copy_observed_rows = [](auto source, auto destination,
+                                  cache::Stream& stream) {
+    return dynamic_cast<hip::TransferStream&>(stream).Copy(
+        destination.data(), source.data(), destination.size(),
+        hip::CopyDirection::kDeviceToHost, destination.size());
+  };
+  return result;
+}
 #endif
 
 }  // namespace
