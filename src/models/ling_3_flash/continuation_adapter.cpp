@@ -34,6 +34,19 @@ void Check(hipError_t result) {
     throw std::runtime_error(hipGetErrorString(result));
   }
 }
+std::atomic<std::uint32_t> g_fail_pre_launch{0};
+// Pre-launch calls (slot construction, restore preparation): a failure throws
+// but does not set the process-wide latch, which is for post-launch errors.
+void CheckPreLaunch(hipError_t result) {
+  std::uint32_t pending = g_fail_pre_launch.load();
+  while (pending > 0 &&
+         !g_fail_pre_launch.compare_exchange_weak(pending, pending - 1)) {
+  }
+  if (pending > 0)
+    result = hipErrorOutOfMemory;
+  if (result != hipSuccess)
+    throw std::runtime_error(hipGetErrorString(result));
+}
 void RefuseSuspectDevice() {
   if (rocm::Executor::DeviceSuspect())
     throw std::runtime_error(
@@ -79,9 +92,9 @@ public:
   State(ContinuationAdapter& adapter, cache::MutationGuard& guard,
         std::unique_ptr<Session> owned)
       : adapter(adapter), guard(guard), session(std::move(owned)) {
-    Check(hipStreamCreateWithFlags(&control, hipStreamNonBlocking));
+    CheckPreLaunch(hipStreamCreateWithFlags(&control, hipStreamNonBlocking));
     try {
-      Check(hipMalloc(&mismatch, sizeof(std::uint32_t) * kMlaLayers));
+      CheckPreLaunch(hipMalloc(&mismatch, sizeof(std::uint32_t) * kMlaLayers));
     } catch (...) {
       (void)hipStreamDestroy(control);
       throw;
@@ -288,6 +301,10 @@ Session& ContinuationAdapter::GetSession(cache::Slot& slot) {
     throw std::logic_error("Ling slot is not ready for execution");
   return *state.session;
 }
+void ContinuationAdapter::FailPreLaunchForTest(std::uint32_t count) noexcept {
+  g_fail_pre_launch = count;
+}
+
 std::uint32_t ContinuationAdapter::KeptExpansionRows(
     const cache::Slot& slot) const {
   const auto& kept = As(slot).kept;
@@ -480,10 +497,10 @@ void ContinuationAdapter::BeginRestore(
   if (!model_->executor_->WithSessionIdle(
           native,
           [&] {
-            Check(hipMemsetAsync(state.mismatch, 0xff,
-                                 sizeof(std::uint32_t) * kMlaLayers,
-                                 state.control));
-            Check(hipStreamSynchronize(state.control));
+            CheckPreLaunch(hipMemsetAsync(state.mismatch, 0xff,
+                                          sizeof(std::uint32_t) * kMlaLayers,
+                                          state.control));
+            CheckPreLaunch(hipStreamSynchronize(state.control));
           },
           &error))
     throw std::runtime_error("Ling restore preparation: " + error);
@@ -808,6 +825,14 @@ bool ContinuationAdapter::Invalidate(cache::Slot& slot) noexcept {
     for (std::uint32_t m = 0; m < kMlaLayers; ++m)
       kept[m] = native.state_.mla_expanded_to[m];
     state.session->Invalidate();
+    // This is the one exception to the invariant that expansion watermarks
+    // never exceed the position: the reset drops the position to 0, but the
+    // latent rows stay intact, so the watermarks go back above it. That is safe
+    // for both consumers. A forward from the new position (Trunk/Mla) lowers
+    // expanded_to to its first_pos before it expands anything, so it reads no
+    // stale row. A restore (Validate) sets the position to the restored one
+    // and calls OnStateReplaced, which reconciles the watermarks with the
+    // rows that are identical.
     if (rows_intact)
       for (std::uint32_t m = 0; m < kMlaLayers; ++m)
         native.state_.mla_expanded_to[m] = kept[m];

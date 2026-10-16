@@ -16,11 +16,15 @@ namespace {
 
 std::atomic<bool> g_device_suspect{false};
 
+// Reports a failed HIP call. It does not set the process-wide device-suspect
+// latch, because a pre-launch failure (reset, capture, allocation) on one
+// session must not make every other session refuse. The post-launch sites of
+// Forward, ForwardBatch, MtpDraft(Batch), and MtpRollback set the latch with
+// NoteDeviceError() (design N11).
 bool Check(hipError_t status, const char* what, std::string* error) {
   if (status == hipSuccess) {
     return true;
   }
-  g_device_suspect.store(true, std::memory_order_release);
   if (error != nullptr) {
     *error = std::string(what) + ": " + hipGetErrorString(status);
   }
@@ -1341,6 +1345,7 @@ bool Executor::Forward(Session& session, const ForwardRequest& r,
       }
       if (launched) {
         // Inputs were being uploaded or the graph ran: a device failure.
+        NoteDeviceError();
         return fail(graph_error);
       }
       // Capture is not executed, so the eager path below starts from the
@@ -1367,6 +1372,7 @@ bool Executor::Forward(Session& session, const ForwardRequest& r,
     }
   }
   if (!UploadInputs(r.tokens, n, first_pos, error)) {
+    NoteDeviceError();
     return false;
   }
   if (r.op_profile != nullptr) {
@@ -1381,16 +1387,20 @@ bool Executor::Forward(Session& session, const ForwardRequest& r,
       Trunk({&lane, 1}, n, /*head_from=*/n, true, r.sink, error);
   launch_.issue_ms = StepMs();
   if (!trunk_ok) {
+    NoteDeviceError();
     profiling_ = false;
     return false;
   }
   if (from < n && !Head(n, from, r.logits, r.argmax, error)) {
+    NoteDeviceError();
     return false;
   }
   if (!MtpAfterForward(session, n, first_pos, 0, 0, error)) {
+    NoteDeviceError();
     return false;
   }
   if (!FinishForward(session, r, n, from, layers, false, error)) {
+    NoteDeviceError();
     profiling_ = false;
     return false;
   }
@@ -1552,6 +1562,8 @@ bool Executor::ForwardBatch(std::span<BatchSegment> segments,
   std::string message;
   bool launched = false;  // the trunk is queued: members' state is in flight
   const auto fail = [&]() {
+    // Every failure here is after the validation loop: post-launch (N11).
+    NoteDeviceError();
     for (BatchSegment* s : members) {
       s->status = Status::kFailed;
       s->error = message;
@@ -1750,12 +1762,14 @@ bool Executor::MtpDraft(Session& session, const DraftRequest& r,
       !Check(hipMemcpyAsync(b.positions, staging_ + 8, sizeof(std::int32_t),
                             hipMemcpyHostToDevice, stream_),
              "upload draft position", error)) {
+    NoteDeviceError();
     return false;
   }
   if (host_h &&
       !Check(hipMemcpyAsync(b.mtp_hn, r.h_host.data(), kHidden * sizeof(float),
                             hipMemcpyHostToDevice, stream_),
              "upload draft hidden", error)) {
+    NoteDeviceError();
     return false;
   }
   (void)hipEventRecord(draft_events_[0], stream_);
@@ -1773,6 +1787,7 @@ bool Executor::MtpDraft(Session& session, const DraftRequest& r,
   const Lane lane{&session, r.position, 1, 0};
   if (!BlockOf(m.block, {&lane, 1}, kMtpBlock, 1, nullptr, fuse, false, nullptr,
                error)) {
+    NoteDeviceError();
     profiling_ = false;
     (void)hipStreamSynchronize(stream_);
     return false;
@@ -1810,6 +1825,7 @@ bool Executor::MtpDraft(Session& session, const DraftRequest& r,
               "copy draft hidden", error)) ||
       !Check(hipStreamSynchronize(stream_), "draft", error) ||
       !Check(hipGetLastError(), "draft", error)) {
+    NoteDeviceError();
     profiling_ = false;
     return false;
   }
@@ -1843,7 +1859,10 @@ bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
     return fail("MTP draft batch needs an MTP executor and 1..8 lanes");
   }
   for (std::size_t i = 0; i < lanes.size(); ++i) {
-    const DraftLane& d = lanes[i];
+    DraftLane& d = lanes[i];
+    d.failed = false;
+    d.error.clear();
+    d.argmax = -1;
     if (d.session == nullptr || d.session->state_.mtp_cache == nullptr ||
         !d.session->mtp_valid_ ||
         std::any_of(lanes.begin(), lanes.begin() + i, [&](const DraftLane& o) {
@@ -1859,15 +1878,26 @@ bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
     d.session->AwaitRowHolds(d.position + 1);  // MTP row `position`
     // Draft rows lie at or past the MTP frontier and need no preservation;
     // DecodeBatch admits only ready lanes, so this never refuses in serving.
+    // A lane that is not ready, or whose hook refuses, fails alone (as a
+    // ForwardBatch segment is kRejected): it keeps its row in the pass so
+    // chained peers keep theirs, but writes nothing to its session.
     if (ContinuationHooks* hooks = d.session->continuation_hooks_) {
       try {
-        if (!hooks->Ready())
-          return fail("MTP draft lane slot is not ready for execution");
-        hooks->BeforeWrite(0, 0, d.position, d.position + 1);
+        if (!hooks->Ready()) {
+          d.failed = true;
+          d.error = "MTP draft lane slot is not ready for execution";
+        } else {
+          hooks->BeforeWrite(0, 0, d.position, d.position + 1);
+        }
       } catch (const std::exception& e) {
-        return fail(e.what());
+        d.failed = true;
+        d.error = e.what();
       }
     }
+  }
+  if (std::all_of(lanes.begin(), lanes.end(),
+                  [](const DraftLane& d) { return d.failed; })) {
+    return true;  // nothing launched; every lane carries its own error
   }
   const DeviceMtp& m = *model_.mtp();
   Buffers& b = *b_;
@@ -1875,18 +1905,34 @@ bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
   launch_ = {};
   std::vector<std::int32_t> tokens(count);
   std::vector<std::int32_t> positions(count);
-  std::vector<Lane> block_lanes(count);
+  std::vector<Lane> block_lanes;
+  block_lanes.reserve(count);
   for (std::uint32_t i = 0; i < count; ++i) {
+    if (lanes[i].failed) {
+      continue;  // a placeholder row: computed, never written to a session
+    }
     tokens[i] = lanes[i].token;
     positions[i] = static_cast<std::int32_t>(lanes[i].position);
-    block_lanes[i] = {.session = lanes[i].session,
-                      .first_pos = lanes[i].position,
-                      .n = 1,
-                      .row0 = i};
+    block_lanes.push_back({.session = lanes[i].session,
+                           .first_pos = lanes[i].position,
+                           .n = 1,
+                           .row0 = i});
   }
   std::string message;
   if (!UploadRows(tokens, positions, &message)) {
+    NoteDeviceError();
     return fail(message);
+  }
+  // A refused lane's placeholder row computes on finite values: zero its
+  // hidden input and the attention output the block never writes for it.
+  for (std::uint32_t i = 0; i < count; ++i) {
+    if (!lanes[i].failed)
+      continue;
+    (void)hipMemsetAsync(b.mtp_hn + std::size_t{i} * kHidden, 0,
+                         kHidden * sizeof(float), stream_);
+    (void)hipMemsetAsync(b.lat + std::size_t{i} * kHeads * kMlaLatent, 0,
+                         std::size_t{kHeads} * kMlaLatent * sizeof(*b.lat),
+                         stream_);
   }
   (void)hipEventRecord(draft_events_[0], stream_);
   // The launches of MtpDraft over `count` rows: row-wise kernels and GEMVs
@@ -1894,8 +1940,9 @@ bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
   dense::Embed(model_.token_embd().type, model_.token_embd().data, b.tokens,
                b.ga, count, kHidden, stream_);
   for (std::uint32_t i = 0; i < count; ++i) {
-    const float* h_in = lanes[i].chain ? b.mtp_hn + std::size_t{i} * kHidden
-                                       : lanes[i].session->state_.mtp_h;
+    const float* h_in = lanes[i].chain || lanes[i].failed
+                            ? b.mtp_hn + std::size_t{i} * kHidden
+                            : lanes[i].session->state_.mtp_h;
     mtp::ConcatNormRows(b.ga + std::size_t{i} * kHidden, h_in, m.enorm.f32(),
                         m.hnorm.f32(), b.gb + std::size_t{i} * 2 * kHidden, 1,
                         kRmsEps, stream_);
@@ -1904,6 +1951,7 @@ bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
   const bool fuse = dense::GemvQ8_0Fits(count, kHidden);
   if (!BlockOf(m.block, block_lanes, kMtpBlock, count, nullptr, fuse, false,
                nullptr, &message)) {
+    NoteDeviceError();
     (void)hipStreamSynchronize(stream_);
     (void)hipStreamSynchronize(branch_stream_);
     return fail(message);
@@ -1927,7 +1975,7 @@ bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
                      hipMemcpyDeviceToHost, stream_),
       "copy draft argmax", &message);
   for (std::uint32_t i = 0; ok && i < count; ++i) {
-    ok = lanes[i].logits.empty() ||
+    ok = lanes[i].logits.empty() || lanes[i].failed ||
          Check(hipMemcpyAsync(lanes[i].logits.data(),
                               b.logits + std::size_t{i} * kVocabRows,
                               std::size_t{kVocabRows} * sizeof(float),
@@ -1935,15 +1983,19 @@ bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
                "copy draft logits", &message);
   }
   for (std::uint32_t i = 0; i < count; ++i) {
-    (void)hipEventRecord(lanes[i].session->forward_done_, stream_);
+    if (!lanes[i].failed) {
+      (void)hipEventRecord(lanes[i].session->forward_done_, stream_);
+    }
   }
   if (!ok || !Check(hipStreamSynchronize(stream_), "draft batch", &message) ||
       !Check(hipGetLastError(), "draft batch", &message)) {
+    NoteDeviceError();
     (void)hipStreamSynchronize(stream_);
     (void)hipStreamSynchronize(branch_stream_);
     return fail(message);
   }
   if (draft_failure_in_ > 0 && --draft_failure_in_ == 0) {
+    NoteDeviceError();
     return fail("MTP draft batch: injected failure after launch (test hook)");
   }
   launch_.wall_ms = StepMs();
@@ -1953,6 +2005,9 @@ bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
     launch_.device_ms = ms;
   }
   for (std::uint32_t i = 0; i < count; ++i) {
+    if (lanes[i].failed) {
+      continue;
+    }
     if (index[i] < 0) {
       return fail("MTP draft logits are not comparable");
     }
@@ -1994,6 +2049,7 @@ bool Executor::MtpRollback(Session& session, std::uint32_t first_pos,
   (void)hipEventRecord(session.forward_done_, stream_);
   if (!Check(hipStreamSynchronize(stream_), "rollback", error) ||
       !Check(hipGetLastError(), "rollback", error)) {
+    NoteDeviceError();
     return false;
   }
   session.set_position(first_pos + keep);
@@ -2138,6 +2194,7 @@ bool Executor::WithSessionIdle(const Session& session,
   const std::lock_guard<std::mutex> lock(capture_mutex_);
   if (!Check(hipEventSynchronize(session.forward_done_),
              "wait for the session's last forward", error)) {
+    NoteDeviceError();  // a transfer completion: the device is in doubt
     return false;
   }
   submit();

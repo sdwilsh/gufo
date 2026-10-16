@@ -19,6 +19,14 @@
 //                     cancelled lease) decodes, peers equal their solo runs
 //   graph_after_restore graph-replayed decode after a restore equals the
 //                     source's
+//   probe_latch       a probe timeout (pending) neither clears the
+//                     device-suspect latch nor reports the device lost
+//   failed_batch_release a failed batched lane leaves the intact rows exact:
+//                     the release after it still preserves the borrowers
+//   mixed_pieces      one MLA layer restored from alternating pinned and
+//                     pageable pieces (the fallback path) stays exact
+//   pre_launch_failure a failed pre-launch HIP call (allocation) sets no
+//                     latch, so another slot still restores and runs
 //   latching          misuse throws, failed loads latch until Invalidate,
 //                     the device-suspect latch retires borrowers without
 //                     device work
@@ -30,6 +38,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -41,6 +50,7 @@
 
 #include "src/core/hip/transfer_pool.hpp"
 #include "src/core/sampling.hpp"
+#include "src/models/ling_3_flash/device_probe_latch.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/executor.hpp"
 
 namespace l3 = gufo::models::ling_3_flash;
@@ -134,9 +144,10 @@ Checkpoint Capture(l3::ContinuationAdapter& adapter, cache::Slot& slot,
 
 // Reverse component and piece order, on independent streams. `pinned` loads
 // from registered host memory (the compare-then-copy path), else pageable.
+// `alternate` mixes them: every second row piece of a component is pinned.
 void Load(l3::ContinuationAdapter& adapter, cache::Slot& slot,
           const Checkpoint& checkpoint, gufo::hip::TransferPool& streams,
-          bool pinned = true) {
+          bool pinned = true, bool alternate = false) {
   adapter.BeginRestore(slot, checkpoint.positions);
   Require(!slot.IsValid(), "BeginRestore exposed executable state");
   Reject([&] { (void)adapter.GetSession(slot); }, "execution during restore");
@@ -159,7 +170,7 @@ void Load(l3::ContinuationAdapter& adapter, cache::Slot& slot,
   for (std::size_t i = adapter.Components().size(); i-- > 0;) {
     const auto& component = adapter.Components()[i];
     std::span<const std::byte> bytes(checkpoint.bytes[i]);
-    if (pinned && !bytes.empty()) {
+    if (pinned && !alternate && !bytes.empty()) {
       void* mapped{};
       Require(hipHostMalloc(&mapped, bytes.size(), hipHostMallocDefault) ==
                   hipSuccess,
@@ -170,14 +181,23 @@ void Load(l3::ContinuationAdapter& adapter, cache::Slot& slot,
     }
     if (component.row_bytes) {
       const auto rows = checkpoint.positions[i].valid_rows;
-      for (cache::Rows end = rows; end;) {
+      std::size_t piece = 0;
+      for (cache::Rows end = rows; end; ++piece) {
         const auto first = end > kRowPiece ? end - kRowPiece : 0;
         auto stream = acquire();
-        pending.push_back(adapter.CopyRowsIn(
-            slot, component.id, first, end,
-            bytes.subspan(first * component.row_bytes,
-                          (end - first) * component.row_bytes),
-            *stream));
+        auto part = bytes.subspan(first * component.row_bytes,
+                                  (end - first) * component.row_bytes);
+        if (alternate && (piece & 1U) && !part.empty()) {
+          void* mapped{};
+          Require(hipHostMalloc(&mapped, part.size(), hipHostMallocDefault) ==
+                      hipSuccess,
+                  "registered load allocation failed");
+          std::memcpy(mapped, part.data(), part.size());
+          registered.push_back(mapped);
+          part = {static_cast<const std::byte*>(mapped), part.size()};
+        }
+        pending.push_back(
+            adapter.CopyRowsIn(slot, component.id, first, end, part, *stream));
         end = first;
       }
     } else {
@@ -322,6 +342,7 @@ struct Fixture {
   std::unique_ptr<l3::ContinuationAdapter> adapter;
   gufo::hip::TransferPool streams{16};
   bool mtp{false};
+  std::string path;
 };
 
 void Report(const char* name) {
@@ -578,6 +599,139 @@ void GraphAfterRestore(Fixture& f) {
   Report("graph_after_restore");
 }
 
+void ProbeLatch(Fixture&) {
+  using Status = gufo::server::TextModelRunner::DeviceProbeStatus;
+  // A probe that never finishes (a hung device) reaches the bound as pending.
+  l3::rocm::Executor::NoteDeviceError();
+  const auto status = gufo::server::BoundedDeviceProbe(
+      [] { return Status::kPending; }, std::chrono::milliseconds(20));
+  Require(status == Status::kPending, "a never-finishing probe was conclusive");
+  Require(l3::ApplyDeviceProbe(status),
+          "a probe timeout declared the device lost");
+  Require(l3::rocm::Executor::DeviceSuspect(),
+          "a probe timeout cleared the device-suspect latch");
+  // Only a probe that completed clears it; a lost one sets it.
+  Require(l3::ApplyDeviceProbe(Status::kUsable) &&
+              !l3::rocm::Executor::DeviceSuspect(),
+          "a usable probe did not clear the latch");
+  Require(!l3::ApplyDeviceProbe(Status::kLost) &&
+              l3::rocm::Executor::DeviceSuspect(),
+          "a lost probe did not set the latch");
+  l3::rocm::Executor::ClearDeviceSuspect();
+  Report("probe_latch");
+}
+
+void FailedBatchRelease(Fixture& f) {
+  auto& adapter = *f.adapter;
+  Slot a(adapter, f.streams), b(adapter, f.streams);
+  Feed(adapter.GetSession(*a.slot), Tokens(700, 50));
+  Feed(adapter.GetSession(*b.slot), Tokens(650, 51));
+  const auto checkpoint = Capture(adapter, *a.slot, f.streams);
+  a.guard.Borrow(checkpoint);
+  auto& sa = adapter.GetSession(*a.slot);
+  auto& sb = adapter.GetSession(*b.slot);
+  // A batched step that fails after its launches. The rows past each frontier
+  // were written, and the positions did not move.
+  f.model->FailBatchesForTest(1);
+  std::vector<l3::Session::BatchLane> step(2);
+  step[0] = {.session = &sa, .token = 4321};
+  step[1] = {.session = &sb, .token = 4322};
+  l3::Session::EvaluateBatch(step);
+  Require(!step[0].ok && !step[1].ok, "injected batch failure did not fail");
+  Require(l3::rocm::Executor::DeviceSuspect(),
+          "a post-launch batch failure did not set the latch");
+  // The runner's probe finds the device usable, which ends the latch.
+  Require(l3::ApplyDeviceProbe(
+              gufo::server::TextModelRunner::DeviceProbeStatus::kUsable),
+          "usable probe");
+  // The runner invalidates the failed lane's state; the release that follows
+  // compares the rows it copies out with the borrowed bytes (the lane wrote
+  // only past its frontier, so the intact rows must still be exact).
+  Require(adapter.Invalidate(*a.slot), "invalidate after a failed lane");
+  Require(!a.guard.release_failed && a.guard.AllPreserved(),
+          "release after a failed lane lost borrowed rows");
+  a.guard.borrowed = nullptr;
+  // The slot recovers with a cold prefill.
+  Feed(adapter.GetSession(*a.slot), Tokens(64, 52));
+  Report("failed_batch_release");
+}
+
+void MixedPieces(Fixture& f) {
+  auto& adapter = *f.adapter;
+  Slot a(adapter, f.streams), ref(adapter, f.streams);
+  auto& session = adapter.GetSession(*a.slot);
+  const auto prompt = Tokens(1300, 60);
+  const auto later = Tokens(500, 61);
+  const auto suffix = Tokens(20, 62);
+  Feed(session, prompt);
+  const auto checkpoint = Capture(adapter, *a.slot, f.streams);
+  Feed(session, later);  // watermarks above the restore point, rows differ
+  // Same-slot restore: alternate pinned (compare-then-copy) and pageable
+  // (fallback) pieces within every MLA layer.
+  Require(adapter.Invalidate(*a.slot), "invalidate");
+  Load(adapter, *a.slot, checkpoint, f.streams, true, true);
+  const auto again = Capture(adapter, *a.slot, f.streams);
+  Require(again.positions == checkpoint.positions, "restored frontiers differ");
+  for (std::size_t i = 0; i < again.bytes.size(); ++i)
+    Require(again.bytes[i] == checkpoint.bytes[i],
+            "component " + std::to_string(i + 1) +
+                " differs after a mixed restore");
+  Feed(adapter.GetSession(*a.slot), suffix);
+  auto& reference = adapter.GetSession(*ref.slot);
+  Feed(reference, prompt);
+  Feed(reference, suffix);
+  SameLogits(reference, adapter.GetSession(*a.slot), "mixed pieces suffix");
+  Report("mixed_pieces");
+}
+
+void PreLaunchFailure(Fixture& f) {
+  auto& adapter = *f.adapter;
+  l3::rocm::Executor::ClearDeviceSuspect();
+  // A second model whose sessions cannot be allocated: a pre-launch HIP
+  // failure (or a failed load) on some other owner of the executor code.
+  l3::ModelOptions big;
+  big.max_context = 1U << 27;
+  big.max_batch = 8;
+  big.layer_limit = 6;
+  big.expanded_kv_bytes = 0;
+  std::string error;
+  auto other = l3::Model::Load(f.path, big, &error);
+  bool failed = !other;
+  if (other) {
+    failed = other->CreateSession(big.max_context, &error) == nullptr;
+    other.reset();
+  }
+  (void)hipGetLastError();
+  Require(failed, "the oversized allocation unexpectedly succeeded");
+  Require(!l3::rocm::Executor::DeviceSuspect(),
+          "a pre-launch failure set the device-suspect latch");
+  // The same inside the adapter: a failed slot allocation and a failed
+  // BeginRestore preparation set no latch either.
+  l3::ContinuationAdapter::FailPreLaunchForTest(1);
+  Reject([&] { Slot doomed(adapter, f.streams); }, "failed slot allocation");
+  Require(!l3::rocm::Executor::DeviceSuspect(),
+          "a failed slot allocation set the device-suspect latch");
+  {
+    Slot c(adapter, f.streams), d(adapter, f.streams);
+    Feed(adapter.GetSession(*c.slot), Tokens(300, 72));
+    const auto small = Capture(adapter, *c.slot, f.streams);
+    l3::ContinuationAdapter::FailPreLaunchForTest(1);
+    Reject([&] { adapter.BeginRestore(*d.slot, small.positions); },
+           "failed restore preparation");
+    l3::ContinuationAdapter::FailPreLaunchForTest(0);
+    Require(!l3::rocm::Executor::DeviceSuspect(),
+            "a failed restore preparation set the device-suspect latch");
+    Require(adapter.Invalidate(*d.slot), "invalidate after failed prepare");
+  }
+  // Another slot is unaffected: it restores, validates and runs.
+  Slot a(adapter, f.streams), b(adapter, f.streams);
+  Feed(adapter.GetSession(*a.slot), Tokens(500, 70));
+  const auto checkpoint = Capture(adapter, *a.slot, f.streams);
+  Load(adapter, *b.slot, checkpoint, f.streams);
+  Feed(adapter.GetSession(*b.slot), Tokens(20, 71));
+  Report("pre_launch_failure");
+}
+
 void Latching(Fixture& f) {
   auto& adapter = *f.adapter;
   Slot a(adapter, f.streams), b(adapter, f.streams);
@@ -652,6 +806,7 @@ int main(int argc, char** argv) {
   }
   Fixture f;
   f.mtp = Flag(argc, argv, "--mtp");
+  f.path = model_path;
   l3::ModelOptions options;
   options.max_context = static_cast<std::uint32_t>(
       std::stoul(Arg(argc, argv, "--max-context", "4096")));
@@ -676,6 +831,10 @@ int main(int argc, char** argv) {
                {"guards", Guards},
                {"batch_lanes", BatchLanes},
                {"graph_after_restore", GraphAfterRestore},
+               {"probe_latch", ProbeLatch},
+               {"failed_batch_release", FailedBatchRelease},
+               {"mixed_pieces", MixedPieces},
+               {"pre_launch_failure", PreLaunchFailure},
                {"latching", Latching}};
   int failures = 0;
   for (const auto& [name, run] : cases) {
