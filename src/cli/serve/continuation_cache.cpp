@@ -94,42 +94,6 @@ struct ContinuationCache::Impl {
     return static_cast<bool>(snapshot_support.restore);
   }
 
-  /// Drops every retained snapshot that is no longer usable (a failed
-  /// background copy) and returns its bytes to the budget at once, instead of
-  /// letting it occupy the budget until an unrelated eviction reaches it.
-  void ReapUnusable() noexcept {
-    std::vector<std::shared_ptr<const ContinuationSnapshot>> removed;
-    std::vector<SnapshotEvent> events;
-    try {
-      {
-        const std::lock_guard<std::mutex> lock(mutex);
-        for (auto& owned : entries) {
-          auto& entry = *owned;
-          if (!entry.valid || !entry.snapshot || entry.snapshot->Usable())
-            continue;
-          const std::size_t bytes = entry.snapshot_bytes;
-          const std::size_t tokens = entry.tokens.size();
-          removed.push_back(std::move(entry.snapshot));
-          entry.tokens.clear();
-          entry.snapshot_bytes = 0;
-          entry.valid = false;
-          retained_snapshot_bytes -= bytes;
-          events.push_back({.action = SnapshotEventAction::kRemoved,
-                            .reason = SnapshotEventReason::kUnusable,
-                            .snapshot_bytes = bytes,
-                            .token_count = tokens,
-                            .retained_snapshot_bytes = retained_snapshot_bytes,
-                            .reserved_snapshot_bytes = reserved_snapshot_bytes,
-                            .capacity_bytes = snapshot_capacity_bytes});
-        }
-      }
-      removed.clear();
-      EmitSnapshotEvents(snapshot_support.on_event, events);
-    } catch (...) {
-      // Reclaiming is best effort; the lookup skips unusable entries anyway.
-    }
-  }
-
   // Rank extra copies before the last useful checkpoint of a prefix family.
   // Exact tokens and input identity, not client IDs or hashes, establish that
   // another continuation can keep the family reusable after this removal.
@@ -504,8 +468,6 @@ ContinuationCache::Lease ContinuationCache::Acquire(
     }
   };
   while (true) {
-    if (impl_->snapshot_mode())
-      impl_->ReapUnusable();
     std::unique_lock<std::mutex> lock(impl_->mutex);
 
     const std::size_t no_entry = impl_->entries.size();
@@ -543,8 +505,6 @@ ContinuationCache::Lease ContinuationCache::Acquire(
         skip_reason = "stable_prefix_boundary";
       else if (!IsPrefix(entry.tokens, prompt))
         skip_reason = "token_prefix";
-      else if (entry.snapshot && !entry.snapshot->Usable())
-        skip_reason = "snapshot_unusable";
       if (!skip_reason.empty()) {
         if (debug_cache) {
           skipped.push_back({index, entry.tokens.size(), skip_reason});
@@ -710,11 +670,6 @@ ContinuationCache::Lease ContinuationCache::Acquire(
           entry.state_last_used = ++impl_->clock;
         }
         impl_->condition.notify_one();
-        // A snapshot whose background copy failed was usable when it was
-        // chosen. Look again: the scan now skips it.
-        if (snapshot != nullptr && !snapshot->Usable() &&
-            !(is_cancelled && is_cancelled()))
-          continue;
         throw;
       }
       Lease lease(this, selected, cache_hit, cached_tokens, source,

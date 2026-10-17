@@ -106,20 +106,6 @@ void Session::DestroyGraphs() noexcept {
 }
 
 Session::~Session() {
-  // A background snapshot copy still reads the cache rows freed below. After a
-  // device loss a copy may be wedged in a HIP call, and then this wait (and a
-  // shutdown that destroys sessions) waits with it; nothing is leaked or timed
-  // out on purpose, so rows are never freed under a running copy.
-  for (;;) {
-    try {
-      AwaitRowHolds(0);
-      break;
-    } catch (...) {
-      // condition_variable::wait failed (resources): a destructor must not
-      // throw, and the rows must not be freed under a running copy. Retry.
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-  }
   DestroyGraphs();
   if (forward_done_ != nullptr) {
     (void)hipEventDestroy(forward_done_);
@@ -236,20 +222,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
 }
 
 bool Executor::Init(std::string* error) {
-  if (!Check(hipStreamCreate(&stream_), "hipStreamCreate", error) ||
-      !Check(hipStreamCreateWithFlags(&transfer_stream_, hipStreamNonBlocking),
-             "transfer stream", error) ||
-      !Check(hipHostMalloc(&transfer_staging_, kTransferStagingBytes),
-             "pinned snapshot staging", error) ||
-      !Check(
-          hipEventCreateWithFlags(&transfer_events_[0], hipEventDisableTiming),
-          "transfer event", error) ||
-      !Check(
-          hipEventCreateWithFlags(&transfer_events_[1], hipEventDisableTiming),
-          "transfer event", error)) {
+  if (!Check(hipStreamCreate(&stream_), "hipStreamCreate", error)) {
     return false;
   }
-  copy_pool_ = std::make_unique<HostCopyPool>(kHostCopyThreads);
   const std::size_t B = options_.max_batch;
   Buffers& b = *b_;
   std::size_t total = 0;
@@ -1274,9 +1249,6 @@ bool Executor::Forward(Session& session, const ForwardRequest& r,
   launch_ = {};
   const auto n = static_cast<std::uint32_t>(r.tokens.size());
   const std::uint32_t first_pos = session.position();
-  // Rows below a held snapshot copy are never rewritten while it runs; a
-  // forward at or past them (every decode and prefill step) does not wait.
-  session.AwaitRowHolds(first_pos);
   const auto fail = [&](const std::string& message) {
     if (error != nullptr) {
       *error = message;
@@ -1442,7 +1414,6 @@ bool Executor::ForwardBatch(std::span<BatchSegment> segments,
       s.error = "batch segment has no session";
       continue;
     }
-    s.session->AwaitRowHolds(s.session->position());
     if (std::any_of(
             segments.begin(), segments.begin() + i,
             [&](const BatchSegment& o) { return o.session == s.session; })) {
@@ -1741,7 +1712,6 @@ bool Executor::MtpDraft(Session& session, const DraftRequest& r,
       (!r.logits.empty() && r.logits.size() < kVocabRows)) {
     return fail("MTP draft request is out of range");
   }
-  session.AwaitRowHolds(r.position + 1);  // MTP row `position`
   if (session.continuation_hooks_ != nullptr) {
     try {
       session.continuation_hooks_->BeforeWrite(0, 0, r.position,
@@ -1875,7 +1845,6 @@ bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
         (!d.logits.empty() && d.logits.size() < kVocabRows)) {
       return fail("MTP draft batch request is out of range");
     }
-    d.session->AwaitRowHolds(d.position + 1);  // MTP row `position`
     // Draft rows lie at or past the MTP frontier and need no preservation;
     // DecodeBatch admits only ready lanes, so this never refuses in serving.
     // A lane that is not ready, or whose hook refuses, fails alone (as a
@@ -2080,7 +2049,6 @@ bool Executor::RunBlock(Session& session, std::uint32_t il,
     }
     return false;
   };
-  session.AwaitRowHolds(first_pos);
   if (il < first_layer() || il >= first_layer() + layer_count()) {
     return fail("block " + std::to_string(il) + " is not resident");
   }
