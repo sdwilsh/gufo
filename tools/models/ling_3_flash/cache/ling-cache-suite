@@ -12,7 +12,8 @@ Phases (progress on stderr with the prefix [ling-cache]):
   hermes      starts `gufo serve` (explicit RAM cache limit, disk cache under
               /work), then restarts it and checks a disk restore, and replays a Hermes-Agent tool loop (strip + echo
               variants, review fork, compaction) with cache_hermes.py; strict
-              reuse checks plus uncached controls.
+              reuse checks plus uncached controls (report-only once a strip
+              step's cached state includes decoded tokens).
   functional  tests/functional/run.py --record-baseline with the cache suites
               (cache = continuation + disk restart + disk spacing,
               cache-shared-prefix, cache-edits, cache-growth, cache-rotation,
