@@ -2871,7 +2871,7 @@ def main():
                 client, args.model, checks, chat_result,
                 image_content("red") if args.vision else None),
             "tool-choice-cache": lambda: check_tool_choice_cache(
-                client, args.model, checks, chat_result, checkpoint_tail),
+                client, args.model, checks, chat_result, checkpoint_tail, args.server_log),
             "tool-schema-edges": lambda: check_tool_schema_edges(
                 client, args.model, checks, chat_result, args.vision, image_content,
                 args.server_log, checkpoint_tail),

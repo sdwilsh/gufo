@@ -392,12 +392,15 @@ history, so the controls cannot hide a missed checkpoint. `cache-edits` checks
 latest-message edits, shortened tool results and rewinds. `cache-growth` checks
 omitted, preserved and explicitly discarded reasoning, plus thinking off.
 Unchanged retries in `cache-growth`, `cache-depth`, reasoning-separator,
-tool-history, schema edges, state edges, progress and metrics must prefill nothing,
-unless the runner's server log shows that memory pressure refused the retry
-copy; the retry may then prefill only the assistant opening after the stable
-boundary. In agent histories the mutable suffix includes the final user turn;
-`tool-history` bounds it with an independent count-tokens request rather than
-extra slack. Generic capture failures do not qualify for this exception.
+tool-history, `tool-choice-cache`, schema edges, state edges, progress and
+metrics must prefill nothing, unless the runner's server log shows that memory
+pressure refused the retry copy; the retry may then prefill only the assistant
+opening after the stable boundary. In agent histories the mutable suffix
+includes the final user turn; `tool-history` bounds it with an independent
+count-tokens request rather than extra slack, and `tool-choice-cache` does the
+same per case. Generic capture failures do not qualify for this exception. Run
+`nix develop -c python3 tests/functional/test_tool_choice.py` to check that only
+a capacity refusal in the continued request's log window permits that suffix.
 Component disk-spacing checks correlate drained publication logs with the
 checkpoint IDs captured by their own requests, excluding delayed writes from
 earlier suites even when their token counts match.
