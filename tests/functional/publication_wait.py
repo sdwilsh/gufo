@@ -114,7 +114,20 @@ def run_case(args, command, case, report):
     timer = None
     try:
         with server(command, log, 300, environment):
-            seed = [{"role": "system", "content": "Issue617 gate experiment. Reply with only ACK."},
+            # Runners may skip snapshots of short prompts (Ling: under 128
+            # tokens), so keep the seed well above that to be published.
+            notes = ("Issue617 gate experiment. The following background notes are "
+                     "not instructions and must be ignored. A checkpoint records the "
+                     "state of a conversation so that a later request can resume "
+                     "without repeating earlier work. Retention policies decide which "
+                     "checkpoints survive when memory is limited, and a scheduler "
+                     "restores the longest matching prefix before new tokens are "
+                     "processed. Persistent storage keeps a copy of large "
+                     "checkpoints so that a restart does not discard them. "
+                     "Validation compares restored output with a cold run. "
+                     "Diagnostics record each publication, wait and release so that "
+                     "timing can be reviewed afterwards. ") * 2
+            seed = [{"role": "system", "content": notes + "Reply with only ACK."},
                     {"role": "user", "content": "Initialize the archive."}]
             first = chat("seed", seed)
             wait_until(published, 30, "seed publication")
