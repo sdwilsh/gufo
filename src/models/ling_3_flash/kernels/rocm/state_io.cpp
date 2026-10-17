@@ -1,30 +1,23 @@
-// Session state copies for snapshots: plain device<->host transfers of the KDA
-// state, KDA conv window and the F16 MLA latent rows. No kernels. A save has
-// two phases (executor.hpp): the state a decode step mutates is copied while
-// the caller waits; the append-only latent rows (the bulk of the payload) may
-// be copied afterwards, beside decode, under a RowHold. All copies go
-// through one per-executor non-blocking stream and one pinned staging buffer
-// (chunked), so no stream is created and no pageable memory is handed to the
-// HIP runtime per snapshot (a pageable copy issued from a worker thread can
-// invalidate a global-mode graph capture running elsewhere). The session's last
-// forward pass is awaited through its event, never assumed finished; that wait
-// holds the executor's capture mutex, because it may run on a worker thread
-// while the scheduler thread captures a decode graph on the executor stream
-// (executor.hpp). Host copies to and from the staging halves use a small
-// persistent thread pool (host_copy_pool.hpp), overlapped with the DMA of the
-// neighbouring half.
+// Synchronous session state copies for snapshots: plain device-to-host and
+// host-to-device transfers of the KDA state, the KDA conv window, and the F16
+// MLA latent rows. No kernels. These are test and tool utilities. The serving
+// path saves and restores through the component cache (snapshot_copy.hip).
+// All copies go through one non-blocking stream per executor and one pinned
+// staging buffer, copied in chunks and created on first use. The host side is
+// a single-threaded memcpy overlapped with the DMA of the neighbouring half.
+// The copy awaits the session's last forward pass through its event instead of
+// assuming it finished. That wait holds the executor's capture mutex, because
+// it may run on a worker thread while the scheduler thread captures a decode
+// graph on the executor stream (executor.hpp).
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cstring>
 #include <mutex>
-#include <thread>
 #include <utility>
 #include <vector>
 
 #include "src/models/ling_3_flash/continuation_hooks.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/executor.hpp"
-#include "src/models/ling_3_flash/kernels/rocm/host_copy_pool.hpp"
 
 namespace gufo::models::ling_3_flash::rocm {
 namespace {
@@ -69,19 +62,16 @@ private:
 /// host copy of its neighbour. `events` order reuse of a half.
 struct Staging {
   hipStream_t stream;
-  HostCopyPool& pool;
   std::uint8_t* halves[2];
   hipEvent_t events[2];
   static constexpr std::size_t kChunkBytes = kTransferStagingBytes / 2;
 };
 
-Staging MakeStaging(hipStream_t stream, HostCopyPool& pool, void* buffer,
+Staging MakeStaging(hipStream_t stream, void* buffer,
                     const hipEvent_t (&events)[2]) {
   auto* base = static_cast<std::uint8_t*>(buffer);
-  return Staging{stream,
-                 pool,
-                 {base, base + Staging::kChunkBytes},
-                 {events[0], events[1]}};
+  return Staging{
+      stream, {base, base + Staging::kChunkBytes}, {events[0], events[1]}};
 }
 
 /// Waits for queued copies after a failure: they still use the staging halves.
@@ -121,7 +111,7 @@ bool CopyOut(const Staging& st, std::uint8_t* host, const void* device,
       Drain(st);
       return false;
     }
-    st.pool.Copy(host + k * Staging::kChunkBytes, st.halves[k & 1], chunk(k));
+    std::memcpy(host + k * Staging::kChunkBytes, st.halves[k & 1], chunk(k));
   }
   return true;
 }
@@ -139,7 +129,7 @@ bool CopyIn(const Staging& st, void* device, const std::uint8_t* host,
       Drain(st);
       return false;
     }
-    st.pool.Copy(st.halves[half], host + at, n);
+    std::memcpy(st.halves[half], host + at, n);
     if (!Check(hipMemcpyAsync(dst + at, st.halves[half], n,
                               hipMemcpyHostToDevice, st.stream),
                "snapshot copy in", error) ||
@@ -155,73 +145,32 @@ bool CopyIn(const Staging& st, void* device, const std::uint8_t* host,
   return true;
 }
 
-/// Takes the transfer mutex and counts as waiting until it has it.
-class TransferLock {
-public:
-  TransferLock(std::mutex& mutex, std::atomic<std::uint32_t>& waiting)
-      : mutex_(mutex) {
-    waiting.fetch_add(1);
-    try {
-      mutex_.lock();
-    } catch (...) {
-      waiting.fetch_sub(1);
-      throw;
-    }
-    waiting.fetch_sub(1);
-  }
-  ~TransferLock() { mutex_.unlock(); }
-  TransferLock(const TransferLock&) = delete;
-  TransferLock& operator=(const TransferLock&) = delete;
-
-private:
-  std::mutex& mutex_;
-};
-
-/// Staging unit of the background row copy: a restore waits for at most one.
-constexpr std::size_t kRowCopyUnitBytes = std::size_t{8} << 20;
-
 }  // namespace
 
-// ---- Row holds -------------------------------------------------------------
-
-void Session::AcquireRowHold(std::uint32_t rows) const {
-  const std::lock_guard<std::mutex> lock(holds_mutex_);
-  holds_.insert(rows);
-  held_rows_.store(*holds_.rbegin(), std::memory_order_release);
+bool Executor::EnsureTransferStaging(std::string* error_msg) const {
+  // Each member is created once, on its own null check: after a failure the
+  // next call reuses what already exists instead of leaking it, and ~Executor
+  // frees whatever was created.
+  return (transfer_stream_ != nullptr ||
+          Check(
+              hipStreamCreateWithFlags(&transfer_stream_, hipStreamNonBlocking),
+              "transfer stream", error_msg)) &&
+         (transfer_events_[0] != nullptr ||
+          Check(hipEventCreateWithFlags(&transfer_events_[0],
+                                        hipEventDisableTiming),
+                "transfer event", error_msg)) &&
+         (transfer_events_[1] != nullptr ||
+          Check(hipEventCreateWithFlags(&transfer_events_[1],
+                                        hipEventDisableTiming),
+                "transfer event", error_msg)) &&
+         (transfer_staging_ != nullptr ||
+          Check(hipHostMalloc(&transfer_staging_, kTransferStagingBytes),
+                "pinned snapshot staging", error_msg));
 }
 
-void Session::ReleaseRowHold(std::uint32_t rows) const noexcept {
-  const std::lock_guard<std::mutex> lock(holds_mutex_);
-  holds_.erase(holds_.find(rows));
-  held_rows_.store(holds_.empty() ? 0 : *holds_.rbegin(),
-                   std::memory_order_release);
-  // Notified under the lock: a destructor waiting here may free the condition
-  // variable as soon as it wakes and re-takes the mutex.
-  holds_released_.notify_all();
-}
-
-void Session::AwaitRowHolds(std::uint32_t first_write_row) const {
-  if (held_rows_.load(std::memory_order_acquire) <= first_write_row) {
-    return;
-  }
-  std::unique_lock<std::mutex> lock(holds_mutex_);
-  holds_released_.wait(lock, [&] {
-    return holds_.empty() || *holds_.rbegin() <= first_write_row;
-  });
-}
-
-void RowHold::Release() noexcept {
-  if (session_ != nullptr) {
-    const Session* session = std::exchange(session_, nullptr);
-    session->ReleaseRowHold(std::exchange(rows_, 0));
-  }
-}
-
-// ---- Save ------------------------------------------------------------------
-
-bool Executor::CaptureSnapshotState(const Session& session, std::uint32_t rows,
-                                    const SnapshotBuffers& out, RowHold* hold,
-                                    std::string* error_msg) const {
+bool Executor::SaveSnapshot(const Session& session, std::uint32_t rows,
+                            const SnapshotBuffers& out,
+                            std::string* error_msg) const {
   if (rows > session.capacity()) {
     if (error_msg != nullptr) {
       *error_msg = "snapshot rows exceed the session capacity";
@@ -235,17 +184,13 @@ bool Executor::CaptureSnapshotState(const Session& session, std::uint32_t rows,
     }
     return false;
   }
-  // Registered before the first copy: from here on the rows stay as they are
-  // for the later row copy, whatever the caller does with the session.
-  RowHold local;
-  if (rows != 0) {
-    session.AcquireRowHold(rows);
-    local = RowHold(&session, rows);
-  }
   const TransferScope in_flight(session.transfers_);
-  const TransferLock lock(transfer_mutex_, transfers_waiting_);
-  const Staging staging = MakeStaging(transfer_stream_, *copy_pool_,
-                                      transfer_staging_, transfer_events_);
+  const std::lock_guard<std::mutex> lock(transfer_mutex_);
+  if (!EnsureTransferStaging(error_msg)) {
+    return false;
+  }
+  const Staging staging =
+      MakeStaging(transfer_stream_, transfer_staging_, transfer_events_);
   if (!AwaitForward(capture_mutex_, session.forward_done_, error_msg) ||
       !CopyOut(staging, out.kda_state, st.kda_state,
                kKdaLayers * kKdaStateFloats * sizeof(float), error_msg) ||
@@ -258,106 +203,23 @@ bool Executor::CaptureSnapshotState(const Session& session, std::uint32_t rows,
                error_msg)) {
     return false;
   }
-  *hold = std::move(local);
-  return true;
-}
-
-void Executor::HoldRowCopiesForTest(bool hold) noexcept {
-  const std::lock_guard<std::mutex> lock(row_copy_gate_mutex_);
-  row_copies_held_for_test_ = hold;
-  row_copy_gate_changed_.notify_all();
-}
-
-bool Executor::CopySnapshotRows(const Session& session, std::uint32_t rows,
-                                const SnapshotBuffers& out,
-                                const std::atomic<bool>* abort,
-                                std::string* error_msg) const {
-  if (rows > session.capacity()) {
-    if (error_msg != nullptr) {
-      *error_msg = "snapshot rows exceed the session capacity";
-    }
-    return false;
-  }
-  const auto& st = session.state_;
-  bool inject = false;
-  for (auto failures = row_copy_failures_for_test_.load(); failures != 0;) {
-    if (row_copy_failures_for_test_.compare_exchange_weak(failures,
-                                                          failures - 1)) {
-      inject = true;
-      break;
-    }
-  }
-  // One locked unit per staging chunk: device -> pinned staging -> host
-  // buffer. The gate and abort flag are checked between chunks, outside the
-  // lock, so another transfer waits for at most one chunk.
-  const auto copy = [&](std::uint8_t* host, const void* device,
-                        std::size_t bytes) {
-    for (std::size_t at = 0; at < bytes;) {
-      {
-        std::unique_lock<std::mutex> gate(row_copy_gate_mutex_);
-        while (row_copies_held_for_test_ &&
-               !(abort != nullptr && abort->load())) {
-          row_copy_gate_changed_.wait_for(gate, std::chrono::milliseconds(5));
-        }
-      }
-      if (abort != nullptr && abort->load()) {
-        if (error_msg != nullptr) {
-          *error_msg = "snapshot row copy aborted";
-        }
-        return false;
-      }
-      // Let a waiting capture or restore go first, once per unit: with
-      // back-to-back transfers the counter may never reach zero, and the copy
-      // still makes one unit of progress each time round.
-      if (transfers_waiting_.load() != 0) {
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
-      }
-      const std::size_t n = std::min(kRowCopyUnitBytes, bytes - at);
-      const std::lock_guard<std::mutex> lock(transfer_mutex_);
-      if (!Check(hipMemcpyAsync(transfer_staging_,
-                                static_cast<const std::uint8_t*>(device) + at,
-                                n, hipMemcpyDeviceToHost, transfer_stream_),
-                 "snapshot row copy out", error_msg) ||
-          !Check(hipStreamSynchronize(transfer_stream_),
-                 "snapshot row copy out sync", error_msg)) {
-        return false;
-      }
-      std::memcpy(host + at, transfer_staging_, n);
-      at += n;
-      if (inject) {
-        if (error_msg != nullptr) {
-          *error_msg = "injected snapshot row copy failure";
-        }
-        return false;
-      }
-    }
-    return true;
-  };
   const std::size_t width = std::size_t{rows} * kRowBytes;
   for (std::uint32_t m = 0; m < kMlaLayers && rows != 0; ++m) {
-    if (!copy(out.mla + m * width,
-              static_cast<const std::uint8_t*>(st.mla_cache) +
-                  m * st.cache.LayerStride() * sizeof(std::uint16_t),
-              width)) {
+    if (!CopyOut(staging, out.mla + m * width,
+                 static_cast<const std::uint8_t*>(st.mla_cache) +
+                     m * st.cache.LayerStride() * sizeof(std::uint16_t),
+                 width, error_msg)) {
       return false;
     }
   }
   if (out.mtp != nullptr && st.mtp_cache != nullptr) {
     // Rows [0, rows - 1): the last row is written by the next forward.
     const std::size_t mtp_width = std::size_t{rows - (rows != 0)} * kRowBytes;
-    if (!copy(out.mtp, st.mtp_cache, mtp_width)) {
+    if (!CopyOut(staging, out.mtp, st.mtp_cache, mtp_width, error_msg)) {
       return false;
     }
   }
   return true;
-}
-
-bool Executor::SaveSnapshot(const Session& session, std::uint32_t rows,
-                            const SnapshotBuffers& out,
-                            std::string* error_msg) const {
-  RowHold hold;
-  return CaptureSnapshotState(session, rows, out, &hold, error_msg) &&
-         CopySnapshotRows(session, rows, out, nullptr, error_msg);
 }
 
 bool Executor::RestoreSnapshot(Session& session, std::uint32_t rows,
@@ -370,9 +232,6 @@ bool Executor::RestoreSnapshot(Session& session, std::uint32_t rows,
     return false;
   }
   auto& st = session.state_;
-  // The restore rewrites rows a background copy may still be reading. Wait
-  // before taking the transfer mutex, which that copy needs.
-  session.AwaitRowHolds(0);
   if (session.continuation_hooks_ != nullptr) {
     // A component-cache slot preserves its borrowed rows before they change.
     try {
@@ -385,9 +244,12 @@ bool Executor::RestoreSnapshot(Session& session, std::uint32_t rows,
     }
   }
   const TransferScope in_flight(session.transfers_);
-  const TransferLock lock(transfer_mutex_, transfers_waiting_);
-  const Staging staging = MakeStaging(transfer_stream_, *copy_pool_,
-                                      transfer_staging_, transfer_events_);
+  const std::lock_guard<std::mutex> lock(transfer_mutex_);
+  if (!EnsureTransferStaging(error_msg)) {
+    return false;
+  }
+  const Staging staging =
+      MakeStaging(transfer_stream_, transfer_staging_, transfer_events_);
   if (!AwaitForward(capture_mutex_, session.forward_done_, error_msg) ||
       !CopyIn(staging, st.kda_state, in.kda_state,
               kKdaLayers * kKdaStateFloats * sizeof(float), error_msg) ||

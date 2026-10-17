@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -23,7 +22,6 @@
 
 #include "src/models/ling_3_flash/gpu_dump.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/device_model.hpp"
-#include "src/models/ling_3_flash/kernels/rocm/host_copy_pool.hpp"
 #include "src/models/ling_3_flash/layout.hpp"
 
 namespace gufo::models::ling_3_flash {
@@ -36,49 +34,9 @@ namespace gufo::models::ling_3_flash::rocm {
 class Executor;
 class Session;
 
-/// Keeps the append-only rows [0, rows) of one session's MLA cache (and rows
-/// [0, rows - 1) of its MTP cache) from being rewritten while they are copied
-/// to the host in the background (Executor::CaptureSnapshotState /
-/// CopySnapshotRows). Decode only appends past `rows`, so it never waits; a
-/// reset, a restore, a forward at an earlier position or the session's
-/// destruction waits for the release. Movable; releases on destruction.
-class RowHold {
-public:
-  RowHold() = default;
-  ~RowHold() { Release(); }
-  RowHold(RowHold&& other) noexcept
-      : session_(std::exchange(other.session_, nullptr)),
-        rows_(std::exchange(other.rows_, 0)) {}
-  RowHold& operator=(RowHold&& other) noexcept {
-    if (this != &other) {
-      Release();
-      session_ = std::exchange(other.session_, nullptr);
-      rows_ = std::exchange(other.rows_, 0);
-    }
-    return *this;
-  }
-  RowHold(const RowHold&) = delete;
-  RowHold& operator=(const RowHold&) = delete;
-  [[nodiscard]] explicit operator bool() const noexcept {
-    return session_ != nullptr;
-  }
-  /// Idempotent. The session may be destroyed as soon as this returns.
-  void Release() noexcept;
-
-private:
-  friend class Executor;
-  RowHold(const Session* session, std::uint32_t rows) noexcept
-      : session_(session), rows_(rows) {}
-  const Session* session_{nullptr};
-  std::uint32_t rows_{0};
-};
-
-/// Pinned staging buffer of the snapshot transfer stream.
+/// Pinned staging buffer of the snapshot transfer stream, allocated by the
+/// first synchronous SaveSnapshot/RestoreSnapshot (test and tool utilities).
 inline constexpr std::size_t kTransferStagingBytes = std::size_t{64} << 20;
-/// Threads (calling thread included) that copy between snapshot host buffers
-/// and the staging buffer. Do not raise it without measuring concurrent decode
-/// during a restore: the host copy, SDMA and decode share one LPDDR5X pool.
-inline constexpr unsigned kHostCopyThreads = 2;
 
 /// Device state of one sequence: KDA recurrent state and conv window of the
 /// 35 KDA layers plus the F16 latent cache of the 7 MLA layers (layout.hpp).
@@ -208,22 +166,6 @@ private:
   /// thread). A batched forward refuses a session with a transfer in flight.
   mutable std::atomic<std::uint32_t> transfers_{0};
   bool mtp_valid_{false};
-  /// Background row copies of this session (RowHold): the largest `rows` of
-  /// any live hold, 0 when none. Read lock-free on every forward.
-  mutable std::atomic<std::uint32_t> held_rows_{0};
-  mutable std::mutex holds_mutex_;
-  mutable std::condition_variable holds_released_;
-  mutable std::multiset<std::uint32_t> holds_;
-  friend class RowHold;
-  /// Registers a hold on rows [0, rows).
-  void AcquireRowHold(std::uint32_t rows) const;
-  void ReleaseRowHold(std::uint32_t rows) const noexcept;
-  /// Blocks while a hold covers a row a write starting at `first_write_row`
-  /// would reach, i.e. while some hold has more than `first_write_row` rows
-  /// (an MTP row q is reached by first_write_row = q + 1: its snapshot rows
-  /// are [0, rows - 1)). Call before any device write that may reach such a
-  /// row and before taking executor locks (a copy worker needs them).
-  void AwaitRowHolds(std::uint32_t first_write_row) const;
 };
 
 /// Time spent by the last Forward, from device events.
@@ -450,36 +392,10 @@ public:
     const std::uint8_t* mtp_h{nullptr};
     const std::uint8_t* mtp{nullptr};
   };
-  /// The whole copy, synchronously: CaptureSnapshotState + CopySnapshotRows.
+  /// Synchronous copy of the session state into `out` (plain memcpy staging).
   [[nodiscard]] bool SaveSnapshot(const Session& session, std::uint32_t rows,
                                   const SnapshotBuffers& out,
                                   std::string* error_msg = nullptr) const;
-  /// Phase 1 of a split copy: awaits the session's last forward, then copies
-  /// the state the next forward mutates (KDA state, conv windows, MTP carry:
-  /// about 76 MiB) into `out`. On success `*hold` keeps rows [0, rows) of the
-  /// session unwritten until CopySnapshotRows finished (or the hold is
-  /// released); the caller may then let the session decode. `out.mla` and
-  /// `out.mtp` are untouched. A failure leaves no hold.
-  [[nodiscard]] bool CaptureSnapshotState(
-      const Session& session, std::uint32_t rows, const SnapshotBuffers& out,
-      RowHold* hold, std::string* error_msg = nullptr) const;
-  /// Phase 2: copies the append-only MLA rows [0, rows) and MTP rows
-  /// [0, rows - 1) into `out.mla` / `out.mtp`. Needs the hold of
-  /// CaptureSnapshotState (decode only appends past `rows`, so it may run
-  /// beside forwards of the session), runs on any thread, takes the transfer
-  /// mutex one pinned-staging chunk at a time so other transfers interleave,
-  /// and stops early (false) when `*abort` becomes true.
-  [[nodiscard]] bool CopySnapshotRows(const Session& session,
-                                      std::uint32_t rows,
-                                      const SnapshotBuffers& out,
-                                      const std::atomic<bool>* abort,
-                                      std::string* error_msg = nullptr) const;
-  /// Test hooks: while held, a CopySnapshotRows pauses before each chunk;
-  /// the next `count` CopySnapshotRows calls fail after their first chunk.
-  void HoldRowCopiesForTest(bool hold) noexcept;
-  void FailRowCopiesForTest(std::uint32_t count) noexcept {
-    row_copy_failures_for_test_ = count;
-  }
   /// Overwrites the session's KDA state, conv window and MLA rows
   /// [0, rows) bit for bit and invalidates derived caches; with MTP buffers
   /// also the MTP rows and carry (the session becomes mtp_valid), otherwise an
@@ -691,24 +607,18 @@ private:
   Options options_;
   bool draft_head_q8_{true};
   hipStream_t stream_{nullptr};
-  /// Snapshot transfers: one private stream and one pinned staging buffer per
-  /// executor (state_io.cpp), serialized by `transfer_mutex_`. No streams or
-  /// pageable copies are created per snapshot.
-  hipStream_t transfer_stream_{nullptr};
-  void* transfer_staging_{nullptr};
-  std::unique_ptr<HostCopyPool> copy_pool_;
+  /// Synchronous snapshot transfers (test and tool utilities): one private
+  /// stream and one pinned staging buffer per executor (state_io.cpp), created
+  /// on first use so a serving executor never holds them, and serialized by
+  /// `transfer_mutex_`.
+  mutable hipStream_t transfer_stream_{nullptr};
+  mutable void* transfer_staging_{nullptr};
   /// Order the reuse of the two staging halves (state_io.cpp).
-  hipEvent_t transfer_events_[2]{nullptr, nullptr};
+  mutable hipEvent_t transfer_events_[2]{nullptr, nullptr};
   mutable std::mutex transfer_mutex_;
-  /// Transfers waiting for `transfer_mutex_` (captures and restores). The
-  /// background row copy of a snapshot yields to them between its staging
-  /// units: std::mutex is not fair, and a copy that relocks at once starves a
-  /// restore for the whole copy.
-  mutable std::atomic<std::uint32_t> transfers_waiting_{0};
-  mutable std::mutex row_copy_gate_mutex_;
-  mutable std::condition_variable row_copy_gate_changed_;
-  bool row_copies_held_for_test_{false};
-  mutable std::atomic<std::uint32_t> row_copy_failures_for_test_{0};
+  /// Creates the transfer stream, staging and events. Call with
+  /// `transfer_mutex_` held.
+  bool EnsureTransferStaging(std::string* error_msg) const;
   /// Held while a decode graph is captured on `stream_` and by any other
   /// thread's host wait on an event recorded on `stream_` (a snapshot worker
   /// waiting for its session's last forward). HIP fails such a wait during a

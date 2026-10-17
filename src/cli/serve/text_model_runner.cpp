@@ -274,8 +274,6 @@ std::string_view SnapshotEventReasonName(SnapshotEventReason reason) noexcept {
       return "capture_failure";
     case SnapshotEventReason::kReservationMismatch:
       return "reservation_mismatch";
-    case SnapshotEventReason::kUnusable:
-      return "snapshot_unusable";
   }
   return "unknown";
 }
@@ -287,8 +285,7 @@ void EmitSnapshotEvent(const SnapshotEvent& event) noexcept {
   // fewer conversations than the workload rotates through, so it is doing
   // avoidable full re-prefills. Failed captures also need attention.
   if (event.action == SnapshotEventAction::kRemoved &&
-      event.reason != SnapshotEventReason::kEntryCapacity &&
-      event.reason != SnapshotEventReason::kUnusable)
+      event.reason != SnapshotEventReason::kEntryCapacity)
     return;
   try {
     std::ostringstream line;
@@ -332,8 +329,6 @@ std::string_view DiskEventActionName(
       return "removed";
     case ContinuationDiskEventAction::kSkipped:
       return "skipped";
-    case ContinuationDiskEventAction::kDrained:
-      return "drained";
   }
   return "unknown";
 }
@@ -373,8 +368,6 @@ std::string_view DiskEventReasonName(
       return "restore_failure";
     case ContinuationDiskEventReason::kBusy:
       return "busy";
-    case ContinuationDiskEventReason::kTimeout:
-      return "timeout";
   }
   return "unknown";
 }

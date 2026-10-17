@@ -173,11 +173,6 @@ public:
   /// Test hook: the batched draft step after the next `skip` ones fails after
   /// launch (Session::DecodeBatch; bookkeeping only).
   void FailDraftBatchForTest(std::uint32_t skip) noexcept;
-  /// Test hooks for the background row copy of Session::SaveSnapshot: while
-  /// held, the copy pauses before each staging chunk (the snapshot stays
-  /// not ready); the next `count` copies fail after their first chunk.
-  void HoldSnapshotRowCopiesForTest(bool hold) noexcept;
-  void FailSnapshotRowCopiesForTest(std::uint32_t count) noexcept;
 
 private:
   Model() = default;
@@ -516,16 +511,11 @@ public:
   /// last logits, in host memory (snapshot_format.hpp; SnapshotBytes() is its
   /// exact size). It reads only this session's buffers on a private stream, so
   /// it may run on a worker thread while another session executes; this
-  /// session must be idle at the call. The recurrent state is copied before
-  /// the call returns; the latent rows (the bulk) are copied by a background
-  /// thread while this session may already decode (see SessionSnapshot).
-  /// Fails on an invalid or empty session.
+  /// session must be idle at the call. The copy is complete when the call
+  /// returns. Test and tool utility: serving saves through the component
+  /// cache (continuation_adapter.hpp). Fails on an invalid or empty session.
   [[nodiscard]] std::unique_ptr<SessionSnapshot> SaveSnapshot(
       std::string* error_msg = nullptr) const;
-  /// Reference for tests: the same payload through Executor::SaveSnapshot
-  /// (capture and row copy back to back, no background worker).
-  [[nodiscard]] std::unique_ptr<SessionSnapshot>
-  SaveSnapshotSynchronouslyForTest(std::string* error_msg = nullptr) const;
   /// Payload size SaveSnapshot would produce now (0 when it would fail).
   [[nodiscard]] std::size_t SnapshotBytes() const noexcept;
   /// Makes this session's context equal to the snapshot's, bit for bit, in any
@@ -559,8 +549,6 @@ public:
 private:
   friend class Model;
   friend class ContinuationAdapter;
-  [[nodiscard]] std::unique_ptr<SessionSnapshot> SaveSnapshotImpl(
-      std::string* error_msg, bool synchronous) const;
   Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
 
   std::shared_ptr<Model> model_;
@@ -601,6 +589,7 @@ private:
   /// on a long enough match, fills `c.chain` with up to `room` copies (the
   /// copy controller decides how many). False: an ordinary cycle.
   [[nodiscard]] bool ProposeCopies(Cycle& c, std::uint32_t room);
+  [[nodiscard]] bool IsStop(std::int32_t token) const noexcept;
   /// After a verify of `c.chain`: acceptance with `sampler`, Rollback, the
   /// result, statistics and the length controller (ObserveCost from `begin`
   /// when given, for serial cycles only).
@@ -621,17 +610,8 @@ private:
   DraftHooks hooks_;
 };
 
-/// Host-held snapshot payload of one session (snapshot_format.hpp).
-///
-/// Session::SaveSnapshot copies the state a decode step mutates before it
-/// returns and fills the append-only latent rows in the background, beside the
-/// session's own decode (the rows below Position() are never rewritten while
-/// the copy runs; a reset, restore or destruction of the session waits for it).
-/// The payload is complete, and immutable, once Wait() returned true.
-/// Position() and SizeBytes() are known immediately; bytes() is the payload
-/// and waits for the copy. Destroying the snapshot aborts its copy without
-/// waiting for it: the worker keeps the payload buffer alive until it stops (at
-/// its next chunk).
+/// Host-held snapshot payload of one session (snapshot_format.hpp), complete
+/// and immutable once Session::SaveSnapshot returned it.
 class SessionSnapshot final {
 public:
   ~SessionSnapshot();
@@ -639,30 +619,15 @@ public:
   SessionSnapshot& operator=(const SessionSnapshot&) = delete;
   [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
   [[nodiscard]] std::size_t SizeBytes() const noexcept { return size_; }
-  /// True once the background copy finished, successfully or not.
-  [[nodiscard]] bool Ready() const noexcept;
-  /// True once the background copy failed (the payload is then unusable).
-  [[nodiscard]] bool Failed() const noexcept;
-  /// Waits for the background copy. False (with the reason in `error_msg`)
-  /// when it failed.
-  [[nodiscard]] bool Wait(std::string* error_msg = nullptr) const;
-  /// The serialized payload (RAM entry and disk file are these same bytes),
-  /// once complete; empty when the copy failed. Waits for the copy.
+  /// The serialized payload (the disk-cache bytes).
   [[nodiscard]] std::span<const std::uint8_t> bytes() const noexcept;
 
 private:
-  struct AsyncCopy;
   SessionSnapshot(std::uint32_t position, std::size_t size);
-  /// Runs `copy` (returns false with a reason on failure; stops early when
-  /// the flag is set) on a worker, then `release`. Inline when no thread can
-  /// be started.
-  void StartCopy(
-      std::function<bool(const std::atomic<bool>&, std::string*)> copy,
-      std::function<void()> release);
-  std::uint8_t* data_{nullptr};  ///< Owned by `copy_`, which a worker shares.
+  // Uninitialized: every byte is written by SaveSnapshot.
+  std::unique_ptr<std::uint8_t[]> buffer_;
   std::size_t size_{0};
   std::uint32_t position_{0};
-  std::shared_ptr<AsyncCopy> copy_;
   friend class Session;
 };
 

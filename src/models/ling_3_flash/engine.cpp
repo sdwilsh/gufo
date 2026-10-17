@@ -4,13 +4,10 @@
 #include <array>
 #include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <functional>
 #include <optional>
-#include <system_error>
-#include <thread>
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/ling_3_flash/continuation_hooks.hpp"
@@ -177,14 +174,6 @@ void Model::BreakCapturesForTest(std::uint32_t count) noexcept {
 
 std::uint32_t Model::BatchRowLimit() const noexcept {
   return executor_->batch_row_limit();
-}
-
-void Model::HoldSnapshotRowCopiesForTest(bool hold) noexcept {
-  executor_->HoldRowCopiesForTest(hold);
-}
-
-void Model::FailSnapshotRowCopiesForTest(std::uint32_t count) noexcept {
-  executor_->FailRowCopiesForTest(count);
 }
 
 void Model::FailDraftBatchForTest(std::uint32_t skip) noexcept {
@@ -522,16 +511,6 @@ std::size_t Session::SnapshotBytes() const noexcept {
 
 std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
     std::string* error_msg) const {
-  return SaveSnapshotImpl(error_msg, false);
-}
-
-std::unique_ptr<SessionSnapshot> Session::SaveSnapshotSynchronouslyForTest(
-    std::string* error_msg) const {
-  return SaveSnapshotImpl(error_msg, true);
-}
-
-std::unique_ptr<SessionSnapshot> Session::SaveSnapshotImpl(
-    std::string* error_msg, bool synchronous) const {
   if (!valid_ || pending_.active || tokens_.empty() ||
       logits_.size() != kVocab || tokens_.size() != session_->position()) {
     AssignError(error_msg, "snapshot needs a valid, non-empty session");
@@ -545,7 +524,7 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshotImpl(
   }
   const SnapshotSections at = SnapshotLayout(position, mtp);
   std::unique_ptr<SessionSnapshot> s(new SessionSnapshot(position, at.total));
-  std::uint8_t* base = s->data_;
+  std::uint8_t* base = s->buffer_.get();
   const SnapshotHeader header{
       .magic = {kSnapshotMagic[0], kSnapshotMagic[1], kSnapshotMagic[2],
                 kSnapshotMagic[3], kSnapshotMagic[4], kSnapshotMagic[5],
@@ -571,39 +550,15 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshotImpl(
       .mla = base + at.mla,
       .mtp_h = mtp ? base + at.mtp_h : nullptr,
       .mtp = mtp ? base + at.mtp : nullptr};
-  if (synchronous) {
-    // The one-call executor path (both phases back to back, no worker).
-    if (!model_->executor_->SaveSnapshot(*session_, position, buffers,
-                                         error_msg)) {
-      return nullptr;
-    }
-    s->StartCopy([](const std::atomic<bool>&, std::string*) { return true; },
-                 [] {});
-    return s;
-  }
-  rocm::RowHold hold;
-  if (!model_->executor_->CaptureSnapshotState(*session_, position, buffers,
-                                               &hold, error_msg)) {
+  if (!model_->executor_->SaveSnapshot(*session_, position, buffers,
+                                       error_msg)) {
     return nullptr;
   }
-  // The worker needs the executor and the session's device buffers only until
-  // it releases the hold; the session's destructor waits for that.
-  const auto held = std::make_shared<rocm::RowHold>(std::move(hold));
-  s->StartCopy(
-      [executor = model_->executor_.get(), device = session_.get(), position,
-       buffers](const std::atomic<bool>& abort, std::string* error) {
-        return executor->CopySnapshotRows(*device, position, buffers, &abort,
-                                          error);
-      },
-      [held] { held->Release(); });
   return s;
 }
 
 bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
                               std::string* error_msg) {
-  if (!snapshot.Wait(error_msg)) {
-    return false;  // the session is untouched
-  }
   return RestoreSnapshot(snapshot.bytes(), error_msg);
 }
 
@@ -1506,105 +1461,13 @@ void Session::DecodeBatch(std::span<BatchDecode> lanes) {
 
 // ---- SessionSnapshot -------------------------------------------------------
 
-/// The background row copy of one snapshot, shared by the snapshot and its
-/// worker; it also owns the payload buffer the worker writes. The worker holds
-/// no reference to the snapshot and releases its RowHold last, after
-/// publishing the result, because the session may be destroyed right after.
-/// Destroying the snapshot only sets `abort` and detaches the worker: joining
-/// could stall the thread that evicts a cache entry behind another session's
-/// restore, which holds the executor's transfer mutex for a whole restore.
-/// The detached worker stops at its next chunk (until then it keeps the host
-/// buffer, though a cache eviction or reap already counted the bytes as freed);
-/// its device reads stay safe because ~rocm::Session waits for the RowHold it
-/// still owns.
-struct SessionSnapshot::AsyncCopy {
-  explicit AsyncCopy(std::size_t size) : buffer(new std::uint8_t[size]) {}
-  // Uninitialized: every byte is written by SaveSnapshot.
-  std::unique_ptr<std::uint8_t[]> buffer;
-  mutable std::mutex mutex;
-  mutable std::condition_variable changed;
-  bool done{false};
-  bool ok{false};
-  std::string error;
-  std::atomic<bool> abort{false};
-  std::thread worker;
-};
-
 SessionSnapshot::SessionSnapshot(std::uint32_t position, std::size_t size)
-    : size_(size), position_(position), copy_(new AsyncCopy(size)) {
-  data_ = copy_->buffer.get();
-}
+    : buffer_(new std::uint8_t[size]), size_(size), position_(position) {}
 
-SessionSnapshot::~SessionSnapshot() {
-  if (copy_ != nullptr && copy_->worker.joinable()) {
-    copy_->abort.store(true);
-    copy_->worker.detach();
-  }
-}
-
-bool SessionSnapshot::Ready() const noexcept {
-  const std::lock_guard<std::mutex> lock(copy_->mutex);
-  return copy_->done;
-}
-
-bool SessionSnapshot::Failed() const noexcept {
-  const std::lock_guard<std::mutex> lock(copy_->mutex);
-  return copy_->done && !copy_->ok;
-}
-
-bool SessionSnapshot::Wait(std::string* error_msg) const {
-  std::unique_lock<std::mutex> lock(copy_->mutex);
-  copy_->changed.wait(lock, [this] { return copy_->done; });
-  if (!copy_->ok) {
-    AssignError(error_msg, copy_->error);
-  }
-  return copy_->ok;
-}
+SessionSnapshot::~SessionSnapshot() = default;
 
 std::span<const std::uint8_t> SessionSnapshot::bytes() const noexcept {
-  return Wait() ? std::span<const std::uint8_t>(data_, size_)
-                : std::span<const std::uint8_t>();
-}
-
-void SessionSnapshot::StartCopy(
-    std::function<bool(const std::atomic<bool>&, std::string*)> copy,
-    std::function<void()> release) {
-  const std::shared_ptr<AsyncCopy> state = copy_;
-  const auto run = [state, copy = std::move(copy),
-                    release = std::move(release)] {
-    bool ok = false;
-    std::string error;
-    try {
-      ok = copy(state->abort, &error);
-    } catch (...) {
-      ok = false;
-      error = "snapshot row copy threw";
-    }
-    // Publish in every path, then release the hold last: a missing release
-    // would make ~rocm::Session wait forever.
-    try {
-      const std::lock_guard<std::mutex> lock(state->mutex);
-      state->ok = ok;
-      try {
-        state->error = std::move(error);
-      } catch (...) {
-        state->error.clear();
-      }
-      state->done = true;
-      state->changed.notify_all();
-    } catch (...) {
-      // The mutex itself failed; nothing more can be published safely.
-    }
-    try {
-      release();
-    } catch (...) {
-    }
-  };
-  try {
-    state->worker = std::thread(run);
-  } catch (const std::system_error&) {
-    run();
-  }
+  return {buffer_.get(), size_};
 }
 
 }  // namespace gufo::models::ling_3_flash
