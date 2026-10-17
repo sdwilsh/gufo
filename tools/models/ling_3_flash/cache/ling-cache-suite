@@ -9,22 +9,25 @@ Environment equivalents: MODEL, LING_SUITES, LING_CONTEXT, LING_SESSIONS,
 LING_CACHE_RAM_BYTES, LING_HERMES_STEPS.
 
 Phases (progress on stderr with the prefix [ling-cache]):
-  hermes      starts `gufo serve` (explicit RAM cache limit, disk cache under
-              /work), then restarts it and checks a disk restore, and replays a Hermes-Agent tool loop (strip + echo
-              variants, review fork, compaction) with cache_hermes.py; strict
-              reuse checks plus uncached controls.
+  hermes      Starts `gufo serve` (explicit RAM cache limit, disk cache under
+              /work), restarts it and checks a disk restore, and replays a
+              Hermes-Agent tool loop (strip and echo variants, review fork,
+              compaction) with cache_hermes.py. It runs strict reuse checks
+              plus uncached controls. The controls are report-only once a strip
+              step's cached state includes decoded tokens.
   functional  tests/functional/run.py --record-baseline with the cache suites
               (cache = continuation, disk restart, and disk spacing;
               cache-shared-prefix, cache-edits, cache-growth, cache-rotation,
-              cache-concurrency) and long-context; it owns its server.
-Summary: per phase status, per-suite request/cached/prefill token totals, the
-server's own per-request cache outcomes (memory/disk/miss with miss reasons
-parsed from the terminal log lines) and the Hermes per-step prefill tokens.
-Exit 0 only when every selected phase passed; a child that exits non-zero fails
-its phase whatever its report says. Only /work is written: each invocation uses
-its own directory WORK/run-<time>-<pid> (WORK defaults to /work/ling-cache), so
-the suite can run again in the same pod. The disk caches are removed once their
-phase is done; logs and reports stay.
+              cache-concurrency) and long-context. It owns its server.
+Summary: per phase status, per-suite request, cached, and prefill token totals,
+the server's own per-request cache outcomes (memory, disk, or miss, with miss
+reasons parsed from the terminal log lines), and the Hermes per-step prefill
+tokens. Exit 0 only when every selected phase passed. A child that exits
+non-zero fails its phase whatever its report says. The suite writes only under
+/work. Each invocation uses its own directory WORK/run-<time>-<pid> (WORK
+defaults to /work/ling-cache), so the suite can run again in the same pod. The
+suite removes the disk caches once their phase is done and keeps logs and
+reports.
 """
 import argparse, glob, json, os, re, shutil, signal, socket, subprocess, sys, time, http.client
 
