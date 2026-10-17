@@ -10,12 +10,7 @@
 //     continue;
 //   * the payload size matches Session::SnapshotBytes and 8068 bytes/token;
 //   * malformed payloads are rejected without touching the session;
-//   * the background row copy (the latent rows are copied after
-//     SaveSnapshot returned): bytes equal the synchronous copy while the
-//     session decodes beside the copy, a reset/rewrite of the rows and the
-//     session's destruction wait for it, destroying the snapshot aborts it, a
-//     failed copy is unusable and leaves restore targets untouched, batched
-//     decode proceeds beside it, and the host-only Invalidate never waits.
+//   * a save is complete when it returns, and repeatable.
 // Exit 77 without --model.
 //
 // After WS12 (persistent expanded K/V in 2048-key blocks) merges, also run with
@@ -29,9 +24,6 @@
 //                 [--layers N] [--timeout-seconds S] [--hold-seconds S]
 
 #define LING_TOOL_NO_MAIN
-#include <chrono>
-#include <future>
-
 #include "tests/models/ling_3_flash/session_test.cpp"
 
 namespace gufo::tests::ling::snapshot_tool {
@@ -437,273 +429,31 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
     check("empty_session_has_no_snapshot", none, std::move(o));
   }
 
-  // 8. Background row copy. The gate pauses the copy before each staging
-  //    chunk so the session can be driven while it is provably in flight.
+  // 8. A save is complete when it returns and repeatable: a second session
+  //    fed the same tokens, saved twice (the second time after the first
+  //    snapshot was restored into it), yields the bytes of `snap` both times.
   {
-    struct Gate {
-      l3::Model& m;
-      explicit Gate(l3::Model& model) : m(model) {
-        m.HoldSnapshotRowCopiesForTest(true);
+    auto sd = fresh();
+    std::unique_ptr<l3::SessionSnapshot> first, second;
+    bool same_first = false, same_second = false;
+    if (sd && feed(*sd, 0, N)) {
+      first = sd->SaveSnapshot(&error);
+      same_first = first && first->bytes().size() == snap->bytes().size() &&
+                   std::memcmp(first->bytes().data(), snap->bytes().data(),
+                               snap->bytes().size()) == 0;
+      if (same_first && sd->RestoreSnapshot(*first, &error)) {
+        second = sd->SaveSnapshot(&error);
+        same_second = second &&
+                      second->bytes().size() == snap->bytes().size() &&
+                      std::memcmp(second->bytes().data(), snap->bytes().data(),
+                                  snap->bytes().size()) == 0;
       }
-      void Open() { m.HoldSnapshotRowCopiesForTest(false); }
-      ~Gate() { Open(); }
-    };
-    using namespace std::chrono_literals;
-    const auto blocked = [](auto& future) {
-      return future.wait_for(300ms) != std::future_status::ready;
-    };
-    const auto same_bytes = [&](const l3::SessionSnapshot& a,
-                                const l3::SessionSnapshot& b) {
-      const auto x = a.bytes();
-      const auto y = b.bytes();
-      return x.size() == y.size() && !x.empty() &&
-             std::memcmp(x.data(), y.data(), x.size()) == 0;
-    };
-
-    // 8a. Decode beside the in-flight copy: it does not wait, the decoded
-    //     state equals the uninterrupted run, and the payload equals the
-    //     copy taken with nothing in flight (`snap`).
-    {
-      auto sd = fresh();
-      Gate gate(*model);
-      std::unique_ptr<l3::SessionSnapshot> held;
-      bool in_flight = false, size_known = false, decode_ok = false;
-      bool still_in_flight = false;
-      if (sd && feed(*sd, 0, N)) {
-        held = sd->SaveSnapshot(&error);
-        in_flight = held && !held->Ready();
-        size_known = held && held->SizeBytes() == sd->SnapshotBytes() &&
-                     held->SizeBytes() == snap->SizeBytes();
-        decode_ok = held && feed_each(*sd, N, total);
-        still_in_flight = held && !held->Ready();
-      }
-      Capture got;
-      const bool state_ok = decode_ok && Take(*sd, layers, &got, &error) &&
-                            exact(got, ref_gen).first;
-      gate.Open();
-      std::string wait_error;
-      const bool done = held && held->Wait(&wait_error) && !held->Failed();
-      auto o = json::Value::object();
-      o["in_flight_after_save"] = in_flight;
-      o["size_known_while_pending"] = size_known;
-      o["decode_while_pending"] = decode_ok;
-      o["still_pending_after_decode"] = still_in_flight;
-      o["decoded_state_equals_uninterrupted"] = state_ok;
-      o["payload_equals_earlier_copy"] = done && same_bytes(*held, *snap);
-      // The reference: Executor::SaveSnapshot (both phases back to back) on
-      // an identically built session, compared byte for byte.
-      bool equals_sync = false;
-      if (done) {
-        auto sref = fresh();
-        auto sync = sref && feed(*sref, 0, N)
-                        ? sref->SaveSnapshotSynchronouslyForTest(&error)
-                        : nullptr;
-        equals_sync = sync && sync->Wait() && same_bytes(*held, *sync);
-      }
-      o["payload_equals_executor_save_snapshot"] = equals_sync;
-      check("async_copy_decode_beside_copy_bytes_exact",
-            in_flight && size_known && decode_ok && still_in_flight &&
-                state_ok && done && same_bytes(*held, *snap) && equals_sync,
-            std::move(o));
     }
-
-    // 8b. Rewriting the rows waits: invalidate (host only, never waits), then
-    //     refill the session from scratch with different tokens. The refill
-    //     blocks until the copy ends, and the payload is still the original.
-    {
-      auto sd = fresh();
-      Gate gate(*model);
-      std::unique_ptr<l3::SessionSnapshot> held;
-      bool invalidate_returned = false, refill_blocked = false;
-      bool refilled = false;
-      if (sd && feed(*sd, 0, N)) {
-        held = sd->SaveSnapshot(&error);
-      }
-      if (held) {
-        sd->Invalidate();
-        invalidate_returned = !held->Ready() && sd->Position() == 0;
-        auto refill = std::async(std::launch::async, [&] {
-          std::string e;
-          return sd->Feed(std::span(other).subspan(0, N), {}, &e);
-        });
-        refill_blocked = blocked(refill) && !held->Ready();
-        gate.Open();
-        refilled = refill.get();
-      }
-      std::string wait_error;
-      const bool done = held && held->Wait(&wait_error);
-      auto o = json::Value::object();
-      o["invalidate_returned_without_waiting"] = invalidate_returned;
-      o["refill_waited_for_copy"] = refill_blocked;
-      o["refill_ok"] = refilled;
-      o["payload_unchanged_by_refill"] = done && same_bytes(*held, *snap);
-      check("async_copy_rewrite_waits_invalidate_does_not",
-            invalidate_returned && refill_blocked && refilled && done &&
-                same_bytes(*held, *snap),
-            std::move(o));
-    }
-
-    // 8c. Restoring the session over its own in-flight snapshot, and a
-    //     restore of the pending snapshot elsewhere, wait for the copy.
-    {
-      auto sd = fresh();
-      auto st = fresh();
-      Gate gate(*model);
-      std::unique_ptr<l3::SessionSnapshot> held;
-      bool blocked_restore = false, restored = false, same_session = false;
-      if (sd && st && feed(*sd, 0, N)) {
-        held = sd->SaveSnapshot(&error);
-      }
-      if (held) {
-        auto restore = std::async(std::launch::async, [&] {
-          std::string e;
-          return st->RestoreSnapshot(*held, &e);
-        });
-        blocked_restore = blocked(restore) && st->Position() == 0;
-        gate.Open();
-        restored = restore.get();
-        same_session = sd->RestoreSnapshot(*held, &error);
-      }
-      Capture got_other, got_same;
-      const bool ok =
-          restored && same_session && Take(*st, layers, &got_other, &error) &&
-          Take(*sd, layers, &got_same, &error) &&
-          exact(got_other, at_n).first && exact(got_same, at_n).first;
-      auto o = json::Value::object();
-      o["restore_waited_for_copy"] = blocked_restore;
-      check("async_copy_restore_waits_and_is_exact", blocked_restore && ok,
-            std::move(o));
-    }
-
-    // 8d. Destroying the snapshot aborts its copy; the session is usable and
-    //     a rewrite no longer waits. Destroying the session waits for the
-    //     copy of a snapshot that outlives it.
-    {
-      auto sd = fresh();
-      Gate gate(*model);
-      bool aborted_fast = false, rewrite_ok = false, destroy_waited = false;
-      bool outlived_exact = false;
-      if (sd && feed(*sd, 0, N)) {
-        auto gone = sd->SaveSnapshot(&error);
-        const auto t0 = std::chrono::steady_clock::now();
-        gone.reset();  // abort + join, though the gate is still closed
-        aborted_fast = std::chrono::steady_clock::now() - t0 < 5s;
-        sd->Invalidate();
-        rewrite_ok = feed(*sd, 0, N);  // no hold left: does not wait
-        auto outlive = sd->SaveSnapshot(&error);
-        if (outlive) {
-          auto destroy = std::async(std::launch::async, [&] { sd.reset(); });
-          destroy_waited = blocked(destroy) && !outlive->Ready();
-          gate.Open();
-          destroy.get();
-          outlived_exact = outlive->Wait() && same_bytes(*outlive, *snap);
-        }
-      }
-      auto o = json::Value::object();
-      o["abort_on_destroy"] = aborted_fast;
-      o["rewrite_after_abort"] = rewrite_ok;
-      o["session_destroy_waited_for_copy"] = destroy_waited;
-      o["snapshot_outlives_session_exact"] = outlived_exact;
-      check("async_copy_destroy_snapshot_aborts_destroy_session_waits",
-            aborted_fast && rewrite_ok && destroy_waited && outlived_exact,
-            std::move(o));
-    }
-
-    // 8e. A failed copy is unusable: no bytes, restore refused with the
-    //     target untouched, and the failing copy does not disturb the next.
-    {
-      auto sd = fresh();
-      auto st = fresh();
-      bool failed = false, no_bytes = false, refused = false;
-      bool target_untouched = false, next_ok = false;
-      if (sd && st && feed(*sd, 0, N) && feed(*st, 0, 12)) {
-        model->FailSnapshotRowCopiesForTest(1);
-        auto bad = sd->SaveSnapshot(&error);
-        std::string why;
-        failed = bad && !bad->Wait(&why) && bad->Failed() && bad->Ready() &&
-                 !why.empty();
-        no_bytes = bad && bad->bytes().empty() &&
-                   bad->SizeBytes() == snap->SizeBytes();
-        std::string refusal;
-        refused =
-            bad && !st->RestoreSnapshot(*bad, &refusal) && !refusal.empty();
-        target_untouched = st->Position() == 12;
-        auto good = sd->SaveSnapshot(&error);
-        next_ok = good && good->Wait() && same_bytes(*good, *snap);
-      }
-      auto o = json::Value::object();
-      o["failed_copy_reports_failure"] = failed;
-      o["failed_copy_has_no_bytes"] = no_bytes;
-      o["restore_refused"] = refused;
-      o["target_untouched"] = target_untouched;
-      o["next_copy_exact"] = next_ok;
-      check("async_copy_failure_is_unusable_and_contained",
-            failed && no_bytes && refused && target_untouched && next_ok,
-            std::move(o));
-    }
-
-    // 8f. Batched decode beside in-flight copies: every lane runs in the
-    //     batch (none is deferred) and ends bit-identical to the same steps
-    //     taken alone.
-    {
-      const std::uint32_t lanes_n =
-          std::min<std::uint32_t>(model->BatchRowLimit(), 3);
-      std::vector<std::unique_ptr<l3::Session>> alone, batched;
-      std::vector<std::unique_ptr<l3::SessionSnapshot>> held;
-      bool setup = lanes_n >= 2;
-      for (std::uint32_t i = 0; setup && i < lanes_n; ++i) {
-        alone.push_back(fresh());
-        batched.push_back(fresh());
-        const auto len = N - 3 * i;
-        setup = alone.back() && batched.back() && feed(*alone.back(), 0, len) &&
-                feed(*batched.back(), 0, len);
-      }
-      Gate gate(*model);
-      bool none_deferred = setup, all_ok = setup, equal = setup;
-      bool pending = setup;
-      for (std::uint32_t i = 0; setup && i < lanes_n; ++i) {
-        held.push_back(batched[i]->SaveSnapshot(&error));
-        pending = pending && held.back() && !held.back()->Ready();
-      }
-      for (int step = 0; setup && step < 3; ++step) {
-        std::vector<l3::Session::BatchLane> lanes(lanes_n);
-        for (std::uint32_t i = 0; i < lanes_n; ++i) {
-          lanes[i].session = batched[i].get();
-          lanes[i].token = ids[N + step];
-          all_ok = all_ok && alone[i]->Evaluate(ids[N + step], &error);
-        }
-        l3::Session::EvaluateBatch(lanes);
-        for (const auto& lane : lanes) {
-          none_deferred = none_deferred && !lane.deferred;
-          all_ok = all_ok && lane.ok;
-        }
-      }
-      for (std::uint32_t i = 0; setup && i < lanes_n; ++i) {
-        Capture a, b;
-        equal = equal && Take(*alone[i], layers, &a, &error) &&
-                Take(*batched[i], layers, &b, &error) && exact(b, a).first;
-      }
-      pending = pending && !held.empty() && !held.back()->Ready();
-      gate.Open();
-      bool exact_payloads = setup;
-      for (std::uint32_t i = 0; setup && i < lanes_n; ++i) {
-        auto ref = fresh();
-        auto again =
-            feed(*ref, 0, N - 3 * i) ? ref->SaveSnapshot(&error) : nullptr;
-        exact_payloads = exact_payloads && again && again->Wait() &&
-                         held[i]->Wait() && same_bytes(*held[i], *again);
-      }
-      auto o = json::Value::object();
-      o["lanes"] = U(lanes_n);
-      o["copies_pending_during_batch"] = pending;
-      o["no_lane_deferred"] = none_deferred;
-      o["batched_equals_alone"] = equal;
-      o["payloads_exact"] = exact_payloads;
-      check("async_copy_batched_decode_beside_copy",
-            setup && pending && none_deferred && all_ok && equal &&
-                exact_payloads,
-            std::move(o));
-    }
+    auto o = json::Value::object();
+    o["first_equals_reference"] = same_first;
+    o["after_restore_equals_reference"] = same_second;
+    check("save_is_complete_and_repeatable", same_first && same_second,
+          std::move(o));
   }
 
   report.Set("checks", std::move(checks));
