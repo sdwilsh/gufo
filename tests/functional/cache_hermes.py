@@ -10,13 +10,17 @@ results are frozen; a background review fork replays the full history plus a
 review prompt concurrently with the next step; compaction rewrites the middle.
 
 For models whose template keeps prior-turn thinking (Ling-3.0-flash) the
-re-rendered history never equals the live session's tokens, so reuse must come
-from the snapshot taken at the end of each request's prompt (the generation
-prompt boundary). Every step k >= 2 must therefore reuse at least the previous
-step's whole prompt and prefill only the previous assistant turn (as the client
-re-rendered it), the new tool result and the generation prompt.
+re-rendered history normally differs from the live session's tokens, so reuse
+comes from the snapshot taken at the end of each request's prompt (the
+generation prompt boundary). Every step k >= 2 must therefore reuse at least
+the previous step's whole prompt and prefill only the previous assistant turn
+(as the client re-rendered it), the new tool result and the generation prompt.
+With empty reasoning the template re-renders the turn token-identically, so the
+server reuses the live frontier including the decoded tokens (cached_tokens
+between the previous prompt and prompt + completion). From that step on the
+strip controls are report-only, as for echo; token counts stay strict.
 
-Checks (all strict; exit 1 on failure, JSON report on --output):
+Checks (strict unless noted; exit 1 on failure, JSON report on --output):
   * step k reuses >= prompt_tokens(k-1) - ALLOW tokens and prefills at most
     prompt_tokens(k) - prompt_tokens(k-1) + ALLOW;
   * the answer (reasoning, text, tool calls) equals an uncached control;
@@ -221,6 +225,33 @@ def first_difference(warm, cold):
     return out
 
 
+def update_decode_lineage(lineage, name, cached_tokens, previous_prompt_tokens,
+                          previous_completion_tokens=0):
+    """Sticky: the step where the warm state first included decoded tokens.
+
+    A step that reuses more than the previous prompt, but no more than that
+    prompt plus its completion, restored the previous request's live frontier,
+    which contains tokens it decoded (small-batch numeric family, not
+    bit-identical to prefill). Reuse beyond that came from another request's
+    prefill (e.g. the review fork sharing a sibling's prompt) and does not set
+    it. Every later state descends from the flagged one.
+    """
+    if lineage is None and previous_prompt_tokens is not None \
+            and previous_prompt_tokens < cached_tokens \
+            <= previous_prompt_tokens + previous_completion_tokens:
+        return name
+    return lineage
+
+
+def control_gate(echo, lineage):
+    """(comparison label, gated) for a control: gated mismatches are failures."""
+    if echo:
+        return "answer-level-report", False
+    if lineage is not None:
+        return "exact-report", False
+    return "exact", True
+
+
 def run_variant(client, variant, args, failures, report):
     echo = variant == "echo"
     label = f"hermes_{variant}_{int(time.time())}"
@@ -229,6 +260,7 @@ def run_variant(client, variant, args, failures, report):
                 "read two of them and summarise what they do."}]
     steps = []
     control_requests = []
+    lineage = None  # step where decoded tokens entered the cached state
 
     def record(name, result, previous):
         row = {"name": name, "loop": variant, **{k: result[k] for k in (
@@ -259,6 +291,11 @@ def run_variant(client, variant, args, failures, report):
         return message, calls
 
     def check_step(name, result, previous):
+        nonlocal lineage
+        lineage = update_decode_lineage(
+            lineage, name, result["cached_tokens"],
+            None if previous is None else previous["prompt_tokens"],
+            0 if previous is None else previous["completion_tokens"])
         row = record(name, result, previous)
         if previous is not None:
             if result["cached_tokens"] < row["reuse_floor"]:
@@ -282,20 +319,25 @@ def run_variant(client, variant, args, failures, report):
             "request_seq", "http_request_id")}})
         row = steps[-1]
         row["control_prefill_tokens"] = cold["prefill_tokens"]
-        row["comparison"] = "answer-level-report" if echo else "exact"
+        row["comparison"], gated = control_gate(echo, lineage)
+        if lineage is not None:
+            row["decode_lineage_from"] = lineage
         truncated = "length" in (cold["finish"], warm["finish"])
         if truncated:
             row["comparison"] = "truncated"  # reported, not gated
         row["answer_equals_control"] = same_answer(cold, warm, exact=not echo) and \
             cold["prompt_tokens"] == warm["prompt_tokens"]
+        # A token-count mismatch is a template/tokenizer bug, never a numeric-family effect.
+        gated_tokens = not echo and cold["prompt_tokens"] != warm["prompt_tokens"]
         if not row["answer_equals_control"] and not truncated:
             row["difference"] = first_difference(warm, cold)
             settings = {k: v for k, v in client.body(messages, max_tokens=COMPARED_MAX_TOKENS).items()
                         if k not in ("messages", "tools")}
             row["request_settings"] = settings
             # Restored decode-family state differs numerically from cold prefill; near-tie
-            # flips are allowed by the reproducibility contract, so echo only reports.
-            if not echo:
+            # flips are allowed by the reproducibility contract, so echo and any strip
+            # lineage that includes decoded tokens only report.
+            if gated or gated_tokens:
                 failures.append(check_line(
                     f"{variant}/{name}_control", "answer equals the uncached control",
                     json.dumps({'settings': settings, **row['difference']})))
@@ -353,15 +395,20 @@ def run_variant(client, variant, args, failures, report):
         control_requests.append({"name": "review_fork:control", "loop": variant, **{k: cold[k] for k in (
             "prompt_tokens", "cached_tokens", "prefill_tokens", "cache_hit", "cache_miss_reason",
             "request_seq", "http_request_id")}})
-        steps[-1]["comparison"] = "answer-level-report" if echo else "exact"
+        steps[-1]["comparison"], gated = control_gate(echo, lineage)
+        if lineage is not None:
+            steps[-1]["decode_lineage_from"] = lineage
         fork_truncated = "length" in (cold["finish"], outcome["fork"]["finish"])
         if fork_truncated:
             steps[-1]["comparison"] = "truncated"  # reported, not gated
-        steps[-1]["answer_equals_control"] = same_answer(cold, outcome["fork"], exact=not echo)
+        steps[-1]["answer_equals_control"] = same_answer(cold, outcome["fork"], exact=not echo) \
+            and cold["prompt_tokens"] == outcome["fork"]["prompt_tokens"]
+        gated_tokens = not echo and cold["prompt_tokens"] != outcome["fork"]["prompt_tokens"]
         if not steps[-1]["answer_equals_control"] and not fork_truncated:
             steps[-1]["difference"] = first_difference(outcome["fork"], cold)
-            # Echo is report-only (decode-family state differs numerically from cold prefill).
-            if not echo:
+            # Echo and decode-lineage strip are report-only (decode-family state differs
+            # numerically from cold prefill).
+            if gated or gated_tokens:
                 failures.append(check_line(
                     f"{variant}/review_fork_control", "answer equals the uncached control",
                     json.dumps(steps[-1]['difference'])))
@@ -374,6 +421,7 @@ def run_variant(client, variant, args, failures, report):
                         "content": tool_result(ran + 1, args.tool_result_lines)})
     previous = outcome["main"]
 
+    # Compaction: the lineage is positional and no control follows compaction.
     # Compaction: the middle is replaced by a summary; head and last turn stay.
     # Reported (a head checkpoint exists only once a shared prefix was learned);
     # the repeat of the same compacted history must be reused whole.
