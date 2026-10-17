@@ -195,7 +195,9 @@ def run_case(args, command, case, report):
                                         log.read_text())
                     assert len(starts) == 1, starts
                     limit = float(starts[0])
-                    assert 0 < limit < 60000, limit
+                    # The estimate follows the model's prefill speed; Ling's
+                    # 55K-token prefill alone takes over 60 s. Below the cap.
+                    assert 0 < limit < 120000, limit
                     assert "release=cost_bound" in log.read_text()
                 queue = timing["queue_ms"]
                 assert limit * .95 <= queue <= limit + max(3, limit * .05), (queue, limit)
