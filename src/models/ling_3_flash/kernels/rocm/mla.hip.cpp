@@ -674,7 +674,9 @@ __global__ void QPrepKernel(const float* __restrict__ q,
 // each 64 x 32 outputs (4 x 2 WMMA tiles). Keys at or past `end` read as zero
 // rows, so everything the attention reads beyond the cache end is finite
 // zeros. Output index of key k is idx = k - obase (obase a multiple of 16),
-// written only when idx < out_rows:
+// written only when idx < out_rows. Precondition: (start - obase) % 16 == 0 and
+// out_rows % 16 == 0, so each 16-key WMMA fragment is wholly inside or outside
+// out_rows and the store guard is wave-uniform:
 //   K mode: out[(h * out_rows + idx) * 128 + d]            (F16)
 //   V mode: out[((h * out_rows / 16 + idx / 16) * 128 + e) * 16 + slot(idx)]:
 //           V^T in 16-key tiles, each tile's 128 x 16 values contiguous (one
@@ -1278,6 +1280,10 @@ void ExpandRows(const __half* layer_cache, const __half* w16,
   if (start >= end) {
     return;
   }
+  // AMD clang 22 (ROCm 7.2.3, not clang 20) sinks the WMMA under the store
+  // guard, so a 16-key fragment past `rows` runs with a partial EXEC mask.
+  // Starting on a whole tile keeps that guard uniform.
+  start -= start % kExpTile;
   __half* vt = layer_expanded + (std::size_t{kHeadsN} * rows * kNope);
   const dim3 grid((end - start + kExpTile - 1) / kExpTile, kHeadsN, 1);
   ExpandKernel<false><<<grid, 256, 0, stream>>>(

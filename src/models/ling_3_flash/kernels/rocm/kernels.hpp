@@ -347,7 +347,8 @@ std::size_t NonAbsorbedScratchBytes(std::uint32_t max_batch);
 std::size_t ExpandedLayerBytes(std::uint32_t rows);
 /// Expands cache rows [start, min(end, rows)) into the persistent store. The
 /// result is a pure function of the cache row (same bits as the transient
-/// expansion).
+/// expansion). It also rewrites [start - start % 128, start) with identical
+/// bits.
 void ExpandRows(const __half* layer_cache, const __half* w16,
                 __half* layer_expanded, std::uint32_t rows, std::uint32_t start,
                 std::uint32_t end, hipStream_t stream);
