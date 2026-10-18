@@ -491,9 +491,8 @@ public:
   [[nodiscard]] std::uint64_t capture_invalidations() const noexcept {
     return capture_invalidations_;
   }
-  /// Test hook: the next `count` decode-graph captures are invalidated the
-  /// way an unserialized snapshot wait used to break them (another thread
-  /// waits on the session's forward event mid-capture).
+  /// Test hook: the next `count` decode-graph captures are invalidated by a
+  /// stream synchronize from the capturing thread, which a capture forbids.
   void BreakCapturesForTest(std::uint32_t count) noexcept {
     capture_breaks_for_test_ = count;
   }
