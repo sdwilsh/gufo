@@ -169,10 +169,10 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
     }
   }
 
-  // A capture that does break (the test hook replays the old unserialized
-  // worker wait) must leave the executor usable: the step runs eagerly with
-  // the same bits and the next step captures again. ROCm keeps such a stream
-  // in capture mode, which used to fail that step and every later one.
+  // A capture that does break (the test hook synchronizes the stream from the
+  // capturing thread) must leave the executor usable. The step runs eagerly
+  // with the same bits, and the next step captures again. ROCm keeps such a
+  // stream in capture mode, which would fail that step and every later one.
   {
     auto s = fresh();
     const std::uint64_t replays = model->GraphReplays();

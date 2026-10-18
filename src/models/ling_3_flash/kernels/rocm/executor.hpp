@@ -80,16 +80,15 @@ public:
       rows = std::min(rows, position);
     }
   }
-  /// Hook called after the whole session state (recurrent state, conv
-  /// windows, cache rows [0, position)) was replaced outside a forward pass,
-  /// by a snapshot restore. It runs with the session idle, after the copies
-  /// completed, and makes everything that is derived from, or kept beside,
-  /// the session state consistent with the new contents (derived state is
-  /// never stored in snapshots):
-  ///   * the position becomes `position` (the next step uploads it to the
-  ///     device-side token/position inputs that the eager launches and the
-  ///     captured decode graphs read; the graphs hold no position of their
-  ///     own, so a replay after a restore starts at the restored position; the
+  /// Hook called by a snapshot restore after it replaced the whole session
+  /// state (recurrent state, conv windows, cache rows [0, position)) outside a
+  /// forward pass. It runs with the session idle, after the copies completed.
+  /// It makes everything derived from the session state consistent with the
+  /// new contents (snapshots never store derived state):
+  ///   * The position becomes `position`. The next step uploads it to the
+  ///     device-side token and position inputs that the eager launches and the
+  ///     captured decode graphs read. The graphs hold no position of their
+  ///     own, so a replay after a restore starts at the restored position. The
   ///     shared-expert branch stream and its fork/join events exist only
   ///     inside a graph capture, whose branches join before the capture ends,
   ///     so no stream or event stays pending across a restore.
@@ -491,9 +490,8 @@ public:
   [[nodiscard]] std::uint64_t capture_invalidations() const noexcept {
     return capture_invalidations_;
   }
-  /// Test hook: the next `count` decode-graph captures are invalidated the
-  /// way an unserialized snapshot wait used to break them (another thread
-  /// waits on the session's forward event mid-capture).
+  /// Test hook: the next `count` decode-graph captures are invalidated by a
+  /// stream synchronize from the capturing thread, which a capture forbids.
   void BreakCapturesForTest(std::uint32_t count) noexcept {
     capture_breaks_for_test_ = count;
   }

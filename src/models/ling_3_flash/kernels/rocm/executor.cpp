@@ -6,7 +6,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <thread>
 
 #include "src/models/ling_3_flash/continuation_hooks.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/kernels.hpp"
@@ -1154,13 +1153,12 @@ bool Executor::ForwardGraph(Session& session, const ForwardRequest& r,
       return false;
     }
     if (capture_breaks_for_test_ > 0) {
-      // Test hook: the wait a snapshot worker used to issue here, from
-      // another thread and without the mutex, which invalidates the capture.
+      // Test hook: a stream synchronize from the capturing thread is not
+      // permitted during a capture (hipErrorStreamCaptureUnsupported) and
+      // invalidates it in ROCm 7.1 and 7.2 (CLR StreamCaptureOngoing).
       --capture_breaks_for_test_;
-      std::thread([&session] {
-        (void)hipEventSynchronize(session.forward_done_);
-        (void)hipGetLastError();
-      }).join();
+      (void)hipStreamSynchronize(stream_);
+      (void)hipGetLastError();
     }
     capturing_ = true;
     const Lane lane{&session, first_pos, n, 0};
