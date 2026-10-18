@@ -3881,6 +3881,12 @@ LingTextRunner::CreateComponentCacheResources(cache::ResourceLedger& ledger,
     // registration onto that request's capture or decode path.
     backing->pool->GrowAhead(2);
     backing->pool->WaitForGrowth();
+    Logger::Info(
+        "cache",
+        "schema=component-cache-v1 event=backing_prepared committed_bytes=" +
+            std::to_string(backing->pool->CommittedBytes()) +
+            " long_term_pinned_bytes=" +
+            std::to_string(backing->pool->LongTermPinnedBytes()));
   };
   result->prepare_prefill = [backing] { backing->pool->GrowAhead(2); };
   result->can_capture = [backing](auto payloads) {
@@ -3909,6 +3915,8 @@ LingTextRunner::CreateComponentCacheResources(cache::ResourceLedger& ledger,
           "schema=component-cache-v1 event=backing_grown committed_bytes=" +
               std::to_string(backing->pool->CommittedBytes()) + " segments=" +
               std::to_string(backing->pool->PageCommitAllocations()) +
+              " long_term_pinned_bytes=" +
+              std::to_string(backing->pool->LongTermPinnedBytes()) +
               " acquire_ms=" +
               std::to_string(std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - started)
