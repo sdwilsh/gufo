@@ -553,6 +553,40 @@ void TestNonAbsorbedPrefill() {
   }
 }
 
+// ExpandRows from an unaligned start up to the store end, where (rows - start)
+// % 16 != 0, must leave the same store bytes as one expansion from row 0. A
+// 16-key WMMA fragment that straddles `rows` ran under a partial EXEC mask in
+// the AMD clang 22 build and corrupted valid rows of the tile.
+void TestExpandRowsUnalignedStart() {
+  NaWeights w(83);
+  for (const std::uint32_t rows : {2048U, 4096U}) {
+    const std::vector<__half> cache = MakeCache(rows, 211 + rows);
+    Dev<__half> d_cache(cache);
+    const std::size_t elems = mla::ExpandedLayerBytes(rows) / sizeof(__half);
+    Dev<__half> whole(elems);
+    mla::ExpandRows(d_cache.get(), w.d_w16.get(), whole.get(), rows, 0, rows,
+                    nullptr);
+    CheckHip(hipDeviceSynchronize(), "sync");
+    const std::vector<__half> want = whole.Download();
+    for (const std::uint32_t start : {1U, 15U, 1000U, 1001U, rows - 17U}) {
+      Dev<__half> split(elems);
+      mla::ExpandRows(d_cache.get(), w.d_w16.get(), split.get(), rows, 0, start,
+                      nullptr);
+      mla::ExpandRows(d_cache.get(), w.d_w16.get(), split.get(), rows, start,
+                      rows, nullptr);
+      CheckHip(hipDeviceSynchronize(), "sync");
+      const std::vector<__half> got = split.Download();
+      const bool same = std::memcmp(got.data(), want.data(),
+                                    want.size() * sizeof(__half)) == 0;
+      if (!same) {
+        ++g_failures;
+      }
+      std::printf("expand_rows_unaligned rows=%u start=%u: %s\n", rows, start,
+                  same ? "ok" : "FAIL");
+    }
+  }
+}
+
 // Bitwise split invariance of the non-absorbed prefill: one chunk of the whole
 // run (transient expansion only) against two and three chunks, at every split
 // point (all points for short runs, a spread incl. tile / key-block edges for
@@ -936,6 +970,7 @@ int main() {
     TestVbUpProjGate();
     TestDecode();
     TestNonAbsorbedPrefill();
+    TestExpandRowsUnalignedStart();
     TestNonAbsorbedInvariance();
     TestNonAbsorbedParentDigest();
     TestLayerCoreVsNonAbsorbed();
