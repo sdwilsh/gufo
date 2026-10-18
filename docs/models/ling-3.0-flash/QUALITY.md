@@ -120,13 +120,13 @@ The sessions, prompts and per-cell counts stay private.
 
 ## Benchmark method
 
-Measured October 12, 2026 with a build of the quant-support commit plus the
-evidence kit (nix-release build mode, clean tree), Fedora 44 kernel 7.2.9, ROCm
-7.2.3, GCC 15.3.0, Gufo binary SHA-256
-`550b089ae314dcbbc2ca0eaabdd752642442ede4e3d4ef30f015a3e5a0f54e7f`. Later
-branch commits change only Bailing tool-call parsing, tests and comments (no
-kernels, executor or MTP). llama.cpp is the
-`server-vulkan-v0.5.0` image (build 11146, commit 7fe450e19, Mesa 26.0.8 RADV).
+Gufo measured October 18, 2026 on the v0.17 build (fork tag v0.17.0.0) with
+the evidence kit (nix-release build mode), Fedora 44 kernel 7.2.9, ROCm 7.2.3,
+GCC 15.3.0, Gufo binary SHA-256
+`349b9d958b09cb979f293a196fe038a93bf81693ea7246448f684d95de51abfe`; each Gufo
+artifact in [artifacts](artifacts/) records that hash in its notes. llama.cpp
+was measured October 12, 2026 and is the `server-vulkan-v0.5.0` image (build
+11146, commit 7fe450e19, Mesa 26.0.8 RADV).
 
 Gufo serves with `--sessions 1 llm --think off --max-pending-per-client 8
 --cache-ram-bytes 2147483648` and `--speculative off` or `mtp`. llama.cpp serves
