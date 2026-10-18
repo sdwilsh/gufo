@@ -607,6 +607,7 @@ void PrintServeHelp(std::string_view program_name,
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
     std::size_t cache_ram_bytes = 0;
+    std::uint64_t expanded_kv_bytes = std::uint64_t{12} << 30;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
@@ -655,7 +656,8 @@ void PrintServeHelp(std::string_view program_name,
 
     // Speculative & Hardware
     parser.AddOption("", "--speculative", "MODE",
-                     "HTTP draft backend: dspark, dflash2, mtp, or off",
+                     "HTTP draft backend: dspark, dflash2, mtp, or off "
+                     "(Ling defaults to mtp when its GGUF has the MTP block)",
                      "Speculative", &speculative_backend);
     parser.AddOption("", "--dflash-model", "PATH",
                      "Path to Qwen DFlash2 GGUF file", "Speculative",
@@ -669,7 +671,8 @@ void PrintServeHelp(std::string_view program_name,
                      "Speculative", &dspark_model_path);
     parser.AddOption("", "--mtp-model", "PATH",
                      "Path to the Qwen MTP draft GGUF (Qwen3.8-Flash-Next: the "
-                     "mtp-...-shared-*.gguf sidecar)",
+                     "mtp-...-shared-*.gguf sidecar; Ling-3.0-flash carries "
+                     "its MTP block in the main GGUF and takes none)",
                      "Speculative", &mtp_model_path);
     parser.AddOption(
         "-d", "--draft-tokens", "N",
@@ -709,6 +712,14 @@ void PrintServeHelp(std::string_view program_name,
         "", "--max-buffered-output-total", "N",
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
+    parser.AddOption(
+        "", "--expanded-kv-bytes", "N",
+        "Ling-3.0-flash device budget for persistent expanded K/V rows of the "
+        "MLA layers, shared by all sessions (112 KiB per cached token; "
+        "default: "
+        "12 GiB, 0 disables; rows past the budget are expanded per chunk with "
+        "identical results)",
+        "Model", &expanded_kv_bytes);
     parser.AddOption(
         "", "--cache-ram-bytes", "N",
         "Retained RAM-cache byte budget (default: 0 = auto: half of free "
@@ -1154,6 +1165,7 @@ int RunServe(std::span<const char* const> args) {
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
     std::size_t cache_ram_bytes = 0;
+    std::uint64_t expanded_kv_bytes = std::uint64_t{12} << 30;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
@@ -1195,7 +1207,9 @@ int RunServe(std::span<const char* const> args) {
                          "Replay prior reasoning: on, off, or auto",
                          "Reasoning Defaults", &preserve_thinking);
     llm_parser.AddOption("", "--speculative", "MODE",
-                         "HTTP draft backend: dspark, dflash2, mtp, or off",
+                         "HTTP draft backend: dspark, dflash2, mtp, or off "
+                         "(Ling defaults to mtp when its GGUF has the MTP "
+                         "block)",
                          "Speculative", &speculative_backend);
     llm_parser.AddOption("", "--dflash-model", "PATH",
                          "Path to Qwen DFlash2 GGUF file", "Speculative",
@@ -1210,7 +1224,8 @@ int RunServe(std::span<const char* const> args) {
     llm_parser.AddOption(
         "", "--mtp-model", "PATH",
         "Path to the Qwen MTP draft GGUF (Qwen3.8-Flash-Next: the "
-        "mtp-...-shared-*.gguf sidecar)",
+        "mtp-...-shared-*.gguf sidecar; Ling-3.0-flash carries its MTP block "
+        "in the main GGUF and takes none)",
         "Speculative", &mtp_model_path);
     llm_parser.AddOption(
         "-d", "--draft-tokens", "N",
@@ -1252,6 +1267,14 @@ int RunServe(std::span<const char* const> args) {
         "", "--max-buffered-output-total", "N",
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
+    llm_parser.AddOption(
+        "", "--expanded-kv-bytes", "N",
+        "Ling-3.0-flash device budget for persistent expanded K/V rows of the "
+        "MLA layers, shared by all sessions (112 KiB per cached token; "
+        "default: "
+        "12 GiB, 0 disables; rows past the budget are expanded per chunk with "
+        "identical results)",
+        "Model", &expanded_kv_bytes);
     llm_parser.AddOption(
         "", "--cache-ram-bytes", "N",
         "Retained RAM-cache byte budget (default: 0 = auto: half of free "
@@ -1353,6 +1376,7 @@ int RunServe(std::span<const char* const> args) {
     if (speculative_backend.empty() && !dspark_model_path.empty()) {
       speculative_backend = "dspark";
     }
+    speculative_config.model_default = speculative_backend.empty();
     if (speculative_backend.empty() || speculative_backend == "off") {
       speculative_config.backend = server::TextSpeculativeBackend::kDisabled;
     } else if (speculative_backend == "dflash2") {
@@ -1432,7 +1456,8 @@ int RunServe(std::span<const char* const> args) {
             .model_artifact_fingerprint = {},
         },
         vision_model_path,
-        server::TextRunnerRamCacheOptions{.capacity_bytes = cache_ram_bytes});
+        server::TextRunnerRamCacheOptions{.capacity_bytes = cache_ram_bytes},
+        expanded_kv_bytes);
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
@@ -1469,8 +1494,10 @@ int RunServe(std::span<const char* const> args) {
         << " frequency_penalty=" << effective_sampling.frequency_penalty
         << " presence_penalty=" << effective_sampling.presence_penalty;
     server::Logger::Info("sampling", sampling_log.str());
+    const std::string loaded_speculation = backend->speculative_mode();
     const char* speculation =
-        speculative_config.backend == server::TextSpeculativeBackend::kDFlash
+        loaded_speculation == "mtp" ? "mtp"
+        : speculative_config.backend == server::TextSpeculativeBackend::kDFlash
             ? "dflash2"
         : speculative_config.backend == server::TextSpeculativeBackend::kDSpark
             ? "dspark"

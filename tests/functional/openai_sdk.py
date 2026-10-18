@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 import openai
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient, DefaultHttpxClient, OpenAI
 from openai.types import Completion, CompletionChoice
+from check_report import describe, failure_lines
 from metrics import CaseComplete, Recorder
 from tool_reasoning import check_reasoning_separator, check_tool_reasoning, response_result
 from tool_streaming import check_tool_streaming
@@ -304,8 +305,30 @@ def image_content(color):
     }
 
 
+SAMPLING_QUESTION = "Name three animals and describe each in one sentence."
+# Ling-3.0-flash retains no prompt snapshot below 128 tokens: its fixed-size
+# recurrent state costs more RAM than re-prefilling a short prompt saves, and
+# that state cannot be cut back from the decoded frontier. The cached-replay
+# checks need a retained prompt, so the Ling preset asks the same question
+# behind this context.
+SAMPLING_CONTEXT = (
+    "You are helping a teacher prepare a short handout for a primary-school nature "
+    "club. The club meets every Thursday afternoon in the school garden, where the "
+    "children watch birds, look for insects under stones and keep a notebook of "
+    "everything they find. The teacher wants the handout to be friendly, accurate "
+    "and easy to read aloud, with plain words and no jargon. Each entry should say "
+    "where the animal lives and one thing that makes it special, so the children can "
+    "remember it on their next walk. Keep the tone warm and curious, and avoid "
+    "anything frightening. The handout will be printed on a single page together "
+    "with a few drawings made by the children themselves.\n\n")
+
+
+def sampling_prompt(preset):
+    return (SAMPLING_CONTEXT if preset == "ling3" else "") + SAMPLING_QUESTION
+
+
 def check_sampling_defaults(client, model, checks, preset, overrides, vision=False,
-                            server_thinking=None):
+                            server_thinking=None, checkpoint_tail=0):
     """Omission and explicit presets must replay within each execution mode."""
     def signature(value):
         return value["text"].strip(), value["reasoning"].strip(), value["finish"]
@@ -338,13 +361,14 @@ def check_sampling_defaults(client, model, checks, preset, overrides, vision=Fal
     for thinking in (False, True):
         qwen_off = preset == "qwen38" and not thinking
         expected = {
-            "temperature": .7 if qwen_off else 1.,
+            # Ling-3.0-flash vendor defaults: temperature 0.6, top_p 0.95, top_k 20.
+            "temperature": .7 if qwen_off else (.6 if preset == "ling3" else 1.),
             "top_p": .8 if qwen_off else .95,
             "presence_penalty": 1.5 if qwen_off else 0.,
             "frequency_penalty": 0.,
             "seed": 73,
         }
-        native = {"top_k": 20 if preset == "qwen38" else 0,
+        native = {"top_k": 20 if preset in ("qwen38", "ling3") else 0,
                   "min_p": 0., "min_keep": 0, "repeat_penalty": 1.,
                   "repeat_last_n": 64}
         assert overrides.keys() <= (expected.keys() | native.keys()), overrides
@@ -357,8 +381,7 @@ def check_sampling_defaults(client, model, checks, preset, overrides, vision=Fal
             expected["seed"] = 73
         request = {
             "model": model, "seed": 73, "max_completion_tokens": 8,
-            "messages": [{"role": "user", "content":
-                          "Name three animals and describe each in one sentence."}],
+            "messages": [{"role": "user", "content": sampling_prompt(preset)}],
             "extra_body": {"cache_prompt": False, "chat_template_kwargs": {
                 "enable_thinking": thinking}},
         }
@@ -404,7 +427,8 @@ def check_sampling_defaults(client, model, checks, preset, overrides, vision=Fal
             **request, "extra_body": {**request["extra_body"], "cache_prompt": True}}, True)
         assert signature(cached) == signature(inherited), (cached, inherited)
         assert cached["usage"]["cached_tokens"] > 0, cached
-        assert cached["usage"]["gufo"]["prefill_tokens"] == 0, cached
+        assert cached["usage"]["gufo"]["prefill_tokens"] <= checkpoint_tail, (
+            checkpoint_tail, cached)
         record(f"sampling_cached_preset_thinking{thinking}", cached)
 
         # Distinct request-owned samplers must replay when admitted together.
@@ -597,7 +621,25 @@ def check_sampling_ranges(client, model, checks):
         checks[f"range_{endpoint}_sampled_zero"] = response.to_dict()
 
 
-def check_batches(client, model, checks, width, vision=False, speculative="off"):
+# Shortest prompt a runner retains as a reusable snapshot (Ling: 128 tokens,
+# TextRunnerCapabilities::min_snapshot_tokens); shorter prompts are never
+# cache hits, so cases asserting a hit must exceed it.
+MIN_RETAINED_PROMPT_TOKENS = {"qwen38": 0, "deepseek4": 0, "ling3": 128}
+# Neutral system context (about 190 tokens) that lifts a short case above it.
+RETAINED_PROMPT_CONTEXT = "You are a precise assistant.\n" + "".join(
+    f"Reference note {index}: the build uses CMake presets and every model "
+    f"package owns its tests and numerical contracts.\n" for index in range(8))
+
+
+def retained_messages(messages, min_retained_prompt_tokens):
+    """Messages behind the neutral system context when a runner needs it."""
+    if not min_retained_prompt_tokens:
+        return messages
+    return [{"role": "system", "content": RETAINED_PROMPT_CONTEXT}, *messages]
+
+
+def check_batches(client, model, checks, width, vision=False, speculative="off",
+                  min_retained_prompt_tokens=0):
     """Different endpoints/samplers/grammars share a physical batch without state leakage."""
     cases = []
     values = []
@@ -629,6 +671,9 @@ def check_batches(client, model, checks, width, vision=False, speculative="off")
             content = body["messages"][0]["content"]
             body["messages"][0]["content"] = [
                 image_content("red"), {"type": "text", "text": content}]
+        if min_retained_prompt_tokens:
+            # The replay below must restore the prompt.
+            body["messages"].insert(0, {"role": "system", "content": RETAINED_PROMPT_CONTEXT})
         # Cache all prompts before measuring concurrency, so short prefills cannot
         # turn the intended physical batch into sequential requests.
         chat_result(client, {**body, "max_completion_tokens": 1})
@@ -924,7 +969,23 @@ def check_conversations(client, model, checks, vision=False):
         assert warm["usage"]["cached_tokens"] > 0, warm
 
 
-def check_long_context(client, model, checks, context, vision=False):
+# Prompt tokens an exact replay may prefill again. Qwen and DeepSeek V4 restore
+# the whole prompt (0). Each Ling-3.0-flash checkpoint carries about 76 MiB of
+# fixed recurrent state, so a full run soon fills a few-GiB --cache-ram-bytes
+# budget; the cache then refuses complete-prompt retry copies (docs/KV-CACHE.md)
+# and a replay restores the prompt's stable boundary instead. Ling keeps every
+# checkpoint at least kSmallBatchMaxTokens + 1 = 9 tokens before the prompt end
+# (TextRunnerCapabilities::min_checkpoint_tail_tokens), so the replay prefills
+# those 9 in the uncached run's numeric family. The server does not report it,
+# so it is keyed by sampling preset.
+CHECKPOINT_TAIL_TOKENS = {"qwen38": 0, "deepseek4": 0, "ling3": 9}
+# Completion budget of a brief low-effort reasoning turn that must still end in
+# its one-word answer (cache-growth). Ling-3.0-flash's reasoning restates the
+# history first and needs the budget the Messages variant already uses.
+REASONING_ANSWER_TOKENS = {"qwen38": 128, "deepseek4": 128, "ling3": 1024}
+
+
+def check_long_context(client, model, checks, context, vision=False, checkpoint_tail=0):
     """A bounded, multi-turn agent history; actual depth is retained in usage."""
     if context < 8192:
         raise ValueError("long-context requires a server context of at least 8192")
@@ -964,7 +1025,10 @@ def check_long_context(client, model, checks, context, vision=False):
     assert context // 4 <= depth < context - 512, depth
     replay = chat("long_schema_cached", request, True)
     assert signature(replay) == signature(first), replay
-    assert replay["usage"]["gufo"]["prefill_tokens"] == 0, replay
+    # An exact replay prefills nothing, except the model's mandatory checkpoint tail.
+    assert replay["usage"]["gufo"]["prefill_tokens"] <= checkpoint_tail, (checkpoint_tail, replay)
+    if checkpoint_tail:
+        assert replay["usage"]["cached_tokens"] >= depth - checkpoint_tail, (checkpoint_tail, replay)
 
     # Reuse the same multimodal history through the Responses SDK, with sampled
     # output and a new turn. JSON validity alone would not catch lost memory.
@@ -1035,7 +1099,8 @@ def check_long_context(client, model, checks, context, vision=False):
     assert stopped["text"] == first["text"].split("TERN")[0], stopped
 
 
-def check_structured_outputs(client, model, checks, vision=False):
+def check_structured_outputs(client, model, checks, vision=False,
+                             min_retained_prompt_tokens=0):
     from typing import Literal
     from pydantic import BaseModel, Field
 
@@ -1148,8 +1213,10 @@ def check_structured_outputs(client, model, checks, vision=False):
         record(f"schema_literal_{streaming}", result)
 
     # A new grammar starts at its root even when prompt/model state is reused.
+    # The third request must restore the first one's prompt.
     for index, text in enumerate(("alpha", "beta", "alpha")):
-        body = {**common, "response_format": constant(text)}
+        body = {**common, "response_format": constant(text), "messages": retained_messages(
+            common["messages"], min_retained_prompt_tokens)}
         result = chat_result(client, body, True)
         assert json.loads(result["text"]) == {"text": text}, result
         record(f"schema_cache_{index}_{text}", result)
@@ -1392,7 +1459,7 @@ def check_strict_tools(client, model, checks):
     assert all(result["usage"]["prompt_tokens_details"]["cached_tokens"] > 0
                for result in concurrent), concurrent
     record("strict_tool_concurrent_replay", concurrent)
-    for limit in (2, 12):
+    for limit in (2, 6):
         partial = chat_result(client, {**sampled, "max_completion_tokens": limit}, True)
         assert partial["finish"] == "length" and not partial["tools"], partial
         # Native DeepSeek calls may begin with ordinary whitespace. No partial
@@ -1508,7 +1575,7 @@ def check_native_tools(client, model, checks, vision=False):
     signature(followup)
     assert followup.usage.input_tokens_details.cached_tokens > 0, followup
     record("responses_tool_history_cache", followup.to_dict())
-    for limit in (1, 12):
+    for limit in (1, 6):
         with client.responses.create(
                 **{**base, "max_output_tokens": limit}, stream=True) as stream:
             events = list(stream)
@@ -1733,7 +1800,8 @@ def check_tool_edges(client, model, checks, sampling_preset=None):
                 assert "text" not in order[order.index("tool"):], result
 
 
-def check_state_edges(client, model, checks, speculative, vision=False, server_log=None):
+def check_state_edges(client, model, checks, speculative, vision=False, server_log=None,
+                      checkpoint_tail=0):
     """Mode proof and request-local grammar state across limits, errors and reuse."""
     common = dict(model=model, temperature=0, top_p=1, seed=91,
                   extra_body={"presence_penalty": 0, "frequency_penalty": 0,
@@ -1854,7 +1922,8 @@ def check_state_edges(client, model, checks, speculative, vision=False, server_l
     assert replay["tools"][0]["function"] == completed["tools"][0]["function"], replay
     check_unchanged_retry("schema_error_did_not_poison_cache", replay,
                           replay["usage"]["gufo"]["prefill_tokens"],
-                          server_log, replay_start, replay_end)
+                          server_log, replay_start, replay_end,
+                          checkpoint_tail=checkpoint_tail)
     checks["schema_error_did_not_poison_cache"] = replay
 
 
@@ -1915,7 +1984,9 @@ def check_auto_tools(client, model, checks, vision=False):
         "extra_body": {"presence_penalty": 0}}, True)
     signature(thought)
     record("auto_chat_thinking_high", thought)
-    for limit in (2, 12):
+    # Ling's compact call markup completes within 12 tokens. Six tokens stop
+    # inside the call for every supported format.
+    for limit in (2, 6):
         result = chat_result(client, {**common, "max_completion_tokens": limit}, True)
         assert result["finish"] == "length" and not result["tools"], result
         record(f"auto_chat_limit{limit}", result)
@@ -2010,7 +2081,8 @@ def check_auto_tools(client, model, checks, vision=False):
         record("auto_image_argument_stop_retry", {"stopped": stopped, "retry": retry})
 
 
-def check_structured_limits(client, model, checks, vision=False):
+def check_structured_limits(client, model, checks, vision=False,
+                            min_retained_prompt_tokens=0):
     """Short boundary checks; valid prefixes may be incomplete at a limit."""
     schema = {"type": "object", "properties": {
         "text": {"type": "string", "const": 'é😀 "\\ ' * 24}},
@@ -2129,6 +2201,7 @@ def check_structured_limits(client, model, checks, vision=False):
     fresh_schema = {"type": "object", "properties": {"ok": {"type": "boolean", "const": True}},
                     "required": ["ok"], "additionalProperties": False}
     fresh = {**common, "max_completion_tokens": 32,
+             "messages": retained_messages(common["messages"], min_retained_prompt_tokens),
              "response_format": {"type": "json_schema", "json_schema": {
                  "name": "fresh", "strict": True, "schema": fresh_schema}}}
     resumed = chat_result(client, fresh, True)
@@ -2225,10 +2298,14 @@ def check_events(events, reasoning):
     return check_response(final, reasoning)
 
 
-def check_responses(client, model, checks, options, async_local_only, expect_reasoning):
+def check_responses(client, model, checks, options, async_local_only, expect_reasoning,
+                    min_retained_prompt_tokens=0):
     prompt = "What is two plus two? Reply briefly."
     request = dict(model=model, input=prompt, temperature=0, max_output_tokens=256,
                    reasoning={"effort": "low" if expect_reasoning else "none"}, store=False)
+    if min_retained_prompt_tokens:
+        # The streamed replay below must restore the prompt.
+        request["instructions"] = RETAINED_PROMPT_CONTEXT
     first = client.responses.create(**request)
     assert first.status == "completed", first
     checks["create"] = check_response(first, expect_reasoning)
@@ -2323,7 +2400,8 @@ def check_stream_start(client, model, checks, width, context):
     check(client, model, checks, width, context)
 
 
-def check_prompt_progress(client, model, checks, width, vision, allow_missing, server_log=None):
+def check_prompt_progress(client, model, checks, width, vision, allow_missing, server_log=None,
+                          checkpoint_tail=0):
     from progress import ProgressTrace
     from server_metrics import ServerMetrics, assert_accounting
 
@@ -2359,7 +2437,8 @@ def check_prompt_progress(client, model, checks, width, vision, allow_missing, s
     assert signature(on) == signature(replay)
     check_unchanged_retry("progress_cached", replay,
                           replay["usage"]["gufo"]["prefill_tokens"],
-                          server_log, replay_start, replay_end)
+                          server_log, replay_start, replay_end,
+                          checkpoint_tail=checkpoint_tail)
     sampled = {**cached, "temperature": .7, "top_p": .85, "presence_penalty": .3,
                "frequency_penalty": .2, "extra_body": {
                    **cached["extra_body"], "presence_penalty": .3, "top_k": 20, "min_p": .05}}
@@ -2456,10 +2535,12 @@ def check_prompt_progress(client, model, checks, width, vision, allow_missing, s
     assert signature(recovered) == signature(replay)
     check_unchanged_retry("progress_cancel_replay", replay,
                           replay["usage"]["gufo"]["prefill_tokens"],
-                          server_log, replay_start, replay_end)
+                          server_log, replay_start, replay_end,
+                          checkpoint_tail=checkpoint_tail)
 
 
-def check_server_metrics(client, model, checks, width, context, speculative, server_log=None):
+def check_server_metrics(client, model, checks, width, context, speculative, server_log=None,
+                         min_retained_prompt_tokens=0, checkpoint_tail=0):
     from server_metrics import (ServerMetrics, assert_accounting, PROMPT, GENERATED,
                                 PROCESSING, DEFERRED, PROMPT_SPEED, GENERATED_SPEED,
                                 KV_USAGE, DRAFT_ROUNDS, DRAFTS, ACCEPTED, assert_slots)
@@ -2479,7 +2560,8 @@ def check_server_metrics(client, model, checks, width, context, speculative, ser
     assert initial[KV_USAGE] == 0, initial
     prompt = "Count from one to one hundred, with no explanation."
     common = dict(model=model, temperature=0, seed=42, max_completion_tokens=16,
-                  messages=[{"role": "user", "content": prompt}],
+                  messages=retained_messages([{"role": "user", "content": prompt}],
+                                             min_retained_prompt_tokens),
                   extra_body={"presence_penalty": 0, "cache_prompt": True,
                               "chat_template_kwargs": {"enable_thinking": False}})
 
@@ -2506,7 +2588,8 @@ def check_server_metrics(client, model, checks, width, context, speculative, ser
     assert rows[0]["metrics"]["cached_tokens"] > 0
     prefilled = rows[0]["metrics"]["prefill_tokens"]
     check_unchanged_retry("metrics_chat_stream_cached", replay, prefilled,
-                          server_log, replay_start, replay_end)
+                          server_log, replay_start, replay_end,
+                          checkpoint_tail=checkpoint_tail)
     assert warm[PROMPT_SPEED] > 0 and cold[PROMPT_SPEED] > 0
     if not prefilled:
         assert warm[PROMPT_SPEED] == cold[PROMPT_SPEED]
@@ -2666,7 +2749,7 @@ def main():
     parser.add_argument("--suite", choices=("all", *SDK_SUITES), default="all")
     parser.add_argument("--vision", action="store_true",
                         help="Add image checks; the server needs its matching --mmproj")
-    parser.add_argument("--sampling-preset", choices=("qwen38", "deepseek4"),
+    parser.add_argument("--sampling-preset", choices=("qwen38", "deepseek4", "ling3"),
                         help="Expected text defaults; required for all/sampling-defaults")
     parser.add_argument("--sampling-overrides", type=json.loads, default={},
                         help="JSON object of explicit server sampling CLI values")
@@ -2724,13 +2807,16 @@ def main():
     checks = CheckResults(report, args.output, recorder)
     report["checks"] = checks
     checks.save()
+    min_retained = MIN_RETAINED_PROMPT_TOKENS.get(args.sampling_preset, 0)
+    checkpoint_tail = CHECKPOINT_TAIL_TOKENS.get(args.sampling_preset, 0)
     with OpenAI(**options, http_client=DefaultHttpxClient(
         trust_env=False, event_hooks={"request": [local_only, recorder.request_hook],
                                      "response": [recorder.response_hook]}
     )) as client:
         suites = {
             "messages-count-tokens": lambda: check_messages_count_tokens(
-                client, args.model, checks, args.context),
+                client, args.model, checks, args.context,
+                RETAINED_PROMPT_CONTEXT if min_retained else ""),
             "messages-image-counts": lambda: check_messages_image_counts(
                 client, args.model, checks, args.context, image_content,
                 args.expected_input_modalities.split(",")),
@@ -2738,7 +2824,8 @@ def main():
                 client, args.model, checks, args.context,
                 args.expected_input_modalities.split(",")),
             "responses": lambda: check_responses(client, args.model, checks, options,
-                                                   async_local_only, args.expect_reasoning),
+                                                   async_local_only, args.expect_reasoning,
+                                                   min_retained),
             "stops": lambda: check_stops(client, args.model, checks),
             "conversation": lambda: check_conversations(client, args.model, checks, args.vision),
             "image-inputs": lambda: check_image_inputs(
@@ -2749,22 +2836,27 @@ def main():
             "tool-images": lambda: check_tool_images(
                 client, args.model, checks, image_content, chat_result, response_result,
                 args.server_log),
-            "structured": lambda: check_structured_outputs(client, args.model, checks, args.vision),
-            "structured-limits": lambda: check_structured_limits(client, args.model, checks, args.vision),
+            "structured": lambda: check_structured_outputs(
+                client, args.model, checks, args.vision, min_retained),
+            "structured-limits": lambda: check_structured_limits(
+                client, args.model, checks, args.vision, min_retained),
             "native-tools": lambda: check_native_tools(client, args.model, checks, args.vision),
             "auto-tools": lambda: check_auto_tools(client, args.model, checks, args.vision),
             "tool-edges": lambda: check_tool_edges(
                 client, args.model, checks, args.sampling_preset),
             "tool-reasoning": lambda: check_tool_reasoning(
-                client, args.model, checks, chat_result, args.sampling_preset),
+                client, args.model, checks, chat_result, args.sampling_preset,
+                RETAINED_PROMPT_CONTEXT if min_retained else ""),
             "reasoning-separator": lambda: check_reasoning_separator(
-                client, args.model, checks, chat_result, args.server_log),
+                client, args.model, checks, chat_result, args.server_log,
+                RETAINED_PROMPT_CONTEXT if min_retained else "", checkpoint_tail),
             "tool-streaming": lambda: check_tool_streaming(client, args.model, checks, chat_result),
             "tool-agent": lambda: check_tool_agent(
                 client, args.model, checks, chat_result, args.vision, image_content),
             "tool-agent-loop": lambda: check_tool_agent_loop(client, args.model, checks, chat_result),
             "tool-history": lambda: check_tool_history(
-                client, args.model, checks, chat_result, args.vision, image_content, args.server_log),
+                client, args.model, checks, chat_result, args.vision, image_content,
+                args.server_log, checkpoint_tail),
             "messages-tools": lambda: check_messages_tools(
                 client, args.model, checks, chat_result),
             "tool-untyped": lambda: check_untyped_agent_tools(
@@ -2779,32 +2871,38 @@ def main():
                 client, args.model, checks, chat_result,
                 image_content("red") if args.vision else None),
             "tool-choice-cache": lambda: check_tool_choice_cache(
-                client, args.model, checks, chat_result),
+                client, args.model, checks, chat_result, checkpoint_tail, args.server_log),
             "tool-schema-edges": lambda: check_tool_schema_edges(
-                client, args.model, checks, chat_result, args.vision, image_content, args.server_log),
+                client, args.model, checks, chat_result, args.vision, image_content,
+                args.server_log, checkpoint_tail),
             "state-edges": lambda: check_state_edges(
-                client, args.model, checks, args.speculative, args.vision, args.server_log),
+                client, args.model, checks, args.speculative, args.vision, args.server_log,
+                checkpoint_tail),
             "sampling-defaults": lambda: check_sampling_defaults(
                 client, args.model, checks, args.sampling_preset, args.sampling_overrides,
-                args.vision, args.server_thinking),
+                args.vision, args.server_thinking, checkpoint_tail),
             "sampling-ranges": lambda: check_sampling_ranges(client, args.model, checks),
             "batch": lambda: check_batches(
-                client, args.model, checks, args.concurrency, args.vision, args.speculative),
+                client, args.model, checks, args.concurrency, args.vision, args.speculative,
+                min_retained),
             "long-context": lambda: check_long_context(
-                client, args.model, checks, args.context, args.vision),
+                client, args.model, checks, args.context, args.vision, checkpoint_tail),
             "progress": lambda: check_prompt_progress(
                 client, args.model, checks, args.concurrency, args.vision,
-                args.allow_missing_progress, args.server_log),
+                args.allow_missing_progress, args.server_log, checkpoint_tail),
             "stream-start": lambda: check_stream_start(
                 client, args.model, checks, args.concurrency, args.context),
             "prefill-scheduling": lambda: check_prefill_scheduling(
                 client, args.model, checks, chat_result, args.concurrency, args.context),
             "metrics": lambda: check_server_metrics(client, args.model, checks, args.concurrency,
-                                                     args.context, args.speculative, args.server_log),
+                                                     args.context, args.speculative,
+                                                     args.server_log, min_retained,
+                                                     checkpoint_tail),
             "cache-edits": lambda: check_cache_edits(
-                client, args.model, checks, chat_result, args.server_log),
+                client, args.model, checks, chat_result, args.server_log, checkpoint_tail),
             "cache-growth": lambda: check_cache_growth(
-                client, args.model, checks, chat_result, args.server_log),
+                client, args.model, checks, chat_result, args.server_log,
+                REASONING_ANSWER_TOKENS.get(args.sampling_preset, 128)),
             "cache-depth": lambda: check_cache_depth(
                 client, args.model, checks, chat_result, args.concurrency, args.server_log),
             "cache-rotation": lambda: check_cache_rotation(client, args.model, checks, chat_result),
@@ -2824,7 +2922,8 @@ def main():
             "cache-messages-loop": lambda: check_cache_messages_loop(
                 client, args.model, checks, chat_result, args.context),
             "system-injection": lambda: check_system_injection(
-                client, args.model, checks, chat_result),
+                client, args.model, checks, chat_result,
+                injection_reuse=args.sampling_preset == "ling3"),
         }
         selected = ([name for name in suites if name not in ("tool-native-types", "cache-bridge", "cache-compaction", "cache-transforms", "cache-pressure", "cache-messages-loop", "prefill-scheduling")
                      and (name not in ("image-inputs", "image-count", "tool-images") or args.vision)]
@@ -2838,9 +2937,13 @@ def main():
             except CaseComplete:
                 report["suites"][name] = {"status": "passed", "through_case": args.through_case}
             except Exception as error:
-                report["suites"][name] = {"status": "failed", "error": str(error),
+                lines = failure_lines(error, next(reversed(checks), None))
+                report["suites"][name] = {"status": "failed", "error": describe(error),
+                                          "failed_checks": lines,
                                           "traceback": traceback.format_exc()}
-                print(f"FAIL {name}: {error}", file=sys.stderr, flush=True)
+                print(f"FAIL {name}: {describe(error)}", file=sys.stderr, flush=True)
+                for line in lines:
+                    print(line, file=sys.stderr, flush=True)
             except KeyboardInterrupt:
                 report["status"] = "interrupted"
                 checks.save()

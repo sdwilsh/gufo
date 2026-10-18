@@ -1,0 +1,5 @@
+#!/bin/sh
+# Entry point of the comparison image: prepare the writable dirs first (restricted
+# pods have only /work), then run the harness. stdout = one JSON summary.
+mkdir -p "${TMPDIR:-/work/tmp}" "${XDG_CACHE_HOME:-/work/cache}" 2>/dev/null
+exec python3 /opt/gufo/compare/compare.py "$@"

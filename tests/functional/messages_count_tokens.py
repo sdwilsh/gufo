@@ -20,7 +20,10 @@ def assert_prompt_count(count, usage):
     assert count == sum(values), (count, usage)
 
 
-def check_messages_count_tokens(client, model, checks, context):
+def check_messages_count_tokens(client, model, checks, context, retained_system=""):
+    """`retained_system`: neutral system text that lifts the plain prompt above
+    a runner's shortest retained snapshot (openai_sdk.RETAINED_PROMPT_CONTEXT),
+    so its unchanged repeat can read the cache."""
     import openai
 
     metrics = ServerMetrics(client.base_url)
@@ -54,6 +57,8 @@ def check_messages_count_tokens(client, model, checks, context):
 
     plain = {"model": model, "thinking": {"type": "disabled"},
              "messages": [{"role": "user", "content": "Reply with exactly: COUNT_OK"}]}
+    if retained_system:
+        plain["system"] = retained_system
     initial = count("plain", plain)  # max_tokens is deliberately absent.
     assert count("plain_repeat", plain) == initial
     cold = generate("plain_cold", plain, initial)

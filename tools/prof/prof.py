@@ -31,6 +31,7 @@ per-kernel numbers must come from the pass that was actually timed.
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import os
 import shutil
@@ -38,11 +39,24 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import typing
 from collections import defaultdict
 from dataclasses import dataclass, field
 
 # Kernel-name substring -> pipeline stage. First match wins, so order matters.
 STAGE_MAPS: dict[str, list[tuple[str, str]]] = {
+    # Ling-3.0-flash: roll up by kernel namespace so renamed kernels stay in
+    # their stage (kda = linear-attention blocks, mla = latent attention).
+    "ling": [
+        ("rocm::kda::", "kda"),
+        ("rocm::mla::", "mla"),
+        ("rocm::moe::", "moe"),
+        ("rocm::dense::", "dense/linear"),
+        ("Cijk", "gemm: hipblaslt"),
+        ("hipblas", "gemm: hipblas"),
+        ("fillBuffer", "runtime: fill"),
+        ("copyBuffer", "runtime: copy"),
+    ],
     "h3": [
         ("WmmaAttention", "attention"),
         ("ShortAttention", "attention"),
@@ -420,6 +434,16 @@ def cmd_show(args: argparse.Namespace) -> int:
                     "wall_ms": prof.wall_ns / 1e6,
                     "dispatches": prof.dispatches,
                     "invalid_dispatches": prof.invalid_dispatches,
+                    "passes": [
+                        {
+                            "start_ms": p.start_ns / 1e6,
+                            "dispatches": p.dispatches,
+                            "kernel_ms": p.kernel_ns / 1e6,
+                            "span_ms": p.span_ns / 1e6,
+                        }
+                        for p in prof.passes
+                        if p.kernel_ns >= 5e6
+                    ],
                     "kernels": {
                         n: {"calls": s.calls, "ms": s.ns / 1e6, "shape": s.shape}
                         for n, s in prof.kernels.items()
@@ -520,25 +544,48 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not args.command:
         raise SystemExit("run: expected a command after --")
     if shutil.which("rocprofv3") is None:
-        raise SystemExit("rocprofv3 not on PATH; run inside `nix develop`")
+        raise SystemExit("rocprofv3 not on PATH (nix develop, or the measurement image)")
     out_dir = args.out or tempfile.mkdtemp(prefix="strixprof-")
     os.makedirs(out_dir, exist_ok=True)
     tag = args.tag
-    proc = subprocess.run(
-        ["rocprofv3", "--kernel-trace", "-d", out_dir, "-o", tag, "--", *args.command],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+    cmd = ["rocprofv3", "--kernel-trace", "-d", out_dir, "-o", tag, "--", *args.command]
+    # Stream the child's output to stderr as it arrives (nothing is lost when
+    # the run is killed) and keep the END of it: when a profiled run dies, the
+    # exception or crash line is the last thing printed, so a head-truncated
+    # capture hides exactly the part that matters.
+    tail: collections.deque[str] = collections.deque(maxlen=400)
+    log_path = os.path.join(out_dir, f"{tag}.log")
+    try:
+        log_file = open(log_path, "w", errors="replace")  # noqa: SIM115
+    except OSError:
+        log_file = None  # read-only or unwritable output directory
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace"
     )
-    if proc.returncode:
-        sys.stdout.write(proc.stdout)
-        raise SystemExit(proc.returncode)
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        tail.append(line)
+        sys.stderr.write(line)
+        if log_file is not None:
+            log_file.write(line)
+    returncode = proc.wait()
+    if log_file is not None:
+        log_file.close()
+    output = "".join(tail)
+
+    def fail(message: str) -> "typing.NoReturn":
+        print(f"prof.py: {message}\ncommand: {' '.join(cmd)}\n--- end of output ---\n{output[-12000:]}")
+        sys.stdout.flush()
+        raise SystemExit(returncode or 1)
+
+    if returncode:
+        how = f"killed by signal {-returncode}" if returncode < 0 else f"exited {returncode}"
+        fail(f"rocprofv3 {how}")
     db = os.path.join(out_dir, f"{tag}_results.db")
     if not os.path.exists(db):
-        sys.stdout.write(proc.stdout)
-        raise SystemExit(f"rocprofv3 produced no database at {db}")
+        fail(f"rocprofv3 produced no database at {db}")
     if args.show_output:
-        sys.stdout.write(proc.stdout)
+        sys.stdout.write(output)
     print(f"database: {db}\n")
     args.db = db
     return cmd_show(args)

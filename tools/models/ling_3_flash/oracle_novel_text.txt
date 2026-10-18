@@ -1,0 +1,720 @@
+The Salt Ledger of Marrowick Quay
+
+I. The surveyor's mistake
+
+Ines Okafor-Vane arrived in Marrowick on a Tuesday that smelled of diesel and boiled turnips, carrying a theodolite in a case that had once held a cello. The harbour office had promised her a room above the chandlery, and what it gave her was a cot behind a stack of unsold rope, a kettle with a cracked handle, and a key tied to a cork so that it would float if she dropped it in the water. She decided not to take this personally.
+
+"You'll be the one from the county," said the woman at the counter, without looking up from a crossword. Her name tag read Dagny, and under it, in marker, someone had added "(not Dagmar)". "Everyone expects you to say the quay is sinking. It isn't. It's the water that is rising, which is a different problem and a more expensive one."
+
+"I'm here to measure it, not to say anything," Ines replied. "The county wants forty-one benchmarks re-levelled before the grant closes on the thirtieth."
+
+"Forty-one." Dagny finally looked up. She had the face of a person who had been told many numbers by many visitors and had kept none of them. "There are only thirty-eight brass studs on the quay. My father counted them every spring. If you find forty-one, someone has been busy."
+
+Ines laughed, because it seemed polite, and then stopped, because Dagny did not. She spent the afternoon walking the old stone wall with a notebook, pressing her thumb against each brass stud as if checking a pulse. They were stamped with a small anchor and a number, and the numbers ran from 3 to 40 with gaps at 17 and 29. Where the county's spreadsheet said there should be a stud labelled 41, there was a cleft in the granite filled with gull droppings and the dry husks of limpets.
+
+She sat on a bollard and ate half a cheese sandwich. A heron stood on the slipway below, watching a tangle of green weed with the patience of an auditor. Out beyond the breakwater the tide was ebbing, drawing a long brown tongue across the sand, and the light was going yellow in the way it did before rain.
+
+"Excuse me," said a boy of about twelve, who had appeared at her elbow without any sound at all. He wore a yellow oilskin two sizes too large and carried a bucket with a lid. "Are you the one who is going to move the quay?"
+
+"I'm going to measure it. Nobody is moving anything."
+
+"Mum says if you measure it, it counts, and if it counts, somebody has to pay." He considered this. "She says that's why nobody has measured it since 1987."
+
+"Your mother sounds like a clever woman."
+
+"She's the harbourmaster. She's mostly just tired." The boy lifted the lid of the bucket a crack, and Ines saw three crabs, one of them missing a claw, arranged with some dignity on a bed of wet newspaper. "This is Gerald, Pauline and the Duke. You can look at them, but you can't name them. They've already got names."
+
+"I wouldn't dream of it," said Ines.
+
+That night she lay on the cot and listened to the rigging of the moored boats ticking against their masts, a sound like a hundred small clocks that had never agreed on the hour. She worked through the arithmetic once more. Thirty-eight studs, forty-one entries, three phantom marks. A surveyor from 1962 had made the original traverse, and the county had copied his figures into a database in 2004, and somebody had since "cleaned" that database, and the cleaning had taken something away or put something in. She fell asleep with the pencil still in her hand.
+
+II. The ledger
+
+The harbourmaster's name was Brigid Tallowby, and she received Ines in an office whose window had been painted shut by a previous administration. A radiator clanked in one corner. On the desk lay a tide table, a mug of tea gone cold enough to grow a skin, and a thick book bound in grey cloth with a red spine, which she pushed across the blotter without ceremony.
+
+"That's what you want," she said. "The salt ledger. My grandfather kept it, and his father before him, and they wrote down the height of the spring tide against the wall on the first of every month. They used a painted post, not a studs-and-brass arrangement. You can have it for the week, but it doesn't leave the building."
+
+"Why is it called the salt ledger?"
+
+"Because the first owner kept it in the salt store, and the damp got into it, and everything written there afterward went a bit bloom-white at the edges. Look." Brigid opened it at random. The ink on the page had gone the colour of weak tea, and a crust of fine crystals lay along the gutter of the binding. "Nobody ever bothered to move it. After a while it was a point of pride."
+
+Ines turned the pages with the care of someone handling a sleeping animal. The entries were terse. "Mar 1. 4.62 m. Wind SW, fresh. Gull on the post." "Apr 1. 4.71 m. Calm. Fog. Gull again, same one." There was a rhythm to it, a monthly pulse of numbers that rose and fell with the lunar year, and underneath the rhythm she could see something slower: a drift, one centimetre here, three there, a quiet upward creep across seventy years.
+
+"It's the same post every time?" she asked.
+
+"Replaced twice. After the 1953 flood, and after somebody's trawler ran into it in 'seventy-nine. They always put it back in the same hole."
+
+"That's the part I need to be sure about." Ines found she was already reaching for her pencil. "If the hole moved, the whole series moves with it. Do you know where it stood?"
+
+Brigid looked at her for a long moment. Then she took a ring of keys from a hook, selected one that was mostly rust, and said, "Come on. Bring your cello."
+
+They walked the length of the quay in a thin drizzle, past the fish sheds with their blue doors, past a man hosing down a crate of something that was still moving, past the lifeboat house where a volunteer in a fleece vest was repainting a number on the bow. At the far end, where the wall turned inward and the water was deeper and darker, there was an iron ring set into the stone and, a metre below it, a vertical row of rust-coloured blots in the granite that might once have been bolt holes.
+
+"Forty-one," said Ines, to herself.
+
+"What?"
+
+"The county's list has a stud forty-one near the old post. It was never installed. Somebody entered it from a drawing, not from the wall. Which means," she said, kneeling on the wet stone and unclasping the case, "the benchmark is real in the paperwork and absent on the ground, and the original surveyor's figures for the other thirty-eight are probably tied to a datum he set from this exact place."
+
+"I understood perhaps half of that," said Brigid.
+
+"It means I'd like to borrow your grandfather's post, or at least the hole it stood in." Ines set the tripod down, extended the legs, and squinted through the eyepiece at a staff held, with great solemnity, by the boy in the yellow oilskin. "And I'd like a bit of quiet. Please."
+
+The boy, whose name turned out to be Tobias, held the staff perfectly still for eleven minutes, which was longer than any adult on the quay would have managed. When she finally lowered the instrument, her reading was 2.318 metres, and the number sat in her notebook like a stone dropped into a well.
+
+"Is that good?" Tobias asked.
+
+"It's exactly what I didn't want," Ines said. "It means the quay has sunk four centimetres relative to the datum and the sea has risen eleven. Which is, I think, a different problem and a more expensive one."
+
+Brigid, to her credit, did not say anything at all. She simply took the ledger out from under her coat, where she had been sheltering it from the rain, and handed it over like a baby.
+
+Technical note 7: why a tide gauge drifts and a benchmark does not
+
+A tide gauge measures the height of the water relative to a mark on a structure, and that structure is itself a moving thing. Harbour walls settle into the mud they stand on, pilings compress, and the ground under a whole coastline can slowly rise or fall as the crust responds to ice that melted ten thousand years ago. If you record only the water level against a fixed post, you measure the sum of three effects: the true change in sea level, the vertical motion of the land, and the instrument's own drift. You cannot separate them from the gauge record alone.
+
+The separation requires a second, independent reference. A levelling benchmark is a brass stud set into bedrock or a deep foundation, and its height is tied to a national datum by a chain of precise sightings. Each sighting in the chain compares two staffs read through a level that is first set to horizontal by a bubble or a pendulum compensator. The error in one set-up is small, perhaps 0.3 mm per sight, but the errors accumulate along the route. For a line of n set-ups with independent random errors of standard deviation s, the accumulated standard deviation is s multiplied by the square root of n. With 400 set-ups and s equal to 0.3 mm, the closing error is about 6 mm, which sounds modest until you remember that the signal you are looking for is 2 to 3 mm per year.
+
+Two practical rules follow from this arithmetic. First, always level in both directions and compare the forward and backward totals; a misclosure larger than four millimetres times the square root of the route length in kilometres is a reason to repeat the line, not to average it away. Second, never rely on a single benchmark. Use at least three, widely spaced, and check them against each other every few years, because a stud that has been knocked, welded to, or covered in resurfaced tarmac tells you nothing about the ground.
+
+There is a subtler issue, the one that catches newcomers. Sea level is not flat. Wind piles water against one shore and drags it from another; a low-pressure system lifts the surface by roughly one centimetre for every hectopascal of pressure drop, the so-called inverse barometer effect; and the tide itself is a superposition of dozens of harmonic constituents with periods from about twelve hours to eighteen and a half years. To compare readings taken on different days, analysts fit the harmonic constituents by least squares and subtract the predicted tide, leaving a residual that contains the weather and the long-term trend. The residual of a month is noisy, with a standard deviation of 8 to 12 cm on an exposed coast, so a trend of 3 mm per year only emerges from the noise after roughly two decades of monthly data.
+
+This is why the hand-written ledger kept at a small harbour can be worth more than a modern sensor installed last spring. The sensor has a calibration certificate and no history; the ledger has seventy years of crooked handwriting and no certificate. Neither is sufficient alone, and the interesting work is the reconciliation.
+
+Date: Thursday 14 March
+From: Rahul Desai-Whitlock
+To: Marrowick quay working group
+Cc: Brigid Tallowby; Dr. Ewa Kowalczyk; finance@marrowick-harbour.example
+Subject: Re: Re: levelling programme, revised schedule and the stud that isn't there
+
+Hi all,
+
+Thanks for the notes from Tuesday. I have tried to pull the open items together below so that nobody has to scroll through nine replies. Please correct me if I have misrepresented anything; I was on a poor connection for the second half and may have missed a decision.
+
+Decisions
+1. The county will accept 38 observed benchmarks in place of the 41 originally listed, provided the surveyor's report states explicitly that studs 17 and 29 are missing and stud 41 was never installed. Ewa has confirmed this in writing and I will forward her message separately.
+2. The grant deadline stays at the 30th. There is no extension available. Finance have asked that the invoice from the survey firm be submitted by the 26th so it can be coded to the right budget year.
+3. Brigid will keep the ledger on site. We will photograph every page at 600 dpi before anything else happens to it, and the scans go to the shared drive under /quay/ledger/2024.
+
+Action items
+- Ines: complete the forward and backward levelling lines by Friday 22nd; send raw observation files, not just the adjusted heights.
+- Brigid: find out which of the two replacement posts (1953 or 1979) was set in the original hole. Ask the lifeboat crew, one of them does the paint.
+- Ewa: check whether the tide-gauge sensor, ID MQ-0412, was re-zeroed after the October storm. If so, we need the date.
+- Rahul: reconcile the budget. Current spend is 18,420 pounds against an approved 22,000, and the remaining 3,580 has to cover the photography, the report and a contingency.
+- Finance: confirm whether VAT is included in the survey invoice. Last time it was not, and it cost us a week.
+
+One thing I would like to flag. The 2004 database migration changed the units of the height column from metres to millimetres for rows 30 onward, and then someone "fixed" the first thirty rows in the opposite direction. I do not think this affects the new work, but it does mean that anyone who has pulled a CSV from the old system in the past twenty years has a file that is partly wrong. Please do not reuse old exports.
+
+Next meeting: Tuesday 19th at 10:00, harbour office, bring your own mug. The radiator will be on.
+
+Best,
+Rahul
+
+--
+Meeting notes, Marrowick working group, 19 March (draft, not yet approved)
+Present: R. Desai-Whitlock (chair), B. Tallowby, E. Kowalczyk, I. Okafor-Vane, D. Sorensen (finance, 15 min only)
+Apologies: T. Tallowby (school)
+
+1. Matters arising. The scans of the ledger are 71 percent complete. Pages 140 to 188 are too damp to feed through the sheet scanner and are being photographed by hand. ES to confirm the file naming convention.
+2. Levelling. IOV reports forward line closed at +2.1 mm, backward at -1.7 mm over 3.4 km, inside the 7.4 mm tolerance. Station 41 will be recorded as "not installed". No objection.
+3. Budget. DS notes the survey firm quoted 9,750 plus VAT; the working group had budgeted without VAT. Agreed to cover the 1,950 shortfall from contingency. Remaining contingency: 1,630.
+4. Gauge MQ-0412. EK found a maintenance log entry: re-zeroed on 2 November by a contractor, offset applied of minus 14 mm. Not applied to the data in the public portal. Action: EK to issue a corrected series and a note explaining the change.
+5. AOB. Mr Pell asked whether the new measurements could be used to argue for a larger sea wall. Chair said the survey establishes facts; any engineering recommendation would be a separate commission.
+
+Next meeting 2 April.
+
+Table A. Observed heights of the harbour studs against the 2024 datum, in metres
+
+stud   year set   height     sigma     note
+3      1962       2.874      0.002     chipped
+4      1962       2.869      0.002
+5      1962       2.861      0.003
+11     1962       2.802      0.002     repainted
+12     1962       2.797      0.002
+16     1962       2.755      0.004     under tarmac patch
+18     1962       2.731      0.003
+22     1975       2.688      0.003     replaced after fire
+28     1975       2.640      0.002
+30     1975       2.611      0.005     tilted about 2 degrees
+35     1988       2.540      0.002
+38     1988       2.517      0.002
+40     1988       2.502      0.003     nearest the old post
+
+Table B. Monthly highest spring tide at the old post, selected years, metres
+
+year   Jan    Mar    May    Jul    Sep    Nov
+1954   4.61   4.64   4.58   4.55   4.66   4.70
+1974   4.66   4.69   4.63   4.60   4.72   4.74
+1994   4.74   4.77   4.70   4.68   4.80   4.83
+2014   4.86   4.89   4.84   4.81   4.93   4.97
+
+Mean rise 1954 to 2014: 0.25 m in 60 years, or 4.2 mm per year, with a 95 percent interval of plus or minus 0.9 mm per year.
+
+// quaylevel.hpp -- height adjustment for a levelling line.
+// Written for the Marrowick re-survey; not a general geodesy library.
+#pragma once
+
+#include <cmath>
+#include <cstddef>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace quay {
+
+// One sighting from a level: backsight on the known point, foresight on the
+// new one. Heights are in metres, distances in metres.
+struct Setup {
+    std::string from;
+    std::string to;
+    double backsight = 0.0;
+    double foresight = 0.0;
+    double distance = 0.0;
+
+    // Rise from `from` to `to`. A positive value means `to` is higher.
+    double rise() const { return backsight - foresight; }
+};
+
+struct Leg {
+    std::vector<Setup> setups;
+    double known_height = 0.0;  // height of the first station
+
+    double total_rise() const {
+        double sum = 0.0;
+        for (const Setup& s : setups) sum += s.rise();
+        return sum;
+    }
+
+    double length_km() const {
+        double d = 0.0;
+        for (const Setup& s : setups) d += s.distance;
+        return d / 1000.0;
+    }
+};
+
+// Misclosure between a forward and a backward run of the same route.
+// Returns nullopt if the two legs do not have the same number of setups,
+// because then they are not the same route and a number would be misleading.
+inline std::optional<double> misclosure(const Leg& fwd, const Leg& bwd) {
+    if (fwd.setups.size() != bwd.setups.size()) return std::nullopt;
+    return fwd.total_rise() + bwd.total_rise();
+}
+
+// Allowed misclosure in millimetres: k * sqrt(L), with L in kilometres.
+// The usual figure for a precise line is k = 4.
+inline double tolerance_mm(const Leg& leg, double k = 4.0) {
+    return k * std::sqrt(leg.length_km());
+}
+
+// Distribute the misclosure over the setups in proportion to distance.
+// The correction for a station is the share of the line already travelled.
+inline std::vector<double> adjust(const Leg& leg, double misclose) {
+    const double total = leg.length_km() * 1000.0;
+    std::vector<double> heights;
+    heights.reserve(leg.setups.size() + 1);
+    double h = leg.known_height;
+    double travelled = 0.0;
+    heights.push_back(h);
+    for (const Setup& s : leg.setups) {
+        travelled += s.distance;
+        h += s.rise();
+        // The correction is subtracted: if the line closed high, every
+        // station further along has to come down by its own share.
+        heights.push_back(h - misclose * (travelled / total));
+    }
+    return heights;
+}
+
+}  // namespace quay
+
+// quaylevel_test.cpp -- a small check that nobody had asked for.
+#include "quaylevel.hpp"
+
+#include <cassert>
+#include <cstdio>
+
+int main() {
+    quay::Leg fwd;
+    fwd.known_height = 2.500;
+    fwd.setups = {
+        {"A", "B", 1.512, 1.388, 41.0},
+        {"B", "C", 1.620, 1.701, 38.5},
+        {"C", "D", 1.455, 1.299, 44.2},
+    };
+
+    quay::Leg bwd;
+    bwd.known_height = 2.500;
+    bwd.setups = {
+        {"D", "C", 1.301, 1.457, 44.2},
+        {"C", "B", 1.703, 1.618, 38.5},
+        {"B", "A", 1.386, 1.514, 41.0},
+    };
+
+    auto m = quay::misclosure(fwd, bwd);
+    assert(m.has_value());
+    std::printf("misclosure = %+.1f mm, tolerance = %.1f mm\n",
+                *m * 1000.0, quay::tolerance_mm(fwd));
+
+    auto heights = quay::adjust(fwd, *m);
+    for (std::size_t i = 0; i < heights.size(); ++i) {
+        std::printf("station %zu: %.4f m\n", i, heights[i]);
+    }
+    return std::fabs(*m * 1000.0) <= quay::tolerance_mm(fwd) ? 0 : 1;
+}
+
+#!/usr/bin/env python3
+"""tidefit.py -- least squares fit of a few tidal constituents to a ledger.
+
+The ledger is a CSV with columns `date,height`; dates are ISO 8601 and heights
+are metres. We fit a mean, a linear trend and the M2, S2, K1 and O1 harmonics,
+then print the trend in millimetres per year. This is a teaching sketch; real
+analyses use dozens of constituents and a nodal correction.
+"""
+import argparse
+import csv
+import math
+from datetime import datetime, timezone
+
+# Angular speeds in degrees per hour.
+SPEEDS = {"M2": 28.9841042, "S2": 30.0, "K1": 15.0410686, "O1": 13.9430356}
+
+
+def read_ledger(path):
+    rows = []
+    with open(path, newline="") as fh:
+        for rec in csv.DictReader(fh):
+            when = datetime.fromisoformat(rec["date"]).replace(tzinfo=timezone.utc)
+            rows.append((when, float(rec["height"])))
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+def design_row(hours, years):
+    """One row of the design matrix: constant, trend, then cos/sin pairs."""
+    row = [1.0, years]
+    for deg_per_hour in SPEEDS.values():
+        phase = math.radians(deg_per_hour * hours)
+        row += [math.cos(phase), math.sin(phase)]
+    return row
+
+
+def solve(normal, rhs):
+    """Gaussian elimination with partial pivoting; modifies its arguments."""
+    n = len(rhs)
+    for col in range(n):
+        pivot = max(range(col, n), key=lambda r: abs(normal[r][col]))
+        if abs(normal[pivot][col]) < 1e-12:
+            raise ValueError("singular system: not enough distinct sample times")
+        normal[col], normal[pivot] = normal[pivot], normal[col]
+        rhs[col], rhs[pivot] = rhs[pivot], rhs[col]
+        for r in range(col + 1, n):
+            factor = normal[r][col] / normal[col][col]
+            for c in range(col, n):
+                normal[r][c] -= factor * normal[col][c]
+            rhs[r] -= factor * rhs[col]
+    x = [0.0] * n
+    for r in reversed(range(n)):
+        tail = sum(normal[r][c] * x[c] for c in range(r + 1, n))
+        x[r] = (rhs[r] - tail) / normal[r][r]
+    return x
+
+
+def fit(rows):
+    t0 = rows[0][0]
+    size = 2 + 2 * len(SPEEDS)
+    normal = [[0.0] * size for _ in range(size)]
+    rhs = [0.0] * size
+    for when, height in rows:
+        hours = (when - t0).total_seconds() / 3600.0
+        years = hours / (24.0 * 365.25)
+        row = design_row(hours, years)
+        for i in range(size):
+            rhs[i] += row[i] * height
+            for j in range(size):
+                normal[i][j] += row[i] * row[j]
+    return solve(normal, rhs)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("ledger")
+    args = ap.parse_args()
+    coeffs = fit(read_ledger(args.ledger))
+    print(f"mean level   {coeffs[0]:8.4f} m")
+    print(f"trend        {coeffs[1] * 1000.0:8.2f} mm/yr")
+    for k, name in enumerate(SPEEDS):
+        a, b = coeffs[2 + 2 * k], coeffs[3 + 2 * k]
+        print(f"{name} amplitude {math.hypot(a, b):7.4f} m")
+
+
+if __name__ == "__main__":
+    main()
+
+第三章　雨季的账本
+
+青石镇的雨从四月下到七月，像是有人忘了关水龙头。沈阿婆每天清晨都会把竹椅搬到茶铺门口，一边剥豆子，一边数着河对岸驳船的灯。她说，数灯比数钱靠得住，钱会少，灯只会换地方。
+
+那年夏天，镇上来了个年轻的测绘员，姓方，背着一只比他人还高的木箱子。他在码头边的石阶上支起三脚架，对着河面看了整整一个下午，引来一群小孩围观。有个扎羊角辫的小姑娘问他：“叔叔，你是在给河量身高吗？”
+
+方明笑了笑，说：“差不多。我想知道水位比三十年前高了多少。”
+
+“那你问我外婆呀，”小姑娘指着茶铺，“她记得所有的事，连隔壁老王家的鸡什么时候下了第一个蛋都记得。”
+
+他于是走进茶铺。沈阿婆没有抬头，只是把一碗浓茶推到桌子对面，茶汤红得发黑，热气里有一股陈年的樟木味。“坐吧，”她说，“先喝茶，后说话。年轻人总是倒过来，所以才总是累。”
+
+方明坐下，从包里取出一本发黄的笔记，说是在县档案馆里找到的，一九七四年的水文记录，上面有几处墨迹已经晕开，看不清数字。沈阿婆接过去，戴上老花镜，翻了两页，忽然停住了。
+
+“这个字是我男人写的，”她轻声说，“他那时候在渡口当守闸的，每个月初一，要拿红漆在石柱上画一道线，再把高度记下来。你看这里，写的是‘一丈二尺三’，后面这个‘三’字被雨水泡糊了，其实是‘八’。”
+
+“您怎么确定？”
+
+“因为那一年他的手断过一根指头，写‘八’的时候总要多绕半圈，你看，这一笔是不是比别的都圆？”
+
+方明凑近了看。果然，那个字的下半部有一个微微鼓起的弧，像一只吃饱了的虫子。他在笔记本上写下新的数字，心里算了一遍：按照现在的水位线，三十年间大约升高了二十六厘米，平均每年将近九毫米，比他预想的要快得多。
+
+窗外的雨忽然大了。屋檐上的水线连成一片，打在青石板上，叮叮咚咚，好像有人在远处敲一面很小的鼓。沈阿婆把眼镜摘下来，用衣角擦了擦，说：“你们读书人总想把水量明白。可水不是用来量的，水是用来住的。它高一点，我们就往上搬一点，搬来搬去，一辈子也就过去了。”
+
+方明没有反驳。他想起自己租的那间屋子，墙角有一圈淡淡的白色盐渍，房东说是去年涨水留下的，擦不掉，也不必擦。他合上笔记，轻声说：“阿婆，我想把这本账抄一份，行吗？”
+
+“抄吧，”沈阿婆说，“不过得用毛笔，用圆珠笔抄的东西，水一泡就没了。”
+
+接下来的七天，方明每天傍晚都来茶铺抄账。他的字不好看，沈阿婆一边看一边摇头，却又每次都替他把砚台里的墨磨好。第七天夜里，雨终于停了，云层裂开一道缝，露出几颗很亮的星。河面上有一只夜鹭，一动不动地站在浅水里，像一枚被人遗忘的标点。
+
+“明天你就走了吧？”沈阿婆问。
+
+“嗯，报告要在月底前交。”
+
+“交上去以后，会有人修堤吗？”
+
+方明想了想，诚实地回答：“不一定。报告只能说明水涨了多少，修不修，要看别人怎么决定。”
+
+沈阿婆点点头，像是早就知道答案。她从柜台下面摸出一个油纸包，塞到他手里：“拿着，路上吃。是我自己腌的萝卜干，咸得很，配白粥正好。”
+
+方明走出茶铺的时候，天已微亮。远处的驳船依旧亮着灯，一盏，两盏，三盏，其中有一盏换了位置。他停下来，认真地数了一遍，然后笑了。他知道，有些东西是不会写进报告里的。
+
+附：本镇近五年雨季降水量统计（单位：毫米）
+
+年份　　四月　　五月　　六月　　七月　　合计
+二〇一九　　142　　188　　236　　201　　767
+二〇二〇　　158　　203　　274　　219　　854
+二〇二一　　131　　176　　219　　185　　711
+二〇二二　　167　　215　　291　　238　　911
+二〇二三　　149　　197　　258　　224　　828
+
+可以看出，二〇二二年的降水最多，比五年平均值高出约九十毫米；二〇二一年最少。需要说明的是，这些数据来自镇上的雨量筒，每天早八点人工读数，误差大约为正负两毫米，与气象站的自动记录并不完全一致。
+
+关于修缮码头的会议纪要（节选）
+
+时间：三月十九日下午两点
+地点：镇政府二楼会议室
+参加人员：镇长陈国华、水利站李站长、测绘员方明、渡口代表沈阿婆的孙女沈晓岚
+
+一、李站长汇报，现有堤坝总长一点八公里，其中老化严重的路段约四百二十米，修复预算初步估算为一百三十八万元，县里答复最多可以拨付八十万元。
+二、方明说明，新测量结果显示码头石阶比三十年前低了约十五厘米，但是否由于地基沉降，还需要再做一次复测，预计需要十天。
+三、沈晓岚提出，修缮期间渡口不能停运，因为镇上有二十多个孩子要过河上学。会议决定，先修东段，保留西段通行，工期推迟到九月开学之后。
+四、陈镇长要求，下次会议前，各部门把各自的方案写成一页纸，不要超过五百字，不要用太多专业词汇。
+
+散会后，沈晓岚把那份纪要折成四折，塞进外婆的茶铺柜台。外婆戴上眼镜，念了一遍，只说了一句：“五百字，够了。我年轻的时候写情书，也没用过这么多。”
+
+散文：一盏灯的重量
+
+我一直觉得，一座城市真正的重量不在高楼，而在夜里亮着的那些小灯。深夜回家的路上，经过一家二十四小时便利店，玻璃门里站着一个打瞌睡的店员，头一点一点，像一只把头埋进翅膀里的鸟。货架上的饭团整整齐齐，冷柜发出轻微的嗡嗡声，这个世界便显得安全而平常。
+
+小时候，我以为大人是不会累的。后来才发现，大人只是学会了把累藏进很小的动作里：比如进门前多站一会儿，比如洗碗的时候把水开得很大。我父亲就是这样的人。他在一家机械厂做了三十一年的钳工，退休以后，手指上还留着一道一道细小的伤疤，像地图上没有标注名字的河流。他很少说话，却总记得给我的自行车打气，每个星期天，一次也没有忘过。
+
+有一次我问他：“你不觉得枯燥吗？每天拧同样的螺丝。”
+
+他想了很久，才说：“螺丝是一样的，可每一颗拧上去的手感不一样。你拧多了，就会知道。”
+
+我当时并不明白。直到许多年以后，我自己在深夜里改一份已经改了十几遍的稿子，忽然发现，每一遍的阻力确实不同，有些句子一碰就松，有些要用力才能进去。那一刻，我想起了父亲，想起他在灯下用棉布擦拭工具的样子，想起他说“手感”这两个字时微微眯起的眼睛。
+
+灯是有重量的。它压在每一个还没有睡的人的肩上，也托着每一个正在回家的人的脚步。
+
+IV. What the gull knew
+
+By the second week Ines had stopped noticing the smell of the turnips. She had a routine: up at six, tea from the cracked kettle, an hour on the quay before the fish sheds opened and the forklifts began their reversing chorus. By seven she had her tripod set over the nearest stud, and by nine she had usually been interrupted by Tobias, who came after breakfast with a new fact about crabs.
+
+"Duke has a limp," he reported on Wednesday.
+
+"The Duke has one claw. Limping would be a generous description."
+
+"He leans. It's not the same." Tobias set down the bucket and sat cross-legged on the wet stone with the gravity of a man at a negotiation. "Dagny says you found the wrong hole."
+
+"I found the right hole. Everyone else has been looking at the wrong spreadsheet."
+
+"That's what Dagny said you'd say."
+
+Ines looked up from the level. "What else did Dagny say?"
+
+"That you'd be gone by the end of the month and that Mum would be sad about it, but she'd pretend she wasn't, and then she'd make a pie." He frowned. "She didn't say what kind of pie. I think it matters."
+
+It was true that Brigid had become, in small ways, less guarded. She no longer stood in the office doorway with her arms folded when Ines passed. On Thursday there was a mug of tea on the bollard beside the tripod, still hot, with no note and no acknowledgement, and Ines drank it standing up and said nothing, because she understood that this was the whole of the transaction.
+
+On Friday the wind turned northeasterly and the water in the harbour began to slap against the wall with a flat, impatient sound. The sky over the breakwater went the colour of an old bruise. Brigid came out of the office with her coat open, looked at the sea for perhaps half a minute, and then said, without turning her head, "You'll want to get your things in. We'll have a surge tonight."
+
+"The forecast says half a metre above the tide."
+
+"The forecast is written in Exeter by people who have never been wet." Brigid pointed with her chin at the iron ring at the end of the quay. "Watch the gull."
+
+On the post that was no longer a post, only a stump of grey timber they had unearthed that week beside the iron ring, there stood a single herring gull, hunched, one yellow eye turned toward the water. It did not move. It had been there every morning since Ines arrived. She had assumed it was a coincidence and then, as the days passed, a joke, and she had never once seen it fly.
+
+"Same one?" she asked.
+
+"My grandfather wrote it down. 'Gull on the post.' Every month, for fifty-one years." Brigid shrugged, but she did not quite succeed in making it look careless. "Gulls live thirty years, perhaps forty. So it is not the same one. It is the same place. They teach it to their young. If you want to know how high the water is going to come, you watch where the gull stands."
+
+"And where is it standing now?"
+
+"Higher than usual."
+
+Ines looked. The gull had indeed moved, not onto the stump but onto the iron ring above it, a full forty centimetres up the wall. She felt something cold and precise settle in her chest, the same feeling she got when two independent measurements disagreed by more than they should.
+
+"I'll need to move the instruments," she said.
+
+"Aye," said Brigid. "That's what I came out to say."
+
+They worked for an hour, the three of them and Dagny, who appeared from the chandlery with a tarpaulin and a roll of tape and said she had always wanted to wrap a theodolite. They carried the tripod and the staffs to the lifeboat house, lashed the cello case to a ladder rung, and spread the ledger on a table under a lamp. Tobias was sent home with the crabs, which he accepted as a sentence passed on him unjustly.
+
+The surge arrived at eleven minutes past nine. It did not come like a wave. It came like a floor rising, quietly, a dark glossy sheet of water that slid up the slipway and over the lowest courses of stone and stopped, shivering, at the height of the second brass stud from the end. Ines stood in the doorway of the lifeboat house with a torch and her notebook, and in the beam the surface of the harbour looked like poured tar. She read the water against the stud, then against the iron ring, then against the stump. Each reading she wrote down with the time to the minute.
+
+"What is it?" Brigid asked, very low.
+
+"Two point six eight metres at the datum," said Ines. "Which is higher than the old ledger says the water has ever been, except once."
+
+"Nineteen fifty-three."
+
+"Nineteen fifty-three."
+
+They stood and watched the water for a long time. The gull on the ring did not move. Behind them in the lifeboat house the volunteer in the fleece vest had made tea on a camping stove, and the smell of it, strong and tannic, mingled with the smell of wet rope and engine oil and the cold iron breath of the sea.
+
+"I don't suppose," Brigid said at last, "that this is going to look very scientific in your report."
+
+"It will look," said Ines, "like a surveyor who was wrong about the quay and right about the water. I think I can live with that."
+
+At three in the morning the water began to fall. By dawn it had returned to the slipway and the quay lay shining and unharmed, strewn with weed and a single dead mackerel. The gull flew, then, for the first time in Ines's hearing, a heavy unwilling flap of grey and white out over the breakwater, and came back to the stump, and settled.
+
+Brigid took the ledger from the lifeboat table and opened it to a fresh page. She wrote the date in blue ink, in a hand that was square and slightly slanted, and underneath it, after a moment's thought, she wrote: "Surge, 2.68 m. Wind NE, strong. Gull on the ring, then on the post."
+
+She blew on the page to dry it. A little salt rose from the paper, a fine white bloom, and drifted away.
+
+// ringbuf.hpp -- a fixed-capacity ring buffer for gauge samples.
+// The gauge logger writes one sample every six minutes and keeps a week.
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
+
+namespace quay {
+
+struct Sample {
+    std::int64_t unix_seconds;  // UTC
+    std::int32_t millimetres;   // water height above the gauge zero
+    std::uint8_t quality;       // 0 = good, 1 = interpolated, 2 = suspect
+};
+
+template <std::size_t N>
+class RingBuffer {
+    static_assert(N > 1, "a ring buffer needs at least two slots");
+
+public:
+    // Appends a sample. When the buffer is full, the oldest sample is lost.
+    void push(const Sample& s) {
+        data_[head_] = s;
+        head_ = (head_ + 1) % N;
+        if (size_ < N) {
+            ++size_;
+        } else {
+            tail_ = (tail_ + 1) % N;
+        }
+    }
+
+    // Index 0 is the oldest sample still held.
+    const Sample& at(std::size_t i) const {
+        if (i >= size_) throw std::out_of_range("RingBuffer::at");
+        return data_[(tail_ + i) % N];
+    }
+
+    std::size_t size() const { return size_; }
+    bool full() const { return size_ == N; }
+
+    // Mean of the good samples between two timestamps, or no value (NaN)
+    // if none qualify. The range is half open: [from, to).
+    double mean_between(std::int64_t from, std::int64_t to) const {
+        double total = 0.0;
+        std::size_t count = 0;
+        for (std::size_t i = 0; i < size_; ++i) {
+            const Sample& s = at(i);
+            if (s.quality != 0 || s.unix_seconds < from || s.unix_seconds >= to) {
+                continue;
+            }
+            total += s.millimetres;
+            ++count;
+        }
+        return count ? total / static_cast<double>(count) : 0.0 / 0.0;
+    }
+
+private:
+    std::array<Sample, N> data_{};
+    std::size_t head_ = 0;  // next slot to write
+    std::size_t tail_ = 0;  // oldest slot
+    std::size_t size_ = 0;
+};
+
+// One week of six-minute samples: 7 * 24 * 10 = 1680.
+using WeekBuffer = RingBuffer<1680>;
+
+}  // namespace quay
+
+# test_tidefit.py -- checks for tidefit.py using a synthetic ledger.
+import math
+import os
+import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
+
+import tidefit
+
+
+def synthetic_rows(days, trend_mm_per_year):
+    """Hourly heights: a 12.42 h tide, a 2 m mean and a small linear trend."""
+    start = datetime(2001, 1, 1, tzinfo=timezone.utc)
+    rows = []
+    for h in range(days * 24):
+        when = start + timedelta(hours=h)
+        years = h / (24 * 365.25)
+        tide = 1.4 * math.cos(math.radians(28.9841042 * h) + 0.7)
+        rows.append((when, 2.0 + tide + trend_mm_per_year * years / 1000.0))
+    return rows
+
+
+class FitTest(unittest.TestCase):
+    def test_recovers_trend(self):
+        rows = synthetic_rows(days=3650, trend_mm_per_year=4.0)
+        coeffs = tidefit.fit(rows)
+        self.assertAlmostEqual(coeffs[1] * 1000.0, 4.0, places=2)
+
+    def test_recovers_m2_amplitude(self):
+        rows = synthetic_rows(days=400, trend_mm_per_year=0.0)
+        coeffs = tidefit.fit(rows)
+        self.assertAlmostEqual(math.hypot(coeffs[2], coeffs[3]), 1.4, places=3)
+
+    def test_too_few_samples_is_an_error(self):
+        rows = synthetic_rows(days=1, trend_mm_per_year=0.0)[:5]
+        with self.assertRaises(ValueError):
+            tidefit.fit(rows)
+
+    def test_read_ledger_sorts_by_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "ledger.csv")
+            with open(path, "w") as fh:
+                fh.write("date,height\n2020-01-02T00:00:00,4.7\n2020-01-01T00:00:00,4.6\n")
+            rows = tidefit.read_ledger(path)
+            self.assertEqual([h for _, h in rows], [4.6, 4.7])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+2024-03-21T06:12:04Z INFO  gauge[MQ-0412] sample ok height=2418mm battery=3.71V rssi=-87dBm
+2024-03-21T06:18:04Z INFO  gauge[MQ-0412] sample ok height=2431mm battery=3.71V rssi=-88dBm
+2024-03-21T06:24:05Z WARN  gauge[MQ-0412] sample out of range height=-9999mm, discarded
+2024-03-21T06:30:04Z INFO  gauge[MQ-0412] sample ok height=2467mm battery=3.70V rssi=-86dBm
+2024-03-21T06:36:04Z ERROR uplink: TLS handshake timed out after 15000 ms (attempt 3 of 5)
+2024-03-21T06:36:19Z INFO  uplink: queued 7 samples, retry in 240 s
+2024-03-21T06:40:20Z INFO  uplink: flushed 8 samples in 412 ms
+
+Technical note 12: choosing a sampling interval
+
+A gauge that samples every six minutes captures ten readings per hour, which is enough to resolve the main semi-diurnal tide, whose period is about 12.42 hours, with roughly 75 samples per cycle. The Nyquist criterion only demands two per cycle, but it is the shorter-period phenomena, such as seiches in the harbour basin with periods of a few minutes, that determine whether the record is clean. A seiche of period 9 minutes sampled every 6 minutes is aliased to a period of 18 minutes, and the analyst sees an oscillation that does not exist in the water. The standard defence is to average many fast samples, for instance one per second for 60 seconds, before storing a single value, so that the fast component is removed before it can be folded into the slow band. This costs battery, because the radio and the pressure transducer must stay awake longer, but it is far cheaper than explaining a phantom oscillation to a committee.
+
+第四章　渡口
+
+清晨的渡口总是最安静的时候。雾从水面上升起来，把对岸的柳树洗成一团浅灰，只有船头的铜铃偶尔响一声，像是在提醒谁别睡过头。
+
+沈晓岚每天五点半起床，先去灶间烧一壶水，再给外婆的茶铺开门。她在城里念过两年书，学的是会计，毕业以后本来在一家公司做账，后来外婆摔了一跤，她就回来了。她很少跟人提起这件事，只是偶尔在算账的时候，会不自觉地用铅笔在桌角画一个小小的圆圈。
+
+“你在想什么？”外婆问。
+
+“没什么，在算这个月的茶叶钱。”
+
+“你骗人，”外婆把一粒花生扔进嘴里，“你算账的时候是皱眉头，想事情的时候是画圈。”
+
+晓岚不好意思地笑了。她把铅笔放下，望着窗外的雾，说：“阿婆，如果堤坝修好了，渡口还会有人来吗？”
+
+外婆没有马上回答。她把剥好的豆子倒进一只搪瓷盆里，水声很轻，像雨落在棉被上。过了很久，她才说：“有人，就有渡口。没有人，修得再好也是一堵墙。你看那些孩子，每天走过这条河去上学，他们不是为了桥才来的，是为了桥那头的东西。”
+
+“桥那头有什么？”
+
+“有他们以后的日子。”
+
+那天上午，方明又回来了。他把复测的结果带来，一共三页，用订书机钉得整整齐齐。晓岚接过去，一行一行看下去，发现码头石阶的沉降只有四厘米，而水位的上升比之前估计的更多，约十一厘米。她抬起头问：“所以不是地基的问题？”
+
+“主要是水的问题，”方明说，“地基也有一点，但不是主因。”
+
+“这对预算有影响吗？”
+
+“有。堤坝要抬高的幅度比原来的方案大，但不需要重做地基，所以总造价大约会低一些。我估计能省十五万左右。”
+
+晓岚在心里快速地算了一遍，脸上慢慢露出一点笑意。一百三十八万减去十五万，是一百二十三万，县里拨八十万，还差四十三万，镇上自己出得起。这是她这几个星期以来第一次觉得，这件事有可能真的办成。
+
+“方先生，”她说，“谢谢你。”
+
+“不用谢，”方明有点窘，“我只是把数字量出来而已。”
+
+“量出来就是大事，”外婆在柜台后面插嘴，眼睛仍然盯着手里的豆子，“从前我们都是凭感觉说水涨了水退了，说了一辈子，没有一个人信。现在你们拿着尺子来，大家就信了。这就是尺子的好处。”
+
+方明低头笑了笑，没有说话。他想起父亲教他测量的第一堂课：不要相信你的眼睛，要相信你重复了三遍以后还一样的东西。他当时觉得这话冷冰冰的，现在却觉得，这其实是一种很深的温柔，因为它的意思是，我愿意为了不骗你，而多做两遍。
+
+中午，雾散了。河面亮得像一块新磨的铜镜，摆渡的老周撑着篙，把第一批上学的孩子送到对岸。孩子们挤在船头，书包摞成一座小山，有人在唱一首没有人教过的歌，调子七扭八歪，却唱得很响。晓岚站在码头上，看着船一点一点变小，直到变成水面上的一粒黑点。
+
+她忽然明白，外婆说的“有人就有渡口”是什么意思。
+
+V. The report
+
+Ines wrote the report in nine days, in the room behind the rope, with the kettle on a stack of manuals and the cello case serving as a desk. It ran to forty-four pages, which she thought was too many, and the appendix of raw observations ran to another sixty, which she thought was too few. She cut the introduction twice. She put the surge in a box on page thirty-one, in plain type, under the heading "Event of 22 March (not part of the levelling programme)," and then moved it to page eleven, and then moved it back.
+
+The summary, in the end, came to six sentences:
+
+"Thirty-eight of the forty-one listed benchmarks were found and re-levelled; stud numbers 17 and 29 are missing and number 41 was never installed. The mean height of the surviving studs has fallen by 3.9 mm relative to the 1962 adjustment, within the range expected from settlement of a masonry quay on silt. Relative to the old post, the highest observed water level has risen by 25 cm in 60 years, a trend of 4.2 mm per year with a 95 percent interval of plus or minus 0.9. The tide-gauge series for sensor MQ-0412 contains an unapplied offset of minus 14 mm from 2 November. The ledger kept at the harbour office is a reliable record and should be preserved. We recommend that the county adopt the old post's position, not stud 41, as the local datum."
+
+Rahul read it twice and wrote back a single line: "Perfect. Please don't change anything." Ewa sent a longer message, mostly about the offset, which ended, "I am embarrassed and grateful in roughly equal measure." Dagny, who was not on the distribution list, somehow obtained a copy anyway and pinned page one to the wall of the chandlery beside the tide table and a faded photograph of a trawler.
+
+On her last morning, Ines packed the theodolite into its case with great care, folding a woollen sock into the empty corner where the cello's endpin would once have rested. She left the key on its cork on the counter. Dagny looked at it, looked at her, and said, "You can keep it. It floats."
+
+"I'm not sure I'll need to open anything," said Ines.
+
+"You will." Dagny returned to her crossword. "Seven letters, 'what a surveyor never admits to.' Starts with D."
+
+"Doubt," said Ines.
+
+"That's five."
+
+"Then I don't know."
+
+"Neither do I," Dagny said, and wrote something in anyway.
+
+At the end of the quay, Tobias was waiting with his bucket. He held it out in both hands and lifted the lid. Inside, on the wet newspaper, sat a fourth crab, tiny and pale, with all of its claws.
+
+"This is a new one," he said. "I'm not allowed to name him. But you can, if you want. Because you found the hole."
+
+Ines crouched and regarded the crab with the seriousness the occasion demanded. It raised both claws at her, a gesture that could have meant a threat or a greeting.
+
+"Datum," she said.
+
+"That's a stupid name."
+
+"It's the best one I have."
+
+"Okay." Tobias put the lid back on, carefully, as if closing a very small door. "I'll tell Mum. She'll write it in the ledger."
+
+Quarterly summary, Marrowick harbour office, first quarter
+
+item                            budget (GBP)   actual (GBP)   variance
+survey firm (levelling)         9,750          11,700         -1,950
+ledger photography              1,200          1,090          +110
+report production               900            845            +55
+gauge recalibration             2,400          2,310          +90
+contingency                     1,630          0              +1,630
+total                           15,880         15,945         -65
+
+Note: the survey firm figure includes VAT at 20 percent (1,950). The variance of minus 65 pounds on the total is carried to the second quarter and will be absorbed by the ledger conservation line, which is currently underspent.

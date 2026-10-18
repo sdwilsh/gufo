@@ -23,6 +23,7 @@
 #include <utility>
 
 #include "src/cli/serve/component_text_cache.hpp"
+#include "src/cli/serve/ling_chat_messages.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
@@ -41,6 +42,12 @@
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/ling_3_flash/chat_template.hpp"
+#include "src/models/ling_3_flash/continuation_adapter.hpp"
+#include "src/models/ling_3_flash/device_probe_latch.hpp"
+#include "src/models/ling_3_flash/engine.hpp"
+#include "src/models/ling_3_flash/kernels/rocm/executor.hpp"
+#include "src/models/ling_3_flash/weights.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
@@ -914,21 +921,22 @@ public:
   }
 
   [[nodiscard]] bool DeviceUsable() const override {
+    return ProbeDevice() != DeviceProbeStatus::kLost;
+  }
+
+protected:
+  /// The bounded probe of DeviceUsable(): kUsable or kLost when conclusive,
+  /// kPending when the 5 s bound passed first (reported as usable by
+  /// DeviceUsable(), but an inconclusive result).
+  [[nodiscard]] DeviceProbeStatus ProbeDevice() const {
     constexpr auto kTimeout = std::chrono::seconds(5);
-    const auto deadline = Clock::now() + kTimeout;
-    for (;;) {
-      const auto status = PollDevice();
-      if (status == DeviceProbeStatus::kUsable)
-        return true;
-      if (status == DeviceProbeStatus::kLost)
-        return false;
-      if (Clock::now() >= deadline) {
-        Logger::Warn("scheduler", "event=device_probe_timeout timeout_s=" +
-                                      std::to_string(kTimeout.count()));
-        return true;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+    const auto status = BoundedDeviceProbe(
+        [this] { return PollDevice(); },
+        std::chrono::duration_cast<std::chrono::milliseconds>(kTimeout));
+    if (status == DeviceProbeStatus::kPending)
+      Logger::Warn("scheduler", "event=device_probe_timeout timeout_s=" +
+                                    std::to_string(kTimeout.count()));
+    return status;
   }
 
 private:
@@ -3100,6 +3108,835 @@ private:
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
   cache::Identity component_identity_;
 };
+
+// Ling-3.0-flash: one device session per component-cache slot
+// (src/models/ling_3_flash/continuation_adapter.hpp). Checkpoints hold the
+// recurrent state and logits as private components and the MLA/MTP latent rows
+// as shared append rows, restorable into any slot, so the runner takes part in
+// the RAM cache, the disk cache, shared prefix learning and forking like
+// Flash-Next. The WS12 expanded K/V cache is derived from the latent rows and
+// is never captured.
+constexpr std::string_view kLingStateAbi = "ling-3-flash-rocm-session-v2";
+// Sessions of an MTP model also carry the MTP block's latent cache and hidden
+// carry (their snapshots include them), a different state ABI.
+constexpr std::string_view kLingMtpStateAbi =
+    "ling-3-flash-rocm-session-mtp-v1";
+constexpr std::string_view kLingModelId = "Ling-3.0-flash";
+
+using LingModel = models::ling_3_flash::Model;
+using LingSession = models::ling_3_flash::Session;
+
+std::vector<std::uint8_t> LingCompatibilityIdentity(
+    std::string_view artifact_fingerprint, std::uint32_t max_context,
+    bool mtp) {
+  if (!IsSha256Hex(artifact_fingerprint)) {
+    throw std::invalid_argument(
+        "Ling-3.0-flash disk cache requires an artifact fingerprint");
+  }
+  namespace ling = models::ling_3_flash;
+  std::ostringstream identity;
+  identity << "schema=gufo-text-continuation-v2\n"
+           << "model_kind=ling-3-flash\n"
+           << "artifact_id=" << core::kGgufIdentityScheme << ':'
+           << artifact_fingerprint << '\n'
+           << "tokenizer=embedded-in-artifact\n"
+           << "chat_template=" << ling::ChatTemplateId() << '\n'
+           << "chat_template_reference_sha256="
+           << ling::ArtifactTemplateSha256() << '\n'
+           << "state_abi=" << (mtp ? kLingMtpStateAbi : kLingStateAbi) << '\n'
+           << "payload_layout=ling-session-snapshot-v"
+           << ling::kSnapshotPayloadVersion
+           << '\n'
+           // Cached frontiers depend on the compiled numeric families.
+           << "numerics=" << ling::kNumericsId << '\n'
+           << "context_tokens=" << max_context << '\n'
+           << "position_policy=absolute-v1\n"
+           << "adapters=none\n";
+  if (mtp) {
+    // The MTP block is part of the artifact; the identity records that its
+    // cache rows and hidden carry are in the snapshots.
+    identity << "draft_backend=ling-mtp-v1\n";
+  }
+  const std::string canonical = identity.str();
+  return {canonical.begin(), canonical.end()};
+}
+
+class LingTextRunnerState final : public TextRunnerState {
+public:
+  /// Bound to a component-cache slot, which owns the session.
+  LingTextRunnerState(LingSession& session, cache::Adapter& adapter,
+                      cache::Slot& slot)
+      : session_(&session), adapter_(&adapter), slot_(&slot) {}
+
+  // No device call of its own: invalidation follows failed work units, and
+  // after a GPU loss any device cleanup can block forever before the
+  // scheduler has classified the failure. The slot releases its borrowed rows
+  // (once a HIP call failed the adapter retires them instead of copying) and
+  // the next prefill zeroes the recurrent state.
+  void Invalidate() noexcept override {
+    (void)adapter_->Invalidate(*slot_);
+    position_ = 0;
+  }
+  [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
+      const noexcept override {
+    return {.per_request_state_bytes = session_->AllocatedBytes(),
+            .temporary_scratch_bytes = 0};
+  }
+
+  [[nodiscard]] LingSession& session() const { return *session_; }
+  [[nodiscard]] std::size_t position() const noexcept { return position_; }
+  void set_position(std::size_t position) noexcept { position_ = position; }
+
+private:
+  LingSession* session_{nullptr};
+  cache::Adapter* adapter_{nullptr};
+  cache::Slot* slot_{nullptr};
+  std::size_t position_{0};
+};
+
+LingTextRunnerState& RequireLingState(TextRunnerState& state) {
+  auto* ling = dynamic_cast<LingTextRunnerState*>(&state);
+  if (ling == nullptr) {
+    throw std::logic_error("text runner state is not Ling-3.0-flash");
+  }
+  return *ling;
+}
+
+const LingTextRunnerState& RequireLingState(const TextRunnerState& state) {
+  const auto* ling = dynamic_cast<const LingTextRunnerState*>(&state);
+  if (ling == nullptr) {
+    throw std::logic_error("text runner state is not Ling-3.0-flash");
+  }
+  return *ling;
+}
+
+std::int32_t LingEngineToken(TextRunnerToken token) {
+  if (token >
+      static_cast<TextRunnerToken>(std::numeric_limits<std::int32_t>::max())) {
+    throw std::invalid_argument("Ling-3.0-flash token ID exceeds engine range");
+  }
+  return static_cast<std::int32_t>(token);
+}
+
+class LingTextRunner final : public HipTextModelRunner {
+public:
+  LingTextRunner(std::shared_ptr<LingModel> model, std::uint32_t max_context,
+                 bool use_mtp, std::uint32_t max_draft_tokens,
+                 std::size_t session_count,
+                 std::string artifact_fingerprint = {})
+      : model_(std::move(model)),
+        max_context_(max_context),
+        use_mtp_(use_mtp),
+        max_draft_tokens_(max_draft_tokens),
+        max_batch_width_(std::min<std::size_t>(
+            std::max<std::size_t>(session_count, 1), model_->BatchRowLimit())) {
+    if (!artifact_fingerprint.empty()) {
+      persistence_ = TextRunnerPersistenceDescriptor{
+          .compatibility_identity = LingCompatibilityIdentity(
+              artifact_fingerprint, max_context_, use_mtp_),
+          .payload_version = models::ling_3_flash::kSnapshotPayloadVersion,
+      };
+      component_identity_ = persistence_->compatibility_identity;
+    } else {
+      // RAM-only caching needs no file fingerprint: the immutable loaded
+      // model instance is an exact process-local identity. Durable caches
+      // require the validated artifact fingerprint above.
+      std::ostringstream identity;
+      identity << "schema=gufo-process-text-continuation-v1\n"
+               << "model_kind=ling-3-flash\n"
+               << "model_instance=" << model_.get() << '\n'
+               << "context_tokens=" << max_context_ << '\n'
+               << "mtp=" << use_mtp_ << '\n';
+      const auto canonical = identity.str();
+      component_identity_.assign(canonical.begin(), canonical.end());
+    }
+  }
+
+  // Component cache (src/cache): one adapter-owned session per slot.
+  [[nodiscard]] bool UsesComponentCache() const override { return true; }
+  [[nodiscard]] std::unique_ptr<ComponentCacheResources>
+  CreateComponentCacheResources(cache::ResourceLedger& ledger,
+                                std::size_t ram) const override;
+  [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
+      cache::Adapter& adapter, cache::Slot& slot) const override {
+    auto& ling =
+        dynamic_cast<models::ling_3_flash::ContinuationAdapter&>(adapter);
+    return std::make_unique<LingTextRunnerState>(ling.GetSession(slot), adapter,
+                                                 slot);
+  }
+  void ReconcileComponentState(TextRunnerState& state,
+                               std::size_t position) const override {
+    RequireLingState(state).set_position(position);
+  }
+  // The probe drives the adapter's device-suspect latch: a lost device stops
+  // every further cache transfer (borrowers are retired, release cannot wait
+  // on it), and a probe that reports usable ends the latch, so an injected or
+  // transient HIP failure does not keep cache transfers refused. A probe
+  // timeout is inconclusive: it leaves the latch as it is, so a hung device
+  // keeps refusing transfers (a release would otherwise block on it).
+  [[nodiscard]] bool DeviceUsable() const override {
+    return models::ling_3_flash::ApplyDeviceProbe(ProbeDevice());
+  }
+
+  [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
+    return {
+        .model_id = std::string(kLingModelId),
+        .state_abi = std::string(use_mtp_ ? kLingMtpStateAbi : kLingStateAbi),
+        .max_context = max_context_,
+        .capabilities =
+            TextRunnerCapabilities{
+                .incremental_prefill = true,
+                .snapshot = true,
+                .fork = true,
+                .final_token_advance_required = false,
+                .incremental_text_is_exact = true,
+                .multi_token_decode = use_mtp_,
+                .batched_multi_token_decode = use_mtp_ && max_batch_width_ > 1,
+                .batched_multi_token_decode_max_width =
+                    use_mtp_ ? max_batch_width_ : 0,
+                .prefix_reuse = true,
+                .min_checkpoint_tail_tokens =
+                    models::ling_3_flash::kSmallBatchMaxTokens + 1,
+                .min_snapshot_tokens = 128,
+            },
+        .persistence = persistence_,
+    };
+  }
+
+  [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    std::optional<std::size_t> capacity;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess)
+      capacity = free_bytes;
+    return {
+        // The whole executor arena (activations, kernel scratch and the MTP
+        // rollback checkpoints) is allocated at model load and is resident
+        // for the process lifetime, so it is reported with the weights. The
+        // state capacity below is the free device memory after that load, so
+        // it is not claimed a second time.
+        .resident_weights_bytes =
+            model_->ResidentBytes() + model_->ScratchBytes(),
+        .state_capacity_bytes = capacity,
+        .per_request_state_bytes =
+            LingModel::SessionBytes(max_context_, use_mtp_),
+        .temporary_scratch_bytes = 0,
+        // Snapshots are host copies (about 75 MiB of recurrent state plus
+        // 8 KiB per token), outside the device state pool.
+        .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
+        .retained_snapshot_ceiling_bytes = HostSnapshotCeilingBytes(),
+        .requires_device_runtime_lock = true,
+    };
+  }
+
+  /// Serial, and batched decode of 2..min(8, sessions, row limit) sessions:
+  /// AR steps (AdvanceBatch, Session::EvaluateBatch) or MTP cycles
+  /// (DecodeBatch, Session::DecodeBatch). One ready request always runs
+  /// serially, so single-user decoding keeps its graph-replayed path.
+  [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
+    std::vector<TextExecutionPlan> plans{
+        {.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
+    for (std::size_t width = 2; width <= max_batch_width_; ++width) {
+      plans.push_back(
+          {.kind = TextExecutionPlanKind::kBatched, .physical_width = width});
+    }
+    return plans;
+  }
+
+  [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary>
+  BuildConstraintVocabulary() const override {
+    return std::make_shared<const sampling::ConstraintVocabulary>(
+        model_->VocabSize(), [this](std::uint32_t id) {
+          const auto token = static_cast<std::int32_t>(id);
+          return sampling::ConstraintVocabulary::Piece{
+              model_->TokenText(token), model_->IsStopToken(token)};
+        });
+  }
+
+  [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
+      std::string_view text) const override {
+    const auto ids = model_->tokenizer().Encode(text);
+    return {ids.begin(), ids.end()};
+  }
+
+  [[nodiscard]] LingRendering Render(
+      const ChatRequest& request,
+      const std::vector<tokenization::ChatMessage>& chat_messages) const {
+    namespace ling = models::ling_3_flash;
+    const auto messages = ToLingMessages(chat_messages);
+    std::vector<ling::ChatTool> tools;
+    if (request.tool_choice != ChatRequest::ToolChoice::kNone) {
+      for (const auto& tool : request.tools) {
+        if (tool.definition_json.empty()) {
+          throw std::invalid_argument(
+              "Ling-3.0-flash tools need their complete definition");
+        }
+        tools.push_back({.definition_json = tool.definition_json});
+      }
+    }
+    // Only the template's own markup may become control tokens; message
+    // bodies, tool results and arguments stay text even if they spell
+    // `<|role_end|>` or `<role>SYSTEM</role>`.
+    LingRendering rendering;
+    auto options = ChatOptions(request);
+    options.literal_spans = &rendering.literal;
+    options.stable_prefix_bytes = &rendering.stable_prefix_bytes;
+    rendering.text = ling::RenderChat(messages, tools, options);
+    return rendering;
+  }
+
+  [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
+      const ChatRequest& request) const override {
+    const auto rendering = Render(request, request.messages);
+    const auto ids =
+        model_->tokenizer().Encode(rendering.text, true, rendering.literal);
+    if (ids.empty())
+      return std::nullopt;
+    return std::vector<TextRunnerToken>(ids.begin(), ids.end());
+  }
+
+  [[nodiscard]] TextGenerationBackend::ToolCallSyntax ToolSyntax()
+      const override {
+    return TextGenerationBackend::ToolCallSyntax::kBailing;
+  }
+
+  sampling::JsonConstraint::ToolFormat ToolFormat() const override {
+    return sampling::JsonConstraint::ToolFormat::kBailing;
+  }
+
+  [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
+      const ChatRequest& request) const override {
+    auto prepared = TextModelRunner::PreparePrompt(request);
+    if (prepared) {
+      prepared->cache_prefix_tokens = LingCacheBoundary(
+          model_->tokenizer(), request.messages,
+          [&](const std::vector<tokenization::ChatMessage>& messages) {
+            return Render(request, messages);
+          },
+          prepared->tokens);
+    }
+    return prepared;
+  }
+
+  [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
+      const ChatRequest& request) const override {
+    return ChatOptions(request).enable_thinking.value_or(true)
+               ? TextGenerationBackend::InitialOutputState::kReasoning
+               : TextGenerationBackend::InitialOutputState::kContent;
+  }
+
+  [[nodiscard]] std::string Decode(
+      std::span<const TextRunnerToken> tokens) const override {
+    std::vector<models::ling_3_flash::TokenId> ids(tokens.begin(),
+                                                   tokens.end());
+    return model_->tokenizer().Decode(ids);
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
+    throw std::logic_error(
+        "Ling-3.0-flash execution slots are owned by the component cache");
+  }
+
+  void PreparePrefixReuse(
+      TextRunnerState& state,
+      std::span<const TextRunnerToken> prefix) const override {
+    // A restored or live state must hold exactly the reused prefix: recurrent
+    // state cannot be cut back, so a mismatch here would be silent corruption.
+    const auto& ling = RequireLingState(state);
+    // Request-local draft-length history must not depend on cache reuse.
+    ling.session().ResetDraftPolicy();
+    const auto held = ling.session().Tokens();
+    if (ling.position() != prefix.size() || held.size() != prefix.size() ||
+        !std::ranges::equal(held, prefix,
+                            [](std::int32_t a, TextRunnerToken b) {
+                              return static_cast<TextRunnerToken>(a) == b;
+                            })) {
+      throw std::logic_error(
+          "Ling-3.0-flash reused prefix does not match checkpoint");
+    }
+  }
+
+  [[nodiscard]] TextPrefillStep Prefill(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t max_input_tokens) const override {
+    auto& ling = RequireLingState(state);
+    if (offset != ling.position()) {
+      throw std::logic_error(
+          "Ling-3.0-flash prefill offset does not match retained state");
+    }
+    if (offset >= prompt.size() || max_input_tokens == 0) {
+      throw std::logic_error("Ling-3.0-flash prefill has no remaining input");
+    }
+    // Numeric families (engine.hpp): `prompt` ends at the next cache boundary
+    // or the prompt end; keep checkpoints out of the small-batch family.
+    const std::size_t consumed = models::ling_3_flash::PrefillChunkTokens(
+        prompt.size() - offset, max_input_tokens, model_->PrefillCapacity());
+    std::vector<std::int32_t> chunk;
+    chunk.reserve(consumed);
+    for (const auto token : prompt.subspan(offset, consumed))
+      chunk.push_back(LingEngineToken(token));
+    std::string error;
+    if (!ling.session().Feed(chunk, {}, &error)) {
+      ling.Invalidate();
+      throw std::runtime_error("Ling-3.0-flash prefill failed: " + error);
+    }
+    ling.set_position(offset + consumed);
+    return {.consumed_tokens = consumed,
+            .decode_ready = offset + consumed == prompt.size()};
+  }
+
+  [[nodiscard]] TextDecodeSelection SelectNext(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    auto& ling = RequireLingState(state);
+    if (ling.position() >= max_context_)
+      return {.stop = true, .piece = {}};
+    const auto logits = ling.session().Logits();
+    if (logits.empty()) {
+      throw std::runtime_error("Ling-3.0-flash token selection has no logits");
+    }
+    const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
+    if (ling.stop_at_eos() && model_->IsStopToken(token))
+      return {.stop = true, .token = 0, .piece = {}};
+    return {.stop = false,
+            .token = static_cast<TextRunnerToken>(token),
+            .piece = model_->TokenText(token)};
+  }
+
+  void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+    auto& ling = RequireLingState(state);
+    std::string error;
+    if (!ling.session().Evaluate(LingEngineToken(token), &error)) {
+      ling.Invalidate();
+      throw std::runtime_error("Ling-3.0-flash decode failed: " + error);
+    }
+    ling.set_position(ling.position() + 1);
+  }
+
+  /// Advance of several requests in one batched forward; every lane ends as
+  /// its own Advance would (batch invariance, engine.hpp).
+  void AdvanceBatch(
+      std::span<const TextRunnerAdvance> advances) const override {
+    std::vector<LingTextRunnerState*> states;
+    std::vector<TextRunnerToken> tokens;
+    states.reserve(advances.size());
+    tokens.reserve(advances.size());
+    for (const auto& advance : advances) {
+      states.push_back(&RequireLingState(advance.state.get()));
+      tokens.push_back(advance.token);
+    }
+    const auto failures = AdvanceLanes(states, tokens);
+    std::exception_ptr unreported;
+    for (std::size_t i = 0; i < advances.size(); ++i) {
+      if (!failures[i])
+        continue;
+      if (advances[i].failure != nullptr)
+        *advances[i].failure = failures[i];
+      else if (!unreported)
+        unreported = failures[i];
+    }
+    if (unreported)
+      std::rethrow_exception(unreported);
+  }
+
+  /// Speculative steps of several requests (Session::DecodeBatch): shared
+  /// draft and verify forwards, each lane exactly as its own DecodeStep.
+  /// Plans and timings are per lane: the widest forward it shared and the
+  /// time of the steps it took part in (TextDecodeStep::decode_ms), so they
+  /// read like a serial request's. A lane the batch could not take runs alone.
+  [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
+      std::span<const TextRunnerDecode> decodes) const override {
+    if (!use_mtp_ || decodes.size() < 2) {
+      return TextModelRunner::DecodeBatch(decodes);
+    }
+    std::vector<TextDecodeStep> steps(decodes.size());
+    std::vector<LingTextRunnerState*> states(decodes.size(), nullptr);
+    std::vector<LingSession::DraftStats> before(decodes.size());
+    // The pool accepts the returned tokens once; each lane works on a copy
+    // and only its draw state is published (as DecodeStep).
+    std::vector<sampling::SamplerState> working;
+    working.reserve(decodes.size());
+    std::vector<LingSession::BatchDecode> lanes;
+    std::vector<std::size_t> index;
+    for (std::size_t i = 0; i < decodes.size(); ++i) {
+      working.push_back(decodes[i].sampler.get());
+      try {
+        auto& ling = RequireLingState(decodes[i].state.get());
+        states[i] = &ling;
+        if (decodes[i].max_tokens == 0) {
+          throw std::invalid_argument(
+              "Ling-3.0-flash MTP decode budget must be at least one token");
+        }
+        if (ling.position() >= max_context_) {
+          steps[i] = {.selections = {}, .stop = true};
+          continue;
+        }
+        before[i] = ling.session().Statistics();
+        LingSession::BatchDecode lane;
+        lane.session = &ling.session();
+        lane.max_tokens = std::min<std::size_t>(
+            decodes[i].max_tokens, models::ling_3_flash::kMaxVerifyTokens);
+        lane.sampler = &working[i];
+        lane.stop_at_eos = ling.stop_at_eos();
+        lanes.push_back(std::move(lane));
+        index.push_back(i);
+      } catch (...) {
+        steps[i] = {};
+        steps[i].failure = std::current_exception();
+      }
+    }
+    LingSession::DecodeBatch(lanes);
+    for (std::size_t j = 0; j < lanes.size(); ++j) {
+      const std::size_t i = index[j];
+      auto& ling = *states[i];
+      const auto& lane = lanes[j];
+      if (lane.deferred) {
+        // Alone, timed like a batched lane: the batch's work it took part
+        // in plus its own step.
+        const auto start = std::chrono::steady_clock::now();
+        try {
+          steps[i] =
+              DecodeStep(ling, decodes[i].max_tokens, decodes[i].sampler.get());
+          steps[i].decode_ms =
+              lane.ms + std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
+        } catch (...) {
+          steps[i] = {};
+          steps[i].failure = std::current_exception();
+        }
+        continue;
+      }
+      if (!lane.ok) {
+        ling.Invalidate();
+        steps[i] = {};
+        steps[i].failure = std::make_exception_ptr(std::runtime_error(
+            "Ling-3.0-flash MTP decode failed: " + lane.error));
+        continue;
+      }
+      decodes[i].sampler.get().CopyDrawStateFrom(working[i]);
+      TextDecodeStep& step = steps[i];
+      step.stop = lane.result.stop;
+      for (const std::int32_t token : lane.result.tokens) {
+        step.selections.push_back({.stop = false,
+                                   .token = static_cast<TextRunnerToken>(token),
+                                   .piece = model_->TokenText(token)});
+      }
+      ling.set_position(ling.session().Position());
+      const auto after = ling.session().Statistics();
+      step.draft_rounds = after.cycles - before[i].cycles;
+      step.draft_tokens = after.drafted - before[i].drafted;
+      step.draft_accepted_tokens = after.accepted - before[i].accepted;
+      step.draft_copied_tokens = after.copied - before[i].copied;
+      step.draft_copied_accepted_tokens =
+          after.copied_accepted - before[i].copied_accepted;
+      step.execution_plan = {.kind = lane.width > 1
+                                         ? TextExecutionPlanKind::kBatched
+                                         : TextExecutionPlanKind::kSerial,
+                             .physical_width = lane.width};
+      step.decode_ms = lane.ms;
+    }
+    return steps;
+  }
+
+  [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    return SelectNext(state, sampler);
+  }
+
+  /// Speculative step (MTP): up to `max_tokens` committed tokens from one
+  /// draft-and-verify cycle (Session::DecodeStep). Plain decoding when MTP is
+  /// off or one token is wanted.
+  [[nodiscard]] TextDecodeStep DecodeStep(
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler) const override {
+    if (!use_mtp_ || max_tokens == 1) {
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    if (max_tokens == 0) {
+      throw std::invalid_argument(
+          "Ling-3.0-flash MTP decode budget must be at least one token");
+    }
+    auto& ling = RequireLingState(state);
+    if (ling.position() >= max_context_) {
+      return {.selections = {}, .stop = true};
+    }
+    const auto before = ling.session().Statistics();
+    // The pool accepts the returned tokens once; the step works on a copy and
+    // only its draw state (RNG, deferred residual draw) is published.
+    sampling::SamplerState working_sampler = sampler;
+    LingSession::DecodeResult decoded;
+    std::string error;
+    const std::size_t budget = std::min<std::size_t>(
+        max_tokens, models::ling_3_flash::kMaxVerifyTokens);
+    if (!ling.session().DecodeStep(budget, working_sampler, &decoded, &error,
+                                   ling.stop_at_eos())) {
+      ling.Invalidate();
+      throw std::runtime_error("Ling-3.0-flash MTP decode failed: " + error);
+    }
+    sampler.CopyDrawStateFrom(working_sampler);
+    TextDecodeStep step;
+    step.stop = decoded.stop;
+    step.selections.reserve(decoded.tokens.size());
+    for (const std::int32_t token : decoded.tokens) {
+      step.selections.push_back({.stop = false,
+                                 .token = static_cast<TextRunnerToken>(token),
+                                 .piece = model_->TokenText(token)});
+    }
+    ling.set_position(ling.session().Position());
+    const auto after = ling.session().Statistics();
+    step.draft_rounds = after.cycles - before.cycles;
+    step.draft_tokens = after.drafted - before.drafted;
+    step.draft_accepted_tokens = after.accepted - before.accepted;
+    step.draft_copied_tokens = after.copied - before.copied;
+    step.draft_copied_accepted_tokens =
+        after.copied_accepted - before.copied_accepted;
+    return step;
+  }
+
+  [[nodiscard]] std::size_t CheckpointPosition(
+      const TextRunnerState& state) const override {
+    return RequireLingState(state).position();
+  }
+
+private:
+  /// Advance of each state by its token in one Session::EvaluateBatch pass.
+  /// Returns one failure per lane (null on success); a failed lane's state is
+  /// invalidated, as a failed Advance leaves it. A lane the batch could not
+  /// take (deferred, untouched) advances alone, as it would without batching.
+  std::vector<std::exception_ptr> AdvanceLanes(
+      std::span<LingTextRunnerState* const> states,
+      std::span<const TextRunnerToken> tokens) const {
+    std::vector<std::exception_ptr> failures(states.size());
+    std::vector<LingSession::BatchLane> lanes;
+    std::vector<std::size_t> index;
+    lanes.reserve(states.size());
+    index.reserve(states.size());
+    for (std::size_t i = 0; i < states.size(); ++i) {
+      try {
+        LingSession::BatchLane lane;
+        lane.session = &states[i]->session();
+        lane.token = LingEngineToken(tokens[i]);
+        lanes.push_back(std::move(lane));
+        index.push_back(i);
+      } catch (...) {
+        failures[i] = std::current_exception();
+      }
+    }
+    LingSession::EvaluateBatch(lanes);
+    for (std::size_t j = 0; j < lanes.size(); ++j) {
+      LingTextRunnerState& ling = *states[index[j]];
+      if (lanes[j].ok) {
+        ling.set_position(ling.position() + 1);
+        continue;
+      }
+      if (lanes[j].deferred) {
+        try {
+          Advance(ling, tokens[index[j]]);
+        } catch (...) {
+          failures[index[j]] = std::current_exception();
+        }
+        continue;
+      }
+      ling.Invalidate();
+      failures[index[j]] = std::make_exception_ptr(std::runtime_error(
+          "Ling-3.0-flash decode failed: " + lanes[j].error));
+    }
+    return failures;
+  }
+
+  // The Bailing V3 template knows thinking on/off only; the default is on.
+  static models::ling_3_flash::ChatTemplateOptions ChatOptions(
+      const ChatRequest& request) {
+    models::ling_3_flash::ChatTemplateOptions options;
+    options.enable_thinking = request.reasoning.enabled;
+    return options;
+  }
+
+  std::shared_ptr<LingModel> model_;
+  std::uint32_t max_context_;
+  bool use_mtp_;
+  std::uint32_t max_draft_tokens_;
+  std::size_t max_batch_width_;
+  std::optional<TextRunnerPersistenceDescriptor> persistence_;
+  cache::Identity component_identity_;
+};
+
+// The Flash-Next provider (committed 64 KiB shared pages, pooled transfer
+// streams, fixed pinned staging), with Ling's adapter and backing plan. To be
+// replaced by the shared CreateHipComponentCacheResources helper of #540 once
+// it lands.
+std::unique_ptr<ComponentCacheResources>
+LingTextRunner::CreateComponentCacheResources(cache::ResourceLedger& ledger,
+                                              std::size_t ram) const {
+  struct Backing {
+    hip::TransferPool streams{64};
+    std::unique_ptr<hip::CommittedBackingPool> pool;
+    std::map<std::uint32_t, std::size_t> component_classes;
+  };
+  auto result = std::make_unique<ComponentCacheResources>();
+  auto adapter = std::make_unique<models::ling_3_flash::ContinuationAdapter>(
+      model_, max_context_, max_draft_tokens_, component_identity_);
+  (void)ram;  // Backing sizing follows actual slot allocation below.
+  result->adapter = std::move(adapter);
+  auto backing = std::make_shared<Backing>();
+  result->transfer_batch_size = 16;
+  const auto rounded = [](std::size_t bytes) {
+    return (bytes + 4095) / 4096 * 4096;
+  };
+  for (const auto& d : result->adapter->Components()) {
+    const auto bytes = rounded(d.kind == cache::ComponentKind::kPrivateState
+                                   ? d.state_bytes
+                                   : d.row_bytes * d.rows_per_chunk);
+    backing->component_classes.emplace(d.id.value, bytes);
+  }
+  // The remainder belongs to index, histories, disk catalog and queue
+  // metadata. The pools charge their own per-block allocator headroom.
+  result->commit_backing = [backing, &ledger, adapter = result->adapter.get(),
+                            width = static_cast<std::uint32_t>(
+                                max_batch_width_)](std::size_t budget) {
+    const auto plan =
+        static_cast<models::ling_3_flash::ContinuationAdapter*>(adapter)
+            ->BackingPlan(budget, width);
+    if (plan.size() != 1)
+      throw std::invalid_argument("insufficient component backing budget");
+    const auto& allocation = plan.front();
+    // Pages commit as captures need them. A payload cannot span segments,
+    // so equal segments of about 1 GiB bound stranded edge space and fit at
+    // least two payloads of the largest component. Completed append rows
+    // prepare more backing; private and tail copies commit only when needed.
+    // Pinning ahead after a final private copy can delay decoder launches.
+    // Growth stops when the host keeps less than its reserve.
+    std::size_t largest = 0;
+    for (const auto& [id, bytes] : backing->component_classes)
+      largest = std::max(largest, bytes);
+    const auto block = allocation.block_bytes;
+    const auto target =
+        std::max<std::size_t>(std::size_t{1} << 30, 2 * largest) / block;
+    const auto parts =
+        std::max<std::size_t>((allocation.blocks + target - 1) / target, 1);
+    const auto segment = (allocation.blocks + parts - 1) / parts * block;
+    struct Limited {
+      std::mutex mutex;
+      std::chrono::steady_clock::time_point refused;
+      bool active{};
+    };
+    backing->pool = std::make_unique<hip::CommittedBackingPool>(
+        ledger,
+        hip::BackingPoolConfig{
+            allocation.blocks * allocation.block_bytes +
+                allocation.metadata_bytes,
+            allocation.block_bytes, allocation.metadata_bytes, segment,
+            [limited = std::make_shared<Limited>()](std::size_t bytes) {
+              const std::lock_guard lock(limited->mutex);
+              const auto now = std::chrono::steady_clock::now();
+              // Pressure retries ask once per capture; recheck at most
+              // once a second while the host is short.
+              if (limited->active &&
+                  now - limited->refused < std::chrono::seconds(1))
+                return false;
+              const auto ceiling = HostSnapshotCeilingBytes();
+              // Pinned host pages come out of the same device heap that
+              // session and scratch allocations draw on; keep its dispatch
+              // reserve so they do not fall back to managed memory.
+              std::size_t heap_free = 0, heap_total = 0;
+              const bool heap_fits =
+                  hipMemGetInfo(&heap_free, &heap_total) == hipSuccess &&
+                  hip::HeapFitsAboveReserve(heap_free, bytes);
+              if (ceiling >= bytes && heap_fits) {
+                limited->active = false;
+                return true;
+              }
+              if (!limited->active)
+                Logger::Warn(
+                    "cache",
+                    "schema=component-cache-v1 "
+                    "event=backing_limited reason=" +
+                        std::string(heap_fits ? "host_reserve "
+                                              : "device_heap_reserve ") +
+                        "segment_bytes=" + std::to_string(bytes) +
+                        " host_headroom_bytes=" + std::to_string(ceiling) +
+                        " device_heap_free_bytes=" + std::to_string(heap_free));
+              limited->active = true;
+              limited->refused = now;
+              return false;
+            }});
+    // Prepare a bounded reserve before readiness. The first shared-prefix
+    // capture needs more than one segment; preparing both avoids moving
+    // registration onto that request's capture or decode path.
+    backing->pool->GrowAhead(2);
+    backing->pool->WaitForGrowth();
+  };
+  result->prepare_prefill = [backing] { backing->pool->GrowAhead(2); };
+  result->can_capture = [backing](auto payloads) {
+    return backing->pool->CanFit(payloads);
+  };
+  result->owner = backing;
+  result->stream = [backing]() -> std::unique_ptr<cache::Stream> {
+    return backing->streams.TryAcquire();
+  };
+  result->allocate = [backing](const cache::PayloadRequest& request) {
+    // Bound the logical capture, then assign whole shared backing pages.
+    const auto capacity =
+        backing->component_classes.at(request.component.value);
+    if (request.bytes > capacity)
+      throw std::logic_error("component capture exceeds its backing class");
+    const auto category =
+        request.category == cache::ResourceCategory::kBackingAssigned
+            ? cache::ResourceCategory::kBackingAssigned
+            : request.category;
+    const auto segments = backing->pool->PageCommitAllocations();
+    const auto started = std::chrono::steady_clock::now();
+    auto block = backing->pool->TryAcquire(category, request.bytes);
+    if (backing->pool->PageCommitAllocations() != segments)
+      Logger::Info(
+          "cache",
+          "schema=component-cache-v1 event=backing_grown committed_bytes=" +
+              std::to_string(backing->pool->CommittedBytes()) + " segments=" +
+              std::to_string(backing->pool->PageCommitAllocations()) +
+              " acquire_ms=" +
+              std::to_string(std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - started)
+                                 .count()));
+    if (!block)
+      throw cache::ResourceExhausted();
+    // Completed append rows prepare backing for subsequent prefill/guard
+    // work. Final private-state and partial-tail copies must not start
+    // speculative pinning that delays the next decode step.
+    if (request.category == cache::ResourceCategory::kBackingAssigned)
+      backing->pool->GrowAhead();
+    auto owner = std::make_shared<hip::BackingBlock>(std::move(*block));
+    return ComponentCaptureBuffer{
+        owner->Bytes(),
+        [owner] {
+          owner->Convert();
+          return std::move(*owner).TakePayload();
+        },
+        backing->pool.get(),
+        [owner, request](cache::SlotLease& lease, auto source) {
+          return cache::Payload::Borrowed(
+              std::move(*owner).Borrow(lease, request.component, request.first,
+                                       request.end, request.bytes, source));
+        }};
+  };
+  result->staging = [](std::size_t bytes) {
+    void* data = nullptr;
+    const auto status = hipHostMalloc(&data, bytes, hipHostMallocCoherent);
+    if (status != hipSuccess)
+      throw std::runtime_error(hipGetErrorString(status));
+    auto owner = std::shared_ptr<void>(
+        data, [](void* value) { (void)hipHostFree(value); });
+    std::memset(data, 0, bytes);
+    return cache::StagingAllocation{std::move(owner),
+                                    {static_cast<std::uint8_t*>(data), bytes}};
+  };
+  result->copy_observed_rows = [](auto source, auto destination,
+                                  cache::Stream& stream) {
+    return dynamic_cast<hip::TransferStream&>(stream).Copy(
+        destination.data(), source.data(), destination.size(),
+        hip::CopyDirection::kDeviceToHost, destination.size());
+  };
+  return result;
+}
 #endif
 
 }  // namespace
@@ -3113,6 +3950,7 @@ struct InferenceBackend::Impl {
     std::uint32_t max_context{0};
     bool supports_images{false};
     ReasoningOptions reasoning_defaults;
+    std::string speculative_mode{"off"};
   };
 
   class ScheduledGenerationRequest final : public GenerationRequest {
@@ -3215,10 +4053,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             std::size_t session_count,
                             TextPrefillPolicy prefill_policy,
                             TextSchedulerPolicy scheduler_policy,
-                            const TextSpeculativeConfig& speculative_config,
+                            TextSpeculativeConfig speculative_config,
                             const TextDiskCacheConfig& disk_cache_config,
                             const std::string& vision_model_path,
-                            TextRunnerRamCacheOptions ram_cache_config) {
+                            TextRunnerRamCacheOptions ram_cache_config,
+                            std::uint64_t expanded_kv_bytes) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -3364,6 +4203,74 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             "Qwen3.8-Flash-Next MTP", speculative_config.draft_model_path,
             &resolved_disk_cache_config.draft_model_artifact_fingerprint,
             error)) {
+      return false;
+    }
+    return load(std::move(model), error, max_context, session_count,
+                prefill_policy, scheduler_policy, speculative_config,
+                std::move(resolved_disk_cache_config), ram_cache_config);
+  }
+  if (reader->GetMetadataString("general.architecture") == "bailingmoe3") {
+    if (!vision_model_path.empty()) {
+      SetError(error, "Ling-3.0-flash does not support --mmproj");
+      return false;
+    }
+    // Ling's default is MTP when the GGUF carries the block-42 weights; an
+    // explicit `--speculative off` (model_default false) keeps AR.
+    if (speculative_config.model_default &&
+        speculative_config.backend == TextSpeculativeBackend::kDisabled &&
+        speculative_config.draft_model_path.empty()) {
+      if (models::ling_3_flash::HasMtpBlock(*reader)) {
+        speculative_config.backend = TextSpeculativeBackend::kMtp;
+      } else {
+        Logger::Info("loader",
+                     "event=speculative_default model=Ling-3.0-flash "
+                     "speculative=off reason=no_mtp_block");
+      }
+    }
+    if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+        speculative_config.backend != TextSpeculativeBackend::kMtp) {
+      SetError(error,
+               "Ling-3.0-flash supports only MTP speculative decoding "
+               "(--speculative mtp)");
+      return false;
+    }
+    if (speculative_config.backend == TextSpeculativeBackend::kMtp &&
+        !speculative_config.draft_model_path.empty()) {
+      SetError(error,
+               "Ling-3.0-flash carries its MTP block in the main GGUF; "
+               "--speculative mtp needs no --mtp-model");
+      return false;
+    }
+    if (speculative_config.backend == TextSpeculativeBackend::kMtp &&
+        (speculative_config.max_draft_tokens == 0 ||
+         speculative_config.min_draft_tokens != 1)) {
+      SetError(error,
+               "Ling-3.0-flash MTP requires a positive draft limit and "
+               "--min-draft-tokens 1");
+      return false;
+    }
+    if (!models::ling_3_flash::ValidateGgufTemplate(*reader, &load_error)) {
+      SetError(error,
+               "Unsupported Ling-3.0-flash chat template: " + load_error);
+      return false;
+    }
+    auto model = models::ling_3_flash::Model::Load(
+        model_path,
+        models::ling_3_flash::ModelOptions{
+            .max_context = max_context,
+            .max_batch = models::ling_3_flash::kCliPrefillBatch,
+            .expanded_kv_bytes = expanded_kv_bytes,
+            .mtp = speculative_config.backend == TextSpeculativeBackend::kMtp},
+        &load_error);
+    if (model == nullptr) {
+      SetError(error, "Failed to create Ling-3.0-flash model: " + load_error);
+      return false;
+    }
+    if (DiskCacheEnabled(resolved_disk_cache_config) &&
+        resolved_disk_cache_config.model_artifact_fingerprint.empty() &&
+        !FingerprintArtifact(
+            "Ling-3.0-flash", *reader,
+            &resolved_disk_cache_config.model_artifact_fingerprint, error)) {
       return false;
     }
     return load(std::move(model), error, max_context, session_count,
@@ -3734,7 +4641,105 @@ bool InferenceBackend::load(
     return false;
   }
 }
+
+bool InferenceBackend::load(std::shared_ptr<models::ling_3_flash::Model> model,
+                            std::string* error, std::uint32_t max_context,
+                            std::size_t session_count,
+                            TextPrefillPolicy prefill_policy,
+                            TextSchedulerPolicy scheduler_policy,
+                            TextSpeculativeConfig speculative_config,
+                            TextDiskCacheConfig disk_cache_config,
+                            TextRunnerRamCacheOptions ram_cache_config) {
+  if (model == nullptr) {
+    SetError(error, "Ling-3.0-flash model must not be null");
+    return false;
+  }
+  if (max_context == 0)
+    max_context = model->MaxContext();
+  if (session_count == 0) {
+    SetError(error, "HTTP session count must be at least one");
+    return false;
+  }
+  if (max_context < 2 || max_context > model->MaxContext()) {
+    SetError(error, "HTTP context exceeds the loaded Ling-3.0-flash context");
+    return false;
+  }
+  if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+      speculative_config.backend != TextSpeculativeBackend::kMtp) {
+    SetError(error,
+             "Ling-3.0-flash supports only MTP speculative decoding "
+             "(--speculative mtp)");
+    return false;
+  }
+  const bool use_mtp =
+      speculative_config.backend == TextSpeculativeBackend::kMtp;
+  if (use_mtp &&
+      (!model->HasMtp() || speculative_config.max_draft_tokens == 0 ||
+       speculative_config.min_draft_tokens != 1)) {
+    SetError(error,
+             "Ling-3.0-flash MTP needs a model loaded with its MTP block, a "
+             "positive draft limit and --min-draft-tokens 1");
+    return false;
+  }
+  if (!use_mtp && model->HasMtp()) {
+    SetError(error,
+             "this Ling-3.0-flash model was loaded with its MTP block; serve "
+             "it with --speculative mtp");
+    return false;
+  }
+  if (DiskCacheEnabled(disk_cache_config) &&
+      (!IsSha256Hex(disk_cache_config.model_artifact_fingerprint) ||
+       disk_cache_config.capacity_bytes == 0)) {
+    SetError(error,
+             "Ling-3.0-flash persistent disk cache configuration is invalid");
+    return false;
+  }
+  try {
+    auto new_state = std::make_shared<Impl::State>();
+    new_state->sampling_defaults.model = sampling::TextModelPreset::kLing3Flash;
+    new_state->speculative_mode = use_mtp ? "mtp" : "off";
+    new_state->sampling_defaults.supplied = {};
+    new_state->supports_images = false;
+    auto runner = std::make_shared<LingTextRunner>(
+        std::move(model), max_context, use_mtp,
+        std::min<std::uint32_t>(speculative_config.max_draft_tokens,
+                                models::ling_3_flash::kMaxDrafts),
+        session_count, disk_cache_config.model_artifact_fingerprint);
+    new_state->model_id = runner->Descriptor().model_id;
+    new_state->max_context = max_context;
+    std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
+    if (DiskCacheEnabled(disk_cache_config)) {
+      runner_disk_cache = TextRunnerDiskCacheOptions{
+          .directory = std::move(disk_cache_config.directory),
+          .capacity_bytes = disk_cache_config.capacity_bytes,
+          .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+      };
+    }
+    auto runner_pool = std::make_shared<TextRunnerPool>(
+        std::move(runner), session_count, std::move(runner_disk_cache),
+        ram_cache_config);
+    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+        std::move(runner_pool), prefill_policy, scheduler_policy);
+    {
+      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+      impl_->state = std::move(new_state);
+    }
+    return true;
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return false;
+  }
+}
 #endif
+
+std::string InferenceBackend::speculative_mode() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr ? state->speculative_mode : "off";
+#else
+  return "off";
+#endif
+}
 
 std::string InferenceBackend::model_id() const {
 #if defined(ENGINE_ENABLE_HIP)
@@ -3819,6 +4824,16 @@ InferenceBackend::InitialOutputState InferenceBackend::initial_output_state(
 #else
   (void)request;
   return InitialOutputState::kAuto;
+#endif
+}
+
+InferenceBackend::ToolCallSyntax InferenceBackend::tool_call_syntax() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr ? state->scheduler->runner().ToolSyntax()
+                          : ToolCallSyntax::kDefault;
+#else
+  return ToolCallSyntax::kDefault;
 #endif
 }
 

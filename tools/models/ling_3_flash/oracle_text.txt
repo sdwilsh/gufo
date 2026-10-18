@@ -1,0 +1,133 @@
+Call me Ishmael. Some years ago, never mind how long precisely, having little or no money in my purse, and nothing particular to interest me on shore, I thought I would sail about a little and see the watery part of the world. It is a way I have of driving off the spleen and regulating the circulation. Whenever I find myself growing grim about the mouth; whenever it is a damp, drizzly November in my soul; whenever I find myself involuntarily pausing before coffin warehouses, and bringing up the rear of every funeral I meet; and especially whenever my hypos get such an upper hand of me, that it requires a strong moral principle to prevent me from deliberately stepping into the street, and methodically knocking people's hats off, then, I account it high time to get to sea as soon as I can. This is my substitute for pistol and ball. With a philosophical flourish Cato throws himself upon his sword; I quietly take to the ship. There is nothing surprising in this. If they but knew it, almost all men in their degree, some time or other, cherish very nearly the same feelings towards the ocean with me.
+
+It is a truth universally acknowledged, that a single man in possession of a good fortune, must be in want of a wife. However little known the feelings or views of such a man may be on his first entering a neighbourhood, this truth is so well fixed in the minds of the surrounding families, that he is considered the rightful property of some one or other of their daughters. "My dear Mr. Bennet," said his lady to him one day, "have you heard that Netherfield Park is let at last?" Mr. Bennet replied that he had not. "But it is," returned she; "for Mrs. Long has just been here, and she told me all about it." Mr. Bennet made no answer. "Do you not want to know who has taken it?" cried his wife impatiently. "You want to tell me, and I have no objection to hearing it." This was invitation enough.
+
+Alice was beginning to get very tired of sitting by her sister on the bank, and of having nothing to do: once or twice she had peeped into the book her sister was reading, but it had no pictures or conversations in it, "and what is the use of a book," thought Alice, "without pictures or conversations?" So she was considering in her own mind (as well as she could, for the hot day made her feel very sleepy and stupid), whether the pleasure of making a daisy-chain would be worth the trouble of getting up and picking the daisies, when suddenly a White Rabbit with pink eyes ran close by her. There was nothing so very remarkable in that; nor did Alice think it so very much out of the way to hear the Rabbit say to itself, "Oh dear! Oh dear! I shall be late!" But when the Rabbit actually took a watch out of its waistcoat-pocket, and looked at it, and then hurried on, Alice started to her feet, for it flashed across her mind that she had never before seen a rabbit with either a waistcoat-pocket, or a watch to take out of it, and burning with curiosity, she ran across the field after it.
+
+It was the best of times, it was the worst of times, it was the age of wisdom, it was the age of foolishness, it was the epoch of belief, it was the epoch of incredulity, it was the season of Light, it was the season of Darkness, it was the spring of hope, it was the winter of despair, we had everything before us, we had nothing before us, we were all going direct to Heaven, we were all going direct the other way. There were a king with a large jaw and a queen with a plain face, on the throne of England; there were a king with a large jaw and a queen with a fair face, on the throne of France. In both countries it was clearer than crystal to the lords of the State preserves of loaves and fishes, that things in general were settled for ever.
+
+Four score and seven years ago our fathers brought forth on this continent, a new nation, conceived in Liberty, and dedicated to the proposition that all men are created equal. Now we are engaged in a great civil war, testing whether that nation, or any nation so conceived and so dedicated, can long endure. We are met on a great battle-field of that war. We have come to dedicate a portion of that field, as a final resting place for those who here gave their lives that that nation might live. It is altogether fitting and proper that we should do this. But, in a larger sense, we can not dedicate, we can not consecrate, we can not hallow this ground. The brave men, living and dead, who struggled here, have consecrated it, far above our poor power to add or detract. The world will little note, nor long remember what we say here, but it can never forget what they did here.
+
+To Sherlock Holmes she is always the woman. I have seldom heard him mention her under any other name. In his eyes she eclipses and predominates the whole of her sex. It was not that he felt any emotion akin to love for Irene Adler. All emotions, and that one particularly, were abhorrent to his cold, precise but admirably balanced mind. He was, I take it, the most perfect reasoning and observing machine that the world has seen, but as a lover he would have placed himself in a false position. He never spoke of the softer passions, save with a gibe and a sneer. They were admirable things for the observer, excellent for drawing the veil from men's motives and actions. But for the trained reasoner to admit such intrusions into his own delicate and finely adjusted temperament was to introduce a distracting factor which might throw a doubt upon all his mental results.
+
+The following short program computes the first few prime numbers with the sieve of Eratosthenes and prints the running total of their sum. It is written in Python.
+
+def primes_below(limit):
+    sieve = [True] * limit
+    sieve[0:2] = [False, False]
+    for n in range(2, int(limit ** 0.5) + 1):
+        if sieve[n]:
+            for multiple in range(n * n, limit, n):
+                sieve[multiple] = False
+    return [n for n, is_prime in enumerate(sieve) if is_prime]
+
+total = 0
+for p in primes_below(100):
+    total += p
+    print(f"{p:3d} {total:5d}")
+
+The same idea in C looks like this, with a fixed array of 1000 flags and a loop bound of 31, because 31 times 31 is 961, and the next prime, 37, squares to 1369, which is already beyond the end of the array.
+
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    static unsigned char composite[1000];
+    memset(composite, 0, sizeof composite);
+    for (int n = 2; n <= 31; ++n) {
+        if (!composite[n]) {
+            for (int m = n * n; m < 1000; m += n) composite[m] = 1;
+        }
+    }
+    int count = 0;
+    for (int n = 2; n < 1000; ++n) {
+        if (!composite[n]) ++count;
+    }
+    printf("%d primes below 1000\n", count);
+    return 0;
+}
+
+Running it prints 168 primes below 1000. A few other numbers worth remembering: the speed of light is 299,792,458 metres per second; the first twenty Fibonacci numbers are 0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597, 2584 and 4181; and pi is approximately 3.14159265358979323846264338327950288419716939937510. The year 1969 saw the first landing on the Moon, the year 1789 the start of the French Revolution, and the year 1066 the Battle of Hastings. A kilometre is 1000 metres, a mile is 1609.344 metres, and one hour has 3600 seconds.
+
+When shall we three meet again? In thunder, lightning, or in rain? When the hurlyburly's done, when the battle's lost and won. That will be ere the set of sun. Where the place? Upon the heath. There to meet with Macbeth. The quality of mercy is not strained; it droppeth as the gentle rain from heaven upon the place beneath: it is twice blest; it blesseth him that gives and him that takes. Tis mightiest in the mightiest; it becomes the throned monarch better than his crown. To be, or not to be, that is the question: whether tis nobler in the mind to suffer the slings and arrows of outrageous fortune, or to take arms against a sea of troubles and by opposing end them.
+
+The Time Traveller, for so it will be convenient to speak of him, was expounding a recondite matter to us. His pale grey eyes shone and twinkled, and his usually pale face was flushed and animated. The fire burned brightly, and the soft radiance of the incandescent lights in the lilies of silver caught the bubbles that flashed and passed in our glasses. Our chairs, being his patents, embraced and caressed us rather than submitted to be sat upon, and there was that luxurious after-dinner atmosphere, when thought runs gracefully free of the trammels of precision. And he put it to us in this way, marking the points with a lean forefinger, as we sat and lazily admired his earnestness over this new paradox, as we thought it, and his fecundity.
+
+In the beginning God created the heaven and the earth. And the earth was without form, and void; and darkness was upon the face of the deep. And the Spirit of God moved upon the face of the waters. And God said, Let there be light: and there was light. And God saw the light, that it was good: and God divided the light from the darkness. And God called the light Day, and the darkness he called Night. And the evening and the morning were the first day.
+
+We hold these truths to be self-evident, that all men are created equal, that they are endowed by their Creator with certain unalienable Rights, that among these are Life, Liberty and the pursuit of Happiness. That to secure these rights, Governments are instituted among Men, deriving their just powers from the consent of the governed, That whenever any Form of Government becomes destructive of these ends, it is the Right of the People to alter or to abolish it, and to institute new Government, laying its foundation on such principles and organizing its powers in such form, as to them shall seem most likely to effect their Safety and Happiness.
+
+Down the rabbit-hole went Alice, never once considering how in the world she was to get out again. The rabbit-hole went straight on like a tunnel for some way, and then dipped suddenly down, so suddenly that Alice had not a moment to think about stopping herself before she found herself falling down a very deep well. Either the well was very deep, or she fell very slowly, for she had plenty of time as she went down to look about her and to wonder what was going to happen next. First, she tried to look down and make out what she was coming to, but it was too dark to see anything; then she looked at the sides of the well, and noticed that they were filled with cupboards and book-shelves; here and there she saw maps and pictures hung upon pegs.
+
+Whether I shall turn out to be the hero of my own life, or whether that station will be held by anybody else, these pages must show. To begin my life with the beginning of my life, I record that I was born, as I have been informed and believe, on a Friday, at twelve o'clock at night. It was remarked that the clock began to strike, and I began to cry, simultaneously. In consideration of the day and hour of my birth, it was declared by the nurse, and by some sage women in the neighbourhood who had taken a lively interest in me several months before there was any possibility of our becoming personally acquainted, first, that I was destined to be unlucky in life; and secondly, that I was privileged to see ghosts and spirits.
+
+Chapter 1. Loomings. There was once a small town on the edge of a great grey sea, and in that town lived a clockmaker who had never been known to be late for anything. Every morning at six he opened the shutters of his shop, wound the seventeen clocks in the window, and swept the step. Every evening at eight he closed the shutters again. In forty years he had missed exactly two days, and both of them because of snow.
+
+There was no possibility of taking a walk that day. We had been wandering, indeed, in the leafless shrubbery an hour in the morning; but since dinner (Mrs. Reed, when there was no company, dined early) the cold winter wind had brought with it clouds so sombre, and a rain so penetrating, that further out-door exercise was now out of the question. I was glad of it: I never liked long walks, especially on chilly afternoons: dreadful to me was the coming home in the raw twilight, with nipped fingers and toes, and a heart saddened by the chidings of Bessie, the nurse, and humbled by the consciousness of my physical inferiority to Eliza, John, and Georgiana Reed.
+
+Squire Trelawney, Dr. Livesey, and the rest of these gentlemen having asked me to write down the whole particulars about Treasure Island, from the beginning to the end, keeping nothing back but the bearings of the island, and that only because there is still treasure not yet lifted, I take up my pen in the year of grace seventeen hundred and fifty-something, and go back to the time when my father kept the Admiral Benbow inn and the brown old seaman with the sabre cut first took up his lodging under our roof. I remember him as if it were yesterday, as he came plodding to the inn door, his sea-chest following behind him in a hand-barrow.
+
+You will rejoice to hear that no disaster has accompanied the commencement of an enterprise which you have regarded with such evil forebodings. I arrived here yesterday, and my first task is to assure my dear sister of my welfare and increasing confidence in the success of my undertaking. I am already far north of London, and as I walk in the streets of Petersburgh, I feel a cold northern breeze play upon my cheeks, which braces my nerves and fills me with delight. Do you understand this feeling? This breeze, which has travelled from the regions towards which I am advancing, gives me a foretaste of those icy climes. Inspirited by this wind of promise, my daydreams become more fervent and vivid.
+
+3 May. Bistritz. Left Munich at 8:35 P.M., on 1st May, arriving at Vienna early next morning; should have arrived at 6:46, but train was an hour late. Buda-Pesth seems a wonderful place, from the glimpse which I got of it from the train and the little I could walk through the streets. I feared to go very far from the station, as we had arrived late and would start as near the correct time as possible. The impression I had was that we were leaving the West and entering the East; the most western of splendid bridges over the Danube, which is here of noble width and depth, took us among the traditions of Turkish rule.
+
+You don't know about me without you have read a book by the name of The Adventures of Tom Sawyer; but that ain't no matter. That book was made by Mr. Mark Twain, and he told the truth, mainly. There was things which he stretched, but mainly he told the truth. That is nothing. I never seen anybody but lied one time or another, without it was Aunt Polly, or the widow, or maybe Mary. Aunt Polly, Tom's Aunt Polly, she is, and Mary, and the Widow Douglas is all told about in that book, which is mostly a true book, with some stretchers, as I said before.
+
+My father had a small estate in Nottinghamshire; I was the third of five sons. He sent me to Emmanuel College in Cambridge at fourteen years old, where I resided three years, and applied myself close to my studies; but the charge of maintaining me, although I had a very scanty allowance, being too great for a narrow fortune, I was bound apprentice to Mr. James Bates, an eminent surgeon in London, with whom I continued four years. My father now and then sending me small sums of money, I laid them out in learning navigation, and other parts of the mathematics, useful to those who intend to travel, as I always believed it would be some time or other my fortune to do.
+
+When I wrote the following pages, or rather the bulk of them, I lived alone, in the woods, a mile from any neighbor, in a house which I had built myself, on the shore of Walden Pond, in Concord, Massachusetts, and earned my living by the labor of my hands only. I lived there two years and two months. At present I am a sojourner in civilized life again. I should not obtrude my affairs so much on the notice of my readers if very particular inquiries had not been made by my townsmen concerning my mode of life, which some would call impertinent, though they do not appear to me at all impertinent, but, considering the circumstances, very natural and pertinent.
+
+When on board H.M.S. Beagle, as naturalist, I was much struck with certain facts in the distribution of the inhabitants of South America, and in the geological relations of the present to the past inhabitants of that continent. These facts seemed to me to throw some light on the origin of species, that mystery of mysteries, as it has been called by one of our greatest philosophers. On my return home, it occurred to me, in 1837, that something might perhaps be made out on this question by patiently accumulating and reflecting on all sorts of facts which could possibly have any bearing on it.
+
+Dorothy lived in the midst of the great Kansas prairies, with Uncle Henry, who was a farmer, and Aunt Em, who was the farmer's wife. Their house was small, for the lumber to build it had to be carried by wagon many miles. There were four walls, a floor and a roof, which made one room; and this room contained a rusty looking cookstove, a cupboard for the dishes, a table, three or four chairs, and the beds. Uncle Henry and Aunt Em had a big bed in one corner, and Dorothy a little bed in another corner. There was no garret at all, and no cellar except a small hole dug in the ground, called a cyclone cellar.
+
+All children, except one, grow up. They soon know that they will grow up, and the way Wendy knew was this. One day when she was two years old she was playing in a garden, and she plucked another flower and ran with it to her mother. I suppose she must have looked rather delightful, for Mrs. Darling put her hand to her heart and cried, "Oh, why can't you remain like this for ever!" This was all that passed between them on the subject, but henceforth Wendy knew that she must grow up. You always know after you are two. Two is the beginning of the end.
+
+It was seven o'clock of a very warm evening in the Seeonee hills when Father Wolf woke up from his day's rest, scratched himself, yawned, and spread out his paws one after the other to get rid of the sleepy feeling in their tips. Mother Wolf lay with her big gray nose dropped across her four tumbling, squealing cubs, and the moon shone into the mouth of the cave where they all lived. "Augrh!" said Father Wolf. "It is time to hunt again." He was going to spring down hill when a little shadow with a bushy tail crossed the threshold and whined: "Good luck go with you, O Chief of the Wolves."
+
+The art of war is of vital importance to the State. It is a matter of life and death, a road either to safety or to ruin. Hence it is a subject of inquiry which can on no account be neglected. The art of war, then, is governed by five constant factors, to be taken into account in one's deliberations, when seeking to determine the conditions obtaining in the field. These are: the Moral Law; Heaven; Earth; the Commander; Method and discipline. The Moral Law causes the people to be in complete accord with their ruler, so that they will follow him regardless of their lives, undismayed by any danger.
+
+The sea was calm that morning, and the small boat rocked gently against the grey stones of the quay while the fishermen mended their nets and argued about the weather. Old Tomas, who had sailed these waters for sixty years and been wrong about the weather for most of them, declared that rain would come before noon. His grandson, who was nine and kept a notebook in which he wrote down every prediction the old man made, wrote the date, the hour, and the word rain, and underlined it twice. By noon the sky was a hard clear blue, and the boy looked at his notebook with the quiet satisfaction of a person who has found the proof of something.
+
+Here is a second program, this time in JavaScript, that counts the words in a block of text and prints the five most common ones along with how many times each occurs.
+
+function topWords(text, limit = 5) {
+  const counts = new Map();
+  for (const word of text.toLowerCase().match(/[a-z']+/g) ?? []) {
+    counts.set(word, (counts.get(word) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, limit);
+}
+
+const sample = "the cat and the dog and the bird saw the cat";
+for (const [word, n] of topWords(sample)) {
+  console.log(`${word}: ${n}`);
+}
+
+And one more, a short SQL query that finds the three customers with the largest total order value in 2023, assuming a customers table and an orders table linked by customer_id.
+
+SELECT c.customer_id, c.name, SUM(o.amount) AS total
+FROM customers AS c
+JOIN orders AS o ON o.customer_id = c.customer_id
+WHERE o.ordered_at >= '2023-01-01' AND o.ordered_at < '2024-01-01'
+GROUP BY c.customer_id, c.name
+ORDER BY total DESC
+LIMIT 3;
+
+Next comes a table of the powers of two from 2 to the power 0 up to 2 to the power 40, followed by the factorials from 1 up to 20, and then the squares of the integers from 1 up to 60. The values are exact.
+
+Powers of two: 2^0 = 1, 2^1 = 2, 2^2 = 4, 2^3 = 8, 2^4 = 16, 2^5 = 32, 2^6 = 64, 2^7 = 128, 2^8 = 256, 2^9 = 512, 2^10 = 1024, 2^11 = 2048, 2^12 = 4096, 2^13 = 8192, 2^14 = 16384, 2^15 = 32768, 2^16 = 65536, 2^17 = 131072, 2^18 = 262144, 2^19 = 524288, 2^20 = 1048576, 2^21 = 2097152, 2^22 = 4194304, 2^23 = 8388608, 2^24 = 16777216, 2^25 = 33554432, 2^26 = 67108864, 2^27 = 134217728, 2^28 = 268435456, 2^29 = 536870912, 2^30 = 1073741824, 2^31 = 2147483648, 2^32 = 4294967296, 2^33 = 8589934592, 2^34 = 17179869184, 2^35 = 34359738368, 2^36 = 68719476736, 2^37 = 137438953472, 2^38 = 274877906944, 2^39 = 549755813888, 2^40 = 1099511627776.
+
+Factorials: 1! = 1, 2! = 2, 3! = 6, 4! = 24, 5! = 120, 6! = 720, 7! = 5040, 8! = 40320, 9! = 362880, 10! = 3628800, 11! = 39916800, 12! = 479001600, 13! = 6227020800, 14! = 87178291200, 15! = 1307674368000, 16! = 20922789888000, 17! = 355687428096000, 18! = 6402373705728000, 19! = 121645100408832000, 20! = 2432902008176640000.
+
+Squares: 1*1 = 1, 2*2 = 4, 3*3 = 9, 4*4 = 16, 5*5 = 25, 6*6 = 36, 7*7 = 49, 8*8 = 64, 9*9 = 81, 10*10 = 100, 11*11 = 121, 12*12 = 144, 13*13 = 169, 14*14 = 196, 15*15 = 225, 16*16 = 256, 17*17 = 289, 18*18 = 324, 19*19 = 361, 20*20 = 400, 21*21 = 441, 22*22 = 484, 23*23 = 529, 24*24 = 576, 25*25 = 625, 26*26 = 676, 27*27 = 729, 28*28 = 784, 29*29 = 841, 30*30 = 900, 31*31 = 961, 32*32 = 1024, 33*33 = 1089, 34*34 = 1156, 35*35 = 1225, 36*36 = 1296, 37*37 = 1369, 38*38 = 1444, 39*39 = 1521, 40*40 = 1600, 41*41 = 1681, 42*42 = 1764, 43*43 = 1849, 44*44 = 1936, 45*45 = 2025, 46*46 = 2116, 47*47 = 2209, 48*48 = 2304, 49*49 = 2401, 50*50 = 2500, 51*51 = 2601, 52*52 = 2704, 53*53 = 2809, 54*54 = 2916, 55*55 = 3025, 56*56 = 3136, 57*57 = 3249, 58*58 = 3364, 59*59 = 3481, 60*60 = 3600.
+
+Pi to 250 decimal places is 3.1415926535897932384626433832795028841971693993751058209749445923078164062862089986280348253421170679821480865132823066470938446095505822317253594081284811174502841027019385211055596446229489549303819644288109756659334461284756482337867831652712019091, and e to 250 decimal places is 2.7182818284590452353602874713526624977572470936999595749669676277240766303535475945713821785251664274274663919320030599218174135966290435729003342952605956307381323286279434907632338298807531952510190115738341879307021540891499348841675092447614606680.
+
+Finally, every prime number below 1500, in increasing order, and then the Fibonacci numbers from the 20th to the 60th.
+
+Primes: 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193, 197, 199, 211, 223, 227, 229, 233, 239, 241, 251, 257, 263, 269, 271, 277, 281, 283, 293, 307, 311, 313, 317, 331, 337, 347, 349, 353, 359, 367, 373, 379, 383, 389, 397, 401, 409, 419, 421, 431, 433, 439, 443, 449, 457, 461, 463, 467, 479, 487, 491, 499, 503, 509, 521, 523, 541, 547, 557, 563, 569, 571, 577, 587, 593, 599, 601, 607, 613, 617, 619, 631, 641, 643, 647, 653, 659, 661, 673, 677, 683, 691, 701, 709, 719, 727, 733, 739, 743, 751, 757, 761, 769, 773, 787, 797, 809, 811, 821, 823, 827, 829, 839, 853, 857, 859, 863, 877, 881, 883, 887, 907, 911, 919, 929, 937, 941, 947, 953, 967, 971, 977, 983, 991, 997, 1009, 1013, 1019, 1021, 1031, 1033, 1039, 1049, 1051, 1061, 1063, 1069, 1087, 1091, 1093, 1097, 1103, 1109, 1117, 1123, 1129, 1151, 1153, 1163, 1171, 1181, 1187, 1193, 1201, 1213, 1217, 1223, 1229, 1231, 1237, 1249, 1259, 1277, 1279, 1283, 1289, 1291, 1297, 1301, 1303, 1307, 1319, 1321, 1327, 1361, 1367, 1373, 1381, 1399, 1409, 1423, 1427, 1429, 1433, 1439, 1447, 1451, 1453, 1459, 1471, 1481, 1483, 1487, 1489, 1493, 1499.
+
+Fibonacci: F(20) = 6765, F(21) = 10946, F(22) = 17711, F(23) = 28657, F(24) = 46368, F(25) = 75025, F(26) = 121393, F(27) = 196418, F(28) = 317811, F(29) = 514229, F(30) = 832040, F(31) = 1346269, F(32) = 2178309, F(33) = 3524578, F(34) = 5702887, F(35) = 9227465, F(36) = 14930352, F(37) = 24157817, F(38) = 39088169, F(39) = 63245986, F(40) = 102334155, F(41) = 165580141, F(42) = 267914296, F(43) = 433494437, F(44) = 701408733, F(45) = 1134903170, F(46) = 1836311903, F(47) = 2971215073, F(48) = 4807526976, F(49) = 7778742049, F(50) = 12586269025, F(51) = 20365011074, F(52) = 32951280099, F(53) = 53316291173, F(54) = 86267571272, F(55) = 139583862445, F(56) = 225851433717, F(57) = 365435296162, F(58) = 591286729879, F(59) = 956722026041, F(60) = 1548008755920.

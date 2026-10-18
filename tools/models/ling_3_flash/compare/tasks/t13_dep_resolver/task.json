@@ -1,0 +1,5 @@
+{
+ "category": "bugfix",
+ "expected_tests": 8,
+ "prompt": "deps.resolve(graph) takes {package: [dependencies]} and must return a build order: every package appears exactly once, after all of its dependencies; ties are broken alphabetically (the alphabetically smallest package that is ready comes first); dependencies that are not keys of the graph are treated as packages with no dependencies and are included in the order. A dependency cycle raises deps.CycleError (a subclass of ValueError) whose message names the packages involved. The current implementation lists shared dependencies twice and loops forever on cycles. Fix deps.py (not the tests)."
+}

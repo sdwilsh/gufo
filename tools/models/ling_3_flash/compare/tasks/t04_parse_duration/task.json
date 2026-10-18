@@ -1,0 +1,5 @@
+{
+ "category": "bugfix",
+ "expected_tests": 6,
+ "prompt": "timeparse.parse_duration(text) converts strings such as '1h30m' to seconds (s, m, h, d units; 'd' = 86400). Rules: units are case-insensitive; whitespace between parts is allowed ('1h 30m'); a bare number such as '90' means seconds; an empty string, a unit with no number ('h'), an unknown unit ('5x') or any other junk raises ValueError. The current implementation fails a test and gets several of these rules wrong. Fix timeparse.py (not the tests)."
+}

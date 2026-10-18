@@ -1,5 +1,7 @@
 #include "src/cli/serve/text_generation_scheduler.hpp"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -515,6 +517,8 @@ public:
     step.draft_rounds = 1;
     step.draft_tokens = count + 1;
     step.draft_accepted_tokens = count;
+    step.draft_copied_tokens = 1;
+    step.draft_copied_accepted_tokens = 1;
     return step;
   }
 
@@ -996,6 +1000,15 @@ void TestMultiTokenDecodePublishesDraftMetricsAndDisablesPrefixReuse() {
   Expect(first.draft_rounds == 2 && first.draft_tokens == 7 &&
              first.draft_accepted_tokens == 5,
          "multi-token decode reports accumulated draft statistics");
+  Expect(
+      first.draft_copied_tokens == 2 && first.draft_copied_accepted_tokens == 2,
+      "prompt-lookup copies are summed over the rounds");
+  Expect(gufo::server::GenerationLogDetails(first).find(
+             " draft_copied=2 draft_copied_accepted=2") != std::string::npos,
+         "the request log carries the copied counts");
+  Expect(gufo::server::GenerationLogDetails({}).find(
+             " draft_copied=0 draft_copied_accepted=0") != std::string::npos,
+         "a model without prompt-lookup copies logs zero");
   Expect(!first.cache_hit,
          "multi-token state starts without continuation reuse");
   control->WaitForInvalidations(1);

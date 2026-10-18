@@ -3,10 +3,15 @@
 import json
 import sys
 
+from cache_growth import check_unchanged_retry, log_offset
 from tool_native import assert_native, cached
 
 
-def check_tool_choice_cache(client, model, checks, chat_result):
+def check_tool_choice_cache(client, model, checks, chat_result, checkpoint_tail=0,
+                           server_log=None):
+    """`checkpoint_tail`: prompt tokens an exact replay may prefill again
+    (CHECKPOINT_TAIL_TOKENS)."""
+    from messages_count_tokens import assert_count_response
     function = {
         "name": "read", "description": "Read a file.",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}},
@@ -50,7 +55,16 @@ def check_tool_choice_cache(client, model, checks, chat_result):
                 else "Reply with only DONE. Do not call a tool.")}]}
         if after is not None:
             continued["tool_choice"] = after
+        # The final user turn is mutable in agent histories; count it and its
+        # assistant opening independently, as tool-history does.
+        suffix = client.post("/messages/count_tokens", body={
+            "model": model, "thinking": {"type": "disabled"},
+            "messages": [continued["messages"][-1]]}, cast_to=object)
+        checks[label + "_mutable_suffix_count"] = suffix
+        mutable_suffix_tokens = assert_count_response(suffix)
+        start = log_offset(server_log)
         done = record(label + "_continued", continued, index % 2 != 0)
+        end = log_offset(server_log)
         expected = first["usage"]["prompt_tokens"] + first["usage"]["completion_tokens"]
         assert cached(done["usage"]) >= expected, (
             label, "tool choice lost the generated frontier", expected, done)
@@ -64,10 +78,16 @@ def check_tool_choice_cache(client, model, checks, chat_result):
             assert done["text"].strip() == "DONE", done
 
         # An identical prompt under another tool choice must have identical
-        # token counts and reuse its completed prompt without any prefill.
+        # token counts and reuse its completed prompt without any prefill,
+        # except the model's mandatory checkpoint tail, or the mutable suffix
+        # when the server log shows memory pressure refused the prompt copy.
         retry = record(label + "_retry", {**continued, "tool_choice": "auto"})
         assert retry["usage"]["prompt_tokens"] == done["usage"]["prompt_tokens"], retry
-        assert cached(retry["usage"]) == retry["usage"]["prompt_tokens"], retry
+        prompt_tokens = retry["usage"]["prompt_tokens"]
+        check_unchanged_retry(label + "_retry", retry, prompt_tokens - cached(retry["usage"]),
+                              server_log, start, end,
+                              mutable_suffix_tokens=mutable_suffix_tokens,
+                              checkpoint_tail=checkpoint_tail)
 
     # Required calls remain mandatory even when the user asks for plain text.
     # The grammar must supply that guarantee without a system instruction.

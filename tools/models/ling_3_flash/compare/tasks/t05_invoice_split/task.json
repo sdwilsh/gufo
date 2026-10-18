@@ -1,0 +1,5 @@
+{
+ "category": "bugfix",
+ "expected_tests": 8,
+ "prompt": "tests/test_invoice.py fails: invoices do not add up to their total. The project is a small billing package. Find the root cause (it may not be in the file the test imports) and fix it in the library code, not the tests. The contract of billing.split.split_cents(total_cents, parts): return a list of `parts` integers summing exactly to total_cents, whose values differ by at most 1, with the larger shares first; parts < 1 or negative totals raise ValueError."
+}
