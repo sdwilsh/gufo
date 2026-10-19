@@ -1,4 +1,4 @@
-// Op tests of the Ling-3.0-flash MLA kernels (absorbed and non-absorbed)
+// Op tests of the Ling-3.0-Flash MLA kernels (absorbed and non-absorbed)
 // against scalar host references computed in double, fixed seeds. Prints max
 // abs / relative errors (relative = max abs error / max |reference|). Exit 77
 // without a GPU.
@@ -12,7 +12,6 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
-#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -22,6 +21,7 @@
 #include "src/models/ling_3_flash/kernels/rocm/kernels.hpp"
 #include "src/models/ling_3_flash/layout.hpp"
 #include "tests/models/ling_3_flash/parent_digests.hpp"
+#include "tests/models/ling_3_flash/test_rng.hpp"
 
 namespace L = gufo::models::ling_3_flash;
 namespace mla = gufo::models::ling_3_flash::rocm::mla;
@@ -75,11 +75,10 @@ private:
 };
 
 std::vector<float> Normal(std::size_t n, std::uint32_t seed, float sigma) {
-  std::mt19937 gen(seed);
-  std::normal_distribution<float> dist(0.0F, sigma);
+  gufo::tests::ling::Rng gen(seed);
   std::vector<float> v(n);
   for (float& x : v) {
-    x = dist(gen);
+    x = gen.Normal(0.0F, sigma);
   }
   return v;
 }
@@ -405,8 +404,8 @@ std::size_t CountDiff(const float* a, const float* b, std::size_t n) {
 
 // ---- non-absorbed prefill ---------------------------------------------------
 
-// k_b / v_b as the engine holds them: Q8_0 on the device plus the F16 expansion
-// weights built from them.
+// k_b and v_b as the engine holds them: Q8_0 on the device, plus the F16
+// expansion weights built from them.
 struct NaWeights {
   Q8Weights kb;
   Q8Weights vb;
@@ -554,9 +553,9 @@ void TestNonAbsorbedPrefill() {
 }
 
 // ExpandRows from an unaligned start up to the store end, where (rows - start)
-// % 16 != 0, must leave the same store bytes as one expansion from row 0. A
-// 16-key WMMA fragment that straddles `rows` ran under a partial EXEC mask in
-// the AMD clang 22 build and corrupted valid rows of the tile.
+// % 16 != 0, must leave the same store bytes as one expansion from row 0. In
+// the AMD clang 22 build, a 16-key WMMA fragment that straddles `rows` ran
+// under a partial EXEC mask and corrupted valid rows of the tile.
 void TestExpandRowsUnalignedStart() {
   NaWeights w(83);
   for (const std::uint32_t rows : {2048U, 4096U}) {
@@ -587,16 +586,16 @@ void TestExpandRowsUnalignedStart() {
   }
 }
 
-// Bitwise split invariance of the non-absorbed prefill: one chunk of the whole
-// run (transient expansion only) against two and three chunks, at every split
-// point (all points for short runs, a spread incl. tile / key-block edges for
-// long ones), from first positions that put chunk boundaries at odd and even
-// offsets of a 16-key tile. Every layout also changes where the expanded rows
-// live: none, 2048 or 4096 persistent rows (expanded incrementally like the
-// engine does), so the transient / persistent equivalence and the fold over
-// key blocks are covered together. The cache beyond a part's end holds the
-// other part's rows, so masked partner keys differ between the layouts (the
-// WMMA key-pair quirk).
+// Bitwise split invariance of the non-absorbed prefill. One chunk of the whole
+// run (transient expansion only) is compared with two and three chunks, at
+// every split point. Short runs use all points. Long runs use a spread that
+// includes tile and key-block edges. The first positions put chunk boundaries
+// at odd and even offsets of a 16-key tile. Every layout also changes where
+// the expanded rows live: none, 2048 persistent rows, or 4096 persistent rows
+// (expanded incrementally like the engine does). That covers the transient and
+// persistent equivalence and the fold over key blocks together. The cache
+// beyond a part's end holds the other part's rows, so masked partner keys
+// differ between the layouts (the WMMA key-pair quirk).
 void TestNonAbsorbedInvariance() {
   NaWeights w(81);
   constexpr std::size_t kTok = kH * kV;
@@ -741,6 +740,11 @@ void TestNonAbsorbedParentDigest() {
               d_gate.get(), store.get(), c.store_rows);
     const auto digest = static_cast<unsigned long long>(
         Fnv(got.data(), got.size() * sizeof(float)));
+    if (gufo::tests::ling::PrintGoldens()) {
+      std::printf("    {%u, %u, %u, 0x%016llxULL},\n", c.first, c.n,
+                  c.store_rows, digest);
+      continue;
+    }
     const bool ok = digest == c.digest;
     std::printf(
         "%-4s NonAbsorbed == parent digest first=%u n=%u store=%u "

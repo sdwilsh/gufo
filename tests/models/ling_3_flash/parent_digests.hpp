@@ -5,6 +5,14 @@
 // later change that alters prefill bits must regenerate them on purpose.
 // Keys: dense (op, rows, k, n), inputs from a fixed per-case seed; MoE
 // (label, expert types, n), inputs from the fixed seeds in moe_ops_test.cpp.
+//
+// The inputs come from the integer generator in test_rng.hpp, not from
+// std::normal_distribution, so a seed gives the same bits under every
+// compiler and standard library. To regenerate after a deliberate change to
+// the kernels or the generator, run the three tests on a GPU with
+// GUFO_PRINT_GOLDENS=1. Each one prints the initializer lines for its table
+// (dense_ops_test: kDense, mla_ops_test: kMlaPrefill, moe_ops_test: kMoe and
+// kDecode) instead of comparing. Paste them over the entries below.
 #ifndef GUFO_TESTS_MODELS_LING_3_FLASH_PARENT_DIGESTS_HPP_
 #define GUFO_TESTS_MODELS_LING_3_FLASH_PARENT_DIGESTS_HPP_
 
@@ -21,34 +29,34 @@ struct Moe {
 };
 
 inline constexpr Dense kDense[] = {
-    {"GemmQ8_0", 20512, 2560, 9, 0xe5b6a97824295c90ULL},
-    {"GemmQ8_0", 2560, 4096, 9, 0x7883a2720e89b4efULL},
-    {"GemmQ8_0", 768, 2560, 9, 0xdf1f28ec70924a74ULL},
-    {"GemmQ8_0", 2560, 768, 9, 0x83d61d4b12b9be9eULL},
-    {"GemmQ8_0", 6144, 2560, 9, 0xebc179d0a1c3b37bULL},
-    {"GemmQ8_0", 2560, 6144, 9, 0x056d60e583a5a653ULL},
-    {"GemmF16", 4097, 2560, 9, 0x8c834398b8354bfaULL},
-    {"GemmQ8_0", 20512, 2560, 64, 0xb317a3fdf00c3e9bULL},
-    {"GemmQ8_0", 2560, 4096, 64, 0xe6d9f63e7f1453ebULL},
-    {"GemmQ8_0", 768, 2560, 64, 0x1a60d62492e473a1ULL},
-    {"GemmQ8_0", 2560, 768, 64, 0x36c3327d987a82f3ULL},
-    {"GemmQ8_0", 6144, 2560, 64, 0x7940e6a9a99db9b2ULL},
-    {"GemmQ8_0", 2560, 6144, 64, 0x04ae1854638f7b55ULL},
-    {"GemmF16", 4097, 2560, 64, 0x4f85cb4fac462556ULL},
-    {"GemmQ8_0", 20512, 2560, 512, 0x81aa08b499ef6420ULL},
-    {"GemmQ8_0", 2560, 4096, 512, 0xaf88cbd5906990c5ULL},
-    {"GemmQ8_0", 768, 2560, 512, 0x620db8d96913b8b3ULL},
-    {"GemmQ8_0", 2560, 768, 512, 0x81bc652dd397c161ULL},
-    {"GemmQ8_0", 6144, 2560, 512, 0xc7bf031aa95308c8ULL},
-    {"GemmQ8_0", 2560, 6144, 512, 0xd9041db9c8cbff6fULL},
-    {"GemmF16", 4097, 2560, 512, 0x7af8535f1c65c05eULL},
-    {"GemmQ8_0", 20512, 2560, 2048, 0x1aebe6727f5880f5ULL},
-    {"GemmQ8_0", 2560, 4096, 2048, 0x843c80f03cf5fdfbULL},
-    {"GemmQ8_0", 768, 2560, 2048, 0x0971dbbd028d5614ULL},
-    {"GemmQ8_0", 2560, 768, 2048, 0x828573ca61e5ae65ULL},
-    {"GemmQ8_0", 6144, 2560, 2048, 0xe1cf6a0d5184bb27ULL},
-    {"GemmQ8_0", 2560, 6144, 2048, 0x727a7e307fb5a147ULL},
-    {"GemmF16", 4097, 2560, 2048, 0xdf8b12185c8f5431ULL},
+    {"GemmQ8_0", 20512, 2560, 9, 0x17c7071516be5724ULL},
+    {"GemmQ8_0", 2560, 4096, 9, 0x9ec239fd3b38d908ULL},
+    {"GemmQ8_0", 768, 2560, 9, 0x7e366871b3ccfb45ULL},
+    {"GemmQ8_0", 2560, 768, 9, 0x653ec0fc9d2682efULL},
+    {"GemmQ8_0", 6144, 2560, 9, 0x8080baf6afa3ee0bULL},
+    {"GemmQ8_0", 2560, 6144, 9, 0x713aa827c821d309ULL},
+    {"GemmF16", 4097, 2560, 9, 0x8b689427e5cfd9d5ULL},
+    {"GemmQ8_0", 20512, 2560, 64, 0xaa5ca3389c32d722ULL},
+    {"GemmQ8_0", 2560, 4096, 64, 0x545ab00d503b23d4ULL},
+    {"GemmQ8_0", 768, 2560, 64, 0xcdfa9b2ce13d92f6ULL},
+    {"GemmQ8_0", 2560, 768, 64, 0xdbe656ac04d8a29aULL},
+    {"GemmQ8_0", 6144, 2560, 64, 0x88840c08df9f0a8cULL},
+    {"GemmQ8_0", 2560, 6144, 64, 0xd62acb00c25b151cULL},
+    {"GemmF16", 4097, 2560, 64, 0xa195204e0ddb1bbdULL},
+    {"GemmQ8_0", 20512, 2560, 512, 0xd10b771fb8f5489dULL},
+    {"GemmQ8_0", 2560, 4096, 512, 0x121da28fd1df2441ULL},
+    {"GemmQ8_0", 768, 2560, 512, 0x011616fd4c5b6937ULL},
+    {"GemmQ8_0", 2560, 768, 512, 0xef04e07f4f143358ULL},
+    {"GemmQ8_0", 6144, 2560, 512, 0xc2cec20b61359ddfULL},
+    {"GemmQ8_0", 2560, 6144, 512, 0x4227253104524830ULL},
+    {"GemmF16", 4097, 2560, 512, 0xffea75b7edc02825ULL},
+    {"GemmQ8_0", 20512, 2560, 2048, 0xbfcc679225e01cfcULL},
+    {"GemmQ8_0", 2560, 4096, 2048, 0x2c57fc78d84b81a1ULL},
+    {"GemmQ8_0", 768, 2560, 2048, 0xb634f2c898d8c28fULL},
+    {"GemmQ8_0", 2560, 768, 2048, 0xd1b7b50e76737697ULL},
+    {"GemmQ8_0", 6144, 2560, 2048, 0x7e31eccc94272d5eULL},
+    {"GemmQ8_0", 2560, 6144, 2048, 0x0c6bdb9e01576d10ULL},
+    {"GemmF16", 4097, 2560, 2048, 0x0272a43412c761ecULL},
     {"", 0, 0, 0, 0}};
 inline constexpr Moe kMoe[] = {
     {"pool16 IQ4_XS/Q4_K n=9", 0x1cc973f2530c2d03ULL, 0x69addf93106daa0bULL},
@@ -83,16 +91,16 @@ struct MlaPrefill {
   unsigned long long digest;
 };
 inline constexpr MlaPrefill kMlaPrefill[] = {
-    {0, 9, 0, 0xee5cdfa8018c746cULL},
-    {0, 16, 2048, 0xebb8ab402439fb45ULL},
-    {1000, 37, 2048, 0x66cec3a359f5cd7bULL},
-    {2040, 16, 4096, 0xde954fd02d105dfcULL},
-    {2047, 100, 0, 0xcf4b012635097ad5ULL},
-    {4090, 100, 4096, 0xf630f8429e94a078ULL},
-    {5000, 130, 8192, 0x6b60fa804f6d78baULL},
-    {6100, 300, 4096, 0x5e186bea2e7dd599ULL},
-    {16384, 16, 18432, 0x28c1b741f6d47c09ULL},
-    {16384, 64, 0, 0xd2e01b4044c69407ULL},
+    {0, 9, 0, 0x7f65bd6bc25e40e6ULL},
+    {0, 16, 2048, 0xd5213337c4b06e43ULL},
+    {1000, 37, 2048, 0xf20aabb57f327c51ULL},
+    {2040, 16, 4096, 0x11c59ffb17600bc1ULL},
+    {2047, 100, 0, 0x8e0b9e3717fbb513ULL},
+    {4090, 100, 4096, 0x48e6c0b46eaf8a4aULL},
+    {5000, 130, 8192, 0xe99b85d1eadd5c18ULL},
+    {6100, 300, 4096, 0x2d480032b994a884ULL},
+    {16384, 16, 18432, 0x8e3486a3e27101b7ULL},
+    {16384, 64, 0, 0x3db0b6d93669bbcbULL},
     {0, 0, 0, 0}};
 
 // Routed-expert decode GEMVs and routing (moe_ops_test TestDecodeDigest /
