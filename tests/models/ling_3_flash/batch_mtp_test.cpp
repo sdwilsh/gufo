@@ -474,7 +474,7 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
           std::move(o2));
   }
   {
-    // A verify forward that fails after launch empties its lanes.
+    // A verify forward that fails after launch empties its own lanes.
     for (std::size_t i = 0; i < 3; ++i) {
       if (!lanes[i]->RestoreSnapshot(*start[i], &error)) {
         return fatal("restore");
@@ -489,12 +489,31 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
       batch[i].sampler = &samplers[i];
       batch[i].stop_at_eos = false;
     }
+    // One injected failure hits one verify forward. The lanes may split
+    // across several (8 rows each; copy chains and the draft width decide), so
+    // only the failed forward's lanes fail, emptied; the others decode on.
     model->FailBatchesForTest(1);
     l3::Session::DecodeBatch(batch);
+    bool injected = false;
     bool emptied = true;
+    bool others_ok = true;
+    auto failed_lanes = json::Value::array();
     for (std::size_t i = 0; i < 3; ++i) {
-      emptied = emptied && !batch[i].ok && lanes[i]->IsValid() &&
-                lanes[i]->Position() == 0 && lanes[i]->Tokens().empty();
+      const auto& t = batch[i].result.tokens;
+      if (batch[i].ok) {
+        others_ok = others_ok && !t.empty() &&
+                    std::equal(t.begin(), t.end(), ar[i].tokens.begin());
+      } else {
+        injected = injected ||
+                   batch[i].error.find("injected failure") != std::string::npos;
+        emptied = emptied && lanes[i]->IsValid() && lanes[i]->Position() == 0 &&
+                  lanes[i]->Tokens().empty();
+      }
+      auto lane = json::Value::object();
+      lane["ok"] = batch[i].ok;
+      lane["position"] = U(lanes[i]->Position());
+      lane["tokens"] = U(lanes[i]->Tokens().size());
+      failed_lanes.push_back(std::move(lane));
     }
     // Reusable: restore and decode again, equal to AR.
     bool reusable = true;
@@ -509,15 +528,23 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
       batch[i].stop_at_eos = false;
     }
     l3::Session::DecodeBatch(batch);
+    auto again_lanes = json::Value::array();
     for (std::size_t i = 0; i < 3; ++i) {
       const auto& t = batch[i].result.tokens;
-      reusable = reusable && batch[i].ok && !t.empty() &&
-                 std::equal(t.begin(), t.end(), ar[i].tokens.begin());
+      const bool equal = std::equal(t.begin(), t.end(), ar[i].tokens.begin());
+      reusable = reusable && batch[i].ok && !t.empty() && equal;
+      auto lane = json::Value::object();
+      lane["ok"] = batch[i].ok;
+      lane["tokens"] = U(t.size());
+      lane["equals_ar"] = equal;
+      again_lanes.push_back(std::move(lane));
     }
     auto o = json::Value::object();
     o["error"] = batch[0].error;
-    check("failed_verify_empties_lanes_reusable", emptied && reusable,
-          std::move(o));
+    o["failed"] = std::move(failed_lanes);
+    o["again"] = std::move(again_lanes);
+    check("failed_verify_empties_its_lanes_reusable",
+          injected && emptied && others_ok && reusable, std::move(o));
   }
   {
     // The second batched draft step fails after launch: its lane (the longer
