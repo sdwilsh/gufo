@@ -25,6 +25,7 @@
 #include "src/models/ling_3_flash/kernels/rocm/kernels.hpp"
 #include "src/models/ling_3_flash/layout.hpp"
 #include "tests/models/ling_3_flash/parent_digests.hpp"
+#include "tests/models/ling_3_flash/test_rng.hpp"
 
 namespace {
 
@@ -43,23 +44,7 @@ void CheckHip(hipError_t e, const char* what) {
   }
 }
 
-struct Rng {
-  std::uint64_t s;
-  explicit Rng(std::uint64_t seed) : s(seed * 0x9E3779B97F4A7C15ULL + 1) {}
-  std::uint64_t Next() {
-    s ^= s << 13;
-    s ^= s >> 7;
-    s ^= s << 17;
-    return s;
-  }
-  float Uniform() {
-    return static_cast<float>((Next() >> 40) * (1.0 / 16777216.0));
-  }
-  float Normal() {
-    const float u1 = std::max(Uniform(), 1e-7F), u2 = Uniform();
-    return std::sqrt(-2.0F * std::log(u1)) * std::cos(6.2831853F * u2);
-  }
-};
+using gufo::tests::ling::Rng;
 
 template<typename T>
 class Dev {
@@ -584,6 +569,12 @@ void CheckDecodeGolden(const std::string& key, std::uint64_t a,
   std::printf("DIGEST %s %016llx %016llx\n", key.c_str(),
               static_cast<unsigned long long>(a),
               static_cast<unsigned long long>(b));
+  if (gufo::tests::ling::PrintGoldens()) {
+    std::printf("    {\"%s\", 0x%016llxULL, 0x%016llxULL},\n", key.c_str(),
+                static_cast<unsigned long long>(a),
+                static_cast<unsigned long long>(b));
+    return;
+  }
   bool found = false, ok = false;
   for (const auto& g : parent_digests::kDecode)
     if (key == g.key) {
@@ -785,14 +776,19 @@ void TestPrefillInvariance(Setup& s, int n, int pool, float limit,
                             Name(s.down.type) + " n=" + std::to_string(n);
     const auto da = Fnv(full.first.data(), full.first.size() * 4);
     const auto dop = Fnv(full.second.data(), full.second.size() * 4);
-    for (const auto& g : parent_digests::kMoe)
-      if (key == g.key) {
-        const bool ok = g.act == da && g.out == dop;
-        std::printf("%-52s %s\n", (key + " == parent digest").c_str(),
-                    ok ? "PASS" : "FAIL");
-        if (!ok)
-          ++g_failures;
-      }
+    if (gufo::tests::ling::PrintGoldens())
+      std::printf("    {\"%s\", 0x%016llxULL, 0x%016llxULL},\n", key.c_str(),
+                  static_cast<unsigned long long>(da),
+                  static_cast<unsigned long long>(dop));
+    else
+      for (const auto& g : parent_digests::kMoe)
+        if (key == g.key) {
+          const bool ok = g.act == da && g.out == dop;
+          std::printf("%-52s %s\n", (key + " == parent digest").c_str(),
+                      ok ? "PASS" : "FAIL");
+          if (!ok)
+            ++g_failures;
+        }
   }
   const auto same = [&](const std::string& what) {
     const auto got = fetch();

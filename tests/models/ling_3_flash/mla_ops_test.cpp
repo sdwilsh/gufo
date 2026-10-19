@@ -12,7 +12,6 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
-#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -22,6 +21,7 @@
 #include "src/models/ling_3_flash/kernels/rocm/kernels.hpp"
 #include "src/models/ling_3_flash/layout.hpp"
 #include "tests/models/ling_3_flash/parent_digests.hpp"
+#include "tests/models/ling_3_flash/test_rng.hpp"
 
 namespace L = gufo::models::ling_3_flash;
 namespace mla = gufo::models::ling_3_flash::rocm::mla;
@@ -75,11 +75,10 @@ private:
 };
 
 std::vector<float> Normal(std::size_t n, std::uint32_t seed, float sigma) {
-  std::mt19937 gen(seed);
-  std::normal_distribution<float> dist(0.0F, sigma);
+  gufo::tests::ling::Rng gen(seed);
   std::vector<float> v(n);
   for (float& x : v) {
-    x = dist(gen);
+    x = gen.Normal(0.0F, sigma);
   }
   return v;
 }
@@ -741,6 +740,11 @@ void TestNonAbsorbedParentDigest() {
               d_gate.get(), store.get(), c.store_rows);
     const auto digest = static_cast<unsigned long long>(
         Fnv(got.data(), got.size() * sizeof(float)));
+    if (gufo::tests::ling::PrintGoldens()) {
+      std::printf("    {%u, %u, %u, 0x%016llxULL},\n", c.first, c.n,
+                  c.store_rows, digest);
+      continue;
+    }
     const bool ok = digest == c.digest;
     std::printf(
         "%-4s NonAbsorbed == parent digest first=%u n=%u store=%u "

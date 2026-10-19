@@ -8,7 +8,6 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
-#include <random>
 #include <thread>
 #include <vector>
 
@@ -16,6 +15,7 @@
 #include "src/core/runtime_environment.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/kernels.hpp"
 #include "tests/models/ling_3_flash/parent_digests.hpp"
+#include "tests/models/ling_3_flash/test_rng.hpp"
 
 namespace dn = gufo::models::ling_3_flash::rocm::dense;
 using gufo::models::ling_3_flash::rocm::WeightType;
@@ -23,7 +23,7 @@ using gufo::models::ling_3_flash::rocm::WeightType;
 namespace {
 
 int g_failures = 0;
-std::mt19937 g_rng(20260101);
+gufo::tests::ling::Rng g_rng(20260101);
 
 #define HIP_OK(call)                                                         \
   do {                                                                       \
@@ -57,10 +57,9 @@ struct Dev {
 };
 
 std::vector<float> Randn(std::size_t n, float sigma = 1.0F) {
-  std::normal_distribution<float> d(0.0F, sigma);
   std::vector<float> v(n);
   for (auto& x : v)
-    x = d(g_rng);
+    x = g_rng.Normal(0.0F, sigma);
   return v;
 }
 
@@ -190,11 +189,11 @@ void TestQ8(std::uint32_t rows, std::uint32_t k) {
     // (the residual plane is zero).
     constexpr std::uint32_t n = 8;
     std::vector<float> xe(std::size_t{n} * k);
-    std::uniform_int_distribution<int> qd(-127, 127);
     for (std::size_t b = 0; b < xe.size() / 32; ++b) {
       const float d = 0.01F * static_cast<float>(1 + b % 7);
       for (int i = 0; i < 32; ++i)
-        xe[b * 32 + i] = d * static_cast<float>(i == 5 ? 127 : qd(g_rng));
+        xe[b * 32 + i] =
+            d * static_cast<float>(i == 5 ? 127 : g_rng.Int(-127, 127));
     }
     const auto refe = RefGemm(wd, xe, n, k, rows);
     Dev<float> dxe(xe);
@@ -336,12 +335,11 @@ void TestF32Router() {
 void TestQuantizeF16ToQ8(std::uint32_t rows, std::uint32_t k) {
   std::vector<std::uint16_t> wh(std::size_t{rows} * k);
   {
-    std::normal_distribution<float> d(0.0F, 0.05F);
     for (std::size_t i = 0; i < wh.size(); ++i) {
       // Mix scales and a few all-zero blocks.
       const std::size_t b = i / 32;
       const float scale = b % 17 == 0 ? 0.0F : (b % 5 == 0 ? 20.0F : 1.0F);
-      wh[i] = HalfBits(scale * d(g_rng));
+      wh[i] = HalfBits(scale * g_rng.Normal(0.0F, 0.05F));
     }
   }
   Dev<std::uint16_t> dw(wh);
@@ -416,9 +414,8 @@ void TestQuantizeF16ToQ8(std::uint32_t rows, std::uint32_t k) {
 void TestF16(std::uint32_t rows, std::uint32_t k) {
   std::vector<std::uint16_t> wh(std::size_t{rows} * k);
   {
-    std::normal_distribution<float> d(0.0F, 0.05F);
     for (auto& h : wh)
-      h = HalfBits(d(g_rng));
+      h = HalfBits(g_rng.Normal(0.0F, 0.05F));
   }
   constexpr std::uint32_t kTok = 67;
   const auto x = Randn(std::size_t{kTok} * k);
@@ -489,7 +486,7 @@ float EmulateDot(const float* w, const float* x, std::size_t k) {
 void TestGemmInvariance(bool q8, std::uint32_t rows, std::uint32_t k,
                         std::uint32_t n_total) {
   // Fixed per-case seed: the digest must not depend on the test order.
-  g_rng.seed(0x5eed0000U + rows * 31U + k * 7U + n_total + (q8 ? 1U : 0U));
+  g_rng.Seed(0x5eed0000U + rows * 31U + k * 7U + n_total + (q8 ? 1U : 0U));
   std::vector<std::uint8_t> wbytes;
   std::vector<float> wd;  // dequantised (F16-exact for the F16 case)
   if (q8) {
@@ -498,9 +495,8 @@ void TestGemmInvariance(bool q8, std::uint32_t rows, std::uint32_t k,
   } else {
     wbytes.resize(std::size_t{rows} * k * 2);
     wd.resize(std::size_t{rows} * k);
-    std::normal_distribution<float> d(0.0F, 0.05F);
     for (std::size_t i = 0; i < wd.size(); ++i) {
-      const std::uint16_t h = HalfBits(d(g_rng));
+      const std::uint16_t h = HalfBits(g_rng.Normal(0.0F, 0.05F));
       std::memcpy(&wbytes[i * 2], &h, 2);
       _Float16 f;
       std::memcpy(&f, &h, 2);
@@ -550,7 +546,10 @@ void TestGemmInvariance(bool q8, std::uint32_t rows, std::uint32_t k,
         found = true;
         ok = g.digest == digest;
       }
-    if (found) {
+    if (gufo::tests::ling::PrintGoldens()) {
+      std::printf("    {\"%s\", %u, %u, %u, 0x%016llxULL},\n", what, rows, k,
+                  n_total, static_cast<unsigned long long>(digest));
+    } else if (found) {
       std::snprintf(name, sizeof name, "%s == parent digest rows=%u k=%u n=%u",
                     what, rows, k, n_total);
       std::printf("%-4s %s\n", ok ? "PASS" : "FAIL", name);
@@ -604,8 +603,8 @@ void TestGemmInvariance(bool q8, std::uint32_t rows, std::uint32_t k,
   // first/last tokens and rows are always included).
   std::vector<std::uint32_t> ts{0, n_total - 1}, rs{0, rows - 1};
   for (int i = 0; i < 46; ++i) {
-    ts.push_back(g_rng() % n_total);
-    rs.push_back(g_rng() % rows);
+    ts.push_back(g_rng.Next() % n_total);
+    rs.push_back(g_rng.Next() % rows);
   }
   std::vector<float> got, ref;
   for (auto t : ts)
@@ -706,12 +705,11 @@ void TestEmbed() {
   constexpr std::size_t row_bytes = hidden / 256 * 144;
   std::vector<std::uint8_t> table(std::size_t{vocab} * row_bytes);
   {
-    std::uniform_int_distribution<int> bd(0, 255);
-    std::uniform_real_distribution<float> dd(0.001F, 0.02F);
     for (auto& b : table)
-      b = static_cast<std::uint8_t>(bd(g_rng));
+      b = static_cast<std::uint8_t>(g_rng.Int(0, 255));
     for (std::size_t sb = 0; sb < table.size() / 144; ++sb) {
-      const std::uint16_t d = HalfBits(dd(g_rng)), m = HalfBits(dd(g_rng));
+      const std::uint16_t d = HalfBits(g_rng.Uniform(0.001F, 0.02F)),
+                          m = HalfBits(g_rng.Uniform(0.001F, 0.02F));
       std::memcpy(&table[sb * 144], &d, 2);
       std::memcpy(&table[sb * 144 + 2], &m, 2);
     }
@@ -739,12 +737,10 @@ void TestEmbedQ8_0() {
   constexpr std::size_t row_bytes = hidden / 32 * 34;
   std::vector<std::uint8_t> table(std::size_t{vocab} * row_bytes);
   {
-    std::uniform_int_distribution<int> bd(0, 255);
-    std::uniform_real_distribution<float> dd(0.0001F, 0.01F);
     for (auto& b : table)
-      b = static_cast<std::uint8_t>(bd(g_rng));
+      b = static_cast<std::uint8_t>(g_rng.Int(0, 255));
     for (std::size_t blk = 0; blk < table.size() / 34; ++blk) {
-      const std::uint16_t d = HalfBits(dd(g_rng));
+      const std::uint16_t d = HalfBits(g_rng.Uniform(0.0001F, 0.01F));
       std::memcpy(&table[blk * 34], &d, 2);
     }
   }
