@@ -556,6 +556,9 @@ struct PrefillStage {
 __launch_bounds__(kPfThreads) __global__
     void PrefillKernel(float* __restrict__ state, RecurrentArgs a,
                        std::uint32_t n_tokens) {
+  // Fast-math reassociation otherwise lets each compiler pick a different
+  // summation order, so the bits differ across toolchains.
+#pragma clang fp reassociate(off)
   const std::uint32_t tid = threadIdx.x;
   const std::uint32_t lane = tid & 31;
   const std::uint32_t wave = tid >> 5;
@@ -673,10 +676,10 @@ __launch_bounds__(kPfThreads) __global__
           st[m][1][x] *= ee.y;
           st[m][2][x] *= ee.z;
           st[m][3][x] *= ee.w;
-          u[x][0] += st[m][0][x] * kk[m].x;
-          u[x][1] += st[m][1][x] * kk[m].y;
-          u[x][2] += st[m][2][x] * kk[m].z;
-          u[x][3] += st[m][3][x] * kk[m].w;
+          u[x][0] = fmaf(st[m][0][x], kk[m].x, u[x][0]);
+          u[x][1] = fmaf(st[m][1][x], kk[m].y, u[x][1]);
+          u[x][2] = fmaf(st[m][2][x], kk[m].z, u[x][2]);
+          u[x][3] = fmaf(st[m][3][x], kk[m].w, u[x][3]);
         }
       }
       const float2 vv = *reinterpret_cast<const float2*>(
@@ -698,10 +701,10 @@ __launch_bounds__(kPfThreads) __global__
           st[m][1][x] = fmaf(kk[m].y, delta[x], st[m][1][x]);
           st[m][2][x] = fmaf(kk[m].z, delta[x], st[m][2][x]);
           st[m][3][x] = fmaf(kk[m].w, delta[x], st[m][3][x]);
-          o[x][0] += st[m][0][x] * qq.x;
-          o[x][1] += st[m][1][x] * qq.y;
-          o[x][2] += st[m][2][x] * qq.z;
-          o[x][3] += st[m][3][x] * qq.w;
+          o[x][0] = fmaf(st[m][0][x], qq.x, o[x][0]);
+          o[x][1] = fmaf(st[m][1][x], qq.y, o[x][1]);
+          o[x][2] = fmaf(st[m][2][x], qq.z, o[x][2]);
+          o[x][3] = fmaf(st[m][3][x], qq.w, o[x][3]);
         }
       }
       const float o0 = QuadSum((o[0][0] + o[0][1]) + (o[0][2] + o[0][3]));
