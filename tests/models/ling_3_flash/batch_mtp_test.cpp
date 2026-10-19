@@ -1,6 +1,6 @@
 // Full-model checks of batched MTP decoding (Session::DecodeBatch: shared
-// draft steps, verify forwards of at most 8 rows with per-lane rollback). Eight
-// sessions on distinct real-text prompts decode T tokens each:
+// draft steps, and verify forwards of at most 8 rows with per-lane rollback).
+// Eight sessions on distinct real-text prompts decode T tokens each:
 //   * greedy cohorts of 2, 3, 4 and 8 lanes with mixed draft widths (fixed
 //     1/3/7 and the adaptive cohort width): every lane's tokens equal plain
 //     greedy decoding of that session alone (Evaluate(Argmax())), and its
@@ -150,9 +150,6 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
     }
     return c;
   };
-  // A lane alone: DecodeStep with the lane's sampler, fixed width (0 =
-  // adaptive; part of a sampled lane's seeded trace) and stop token, until T
-  // tokens or a stop.
   // Forced copies for lane i: its AR continuation, every fifth token wrong;
   // `alternate` leaves every other 8 committed tokens to the MTP drafter. A
   // function of the lane's own committed tokens, so alone and batched agree.
@@ -174,6 +171,9 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
                          : truth;
     };
   };
+  // Runs a lane alone with DecodeStep, using the lane's sampler, fixed width (0
+  // is adaptive and is part of a sampled lane's seeded trace), and stop token,
+  // until T tokens or a stop.
   const auto solo_run = [&](std::size_t i, Kind kind, std::uint32_t fixed,
                             std::int32_t stop_token, Outcome* out,
                             int copy = 0) {
@@ -225,7 +225,7 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
     for (std::size_t m = 0; m < count; ++m) {
       const std::size_t i = plan.members[m];
       if (plan.kind[m] == kGreedy && !plan.stop) {
-        want[m] = ar[i];  // greedy MTP == plain greedy decoding
+        want[m] = ar[i];  // greedy MTP equals plain greedy decoding
         continue;
       }
       if (plan.stop) {
@@ -474,7 +474,7 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
           std::move(o2));
   }
   {
-    // A verify forward that fails after launch empties its lanes.
+    // A verify forward that fails after launch empties its own lanes.
     for (std::size_t i = 0; i < 3; ++i) {
       if (!lanes[i]->RestoreSnapshot(*start[i], &error)) {
         return fatal("restore");
@@ -489,12 +489,32 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
       batch[i].sampler = &samplers[i];
       batch[i].stop_at_eos = false;
     }
+    // One injected failure hits one verify forward. The lanes may split across
+    // several forwards (8 rows each, set by copy chains and the draft width).
+    // Only the failed forward's lanes fail and are emptied. The others decode
+    // on.
     model->FailBatchesForTest(1);
     l3::Session::DecodeBatch(batch);
+    bool injected = false;
     bool emptied = true;
+    bool others_ok = true;
+    auto failed_lanes = json::Value::array();
     for (std::size_t i = 0; i < 3; ++i) {
-      emptied = emptied && !batch[i].ok && lanes[i]->IsValid() &&
-                lanes[i]->Position() == 0 && lanes[i]->Tokens().empty();
+      const auto& t = batch[i].result.tokens;
+      if (batch[i].ok) {
+        others_ok = others_ok && !t.empty() &&
+                    std::equal(t.begin(), t.end(), ar[i].tokens.begin());
+      } else {
+        injected = injected ||
+                   batch[i].error.find("injected failure") != std::string::npos;
+        emptied = emptied && lanes[i]->IsValid() && lanes[i]->Position() == 0 &&
+                  lanes[i]->Tokens().empty();
+      }
+      auto lane = json::Value::object();
+      lane["ok"] = batch[i].ok;
+      lane["position"] = U(lanes[i]->Position());
+      lane["tokens"] = U(lanes[i]->Tokens().size());
+      failed_lanes.push_back(std::move(lane));
     }
     // Reusable: restore and decode again, equal to AR.
     bool reusable = true;
@@ -509,20 +529,28 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
       batch[i].stop_at_eos = false;
     }
     l3::Session::DecodeBatch(batch);
+    auto again_lanes = json::Value::array();
     for (std::size_t i = 0; i < 3; ++i) {
       const auto& t = batch[i].result.tokens;
-      reusable = reusable && batch[i].ok && !t.empty() &&
-                 std::equal(t.begin(), t.end(), ar[i].tokens.begin());
+      const bool equal = std::equal(t.begin(), t.end(), ar[i].tokens.begin());
+      reusable = reusable && batch[i].ok && !t.empty() && equal;
+      auto lane = json::Value::object();
+      lane["ok"] = batch[i].ok;
+      lane["tokens"] = U(t.size());
+      lane["equals_ar"] = equal;
+      again_lanes.push_back(std::move(lane));
     }
     auto o = json::Value::object();
     o["error"] = batch[0].error;
-    check("failed_verify_empties_lanes_reusable", emptied && reusable,
-          std::move(o));
+    o["failed"] = std::move(failed_lanes);
+    o["again"] = std::move(again_lanes);
+    check("failed_verify_empties_its_lanes_reusable",
+          injected && emptied && others_ok && reusable, std::move(o));
   }
   {
-    // The second batched draft step fails after launch: its lane (the longer
+    // The second batched draft step fails after launch. Its lane (the longer
     // chain) fails with the trunk untouched, as a failed draft alone leaves
-    // it; the shorter chain, done drafting, still verifies.
+    // it. The shorter chain has finished drafting and still verifies.
     for (std::size_t i = 0; i < 2; ++i) {
       if (!lanes[i]->RestoreSnapshot(*start[i], &error)) {
         return fatal("restore");
