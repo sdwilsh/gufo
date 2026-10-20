@@ -1,5 +1,13 @@
 {
   "arbiter": "Gufo ReferenceModel over the same GGUF, F32 activations and F32 latent cache (src/models/ling_3_flash/reference.cpp)",
+  "model": "Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf",
+  "variant": "q4ks",
+  "source": {
+    "revision": "3186127220b071a884270ef5004d34bf6d675038",
+    "dirty": "0",
+    "image": "ephemeral-container-registry.hogs.tswn.us/gufo-ling-426:n173-q4ks-24h"
+  },
+  "measuredOn": "2026-10-20",
   "bases": {
     "chat128.kl": "087096abe9313b2df74d01d3c2c0d277c46793620d73e2b2e32534c4313a5e6e",
     "window512.kl": "059db4f6b2534d2f614e17a9c61a8ae4545f755503338207620dfaf22b0d02e0"
@@ -11,8 +19,8 @@
       "kl_mean_stderr": 3.66846e-06,
       "kl_p99": 0.00022206,
       "kl_max": 0.00035099,
-      "top1_agreement": 1,
-      "positions": 126
+      "positions": 126,
+      "top1_agreement": 1
     },
     "gufo-decode-window512": {
       "status": "pass",
@@ -20,26 +28,27 @@
       "kl_mean_stderr": 9.39e-05,
       "kl_p99": 0.008529,
       "kl_max": 0.0122,
-      "top1_agreement": 0.99216,
-      "positions": 255
+      "positions": 255,
+      "top1_agreement": 0.99216
     },
     "gufo-prefill-chat128": {
       "status": "pass",
-      "kl_mean": 0.000340786,
-      "kl_mean_stderr": 0.000196493,
-      "kl_p99": 0.0028388,
-      "kl_max": 0.024279,
-      "top1_agreement": 1,
-      "positions": 126
+      "kl_mean": 0.00149337,
+      "kl_mean_stderr": 0.000436903,
+      "kl_p99": 0.018713,
+      "kl_max": 0.043905,
+      "positions": 126,
+      "top1_agreement": 0.99206
     },
     "gufo-prefill-window512": {
       "status": "fail",
-      "kl_mean": 0.000775274,
-      "kl_mean_stderr": 0.000127466,
-      "kl_p99": 0.0085164,
-      "kl_max": 0.02174,
-      "top1_agreement": 0.96863,
-      "positions": 255
+      "kl_mean": 0.000923341,
+      "kl_mean_stderr": 0.000140174,
+      "kl_p99": 0.010205,
+      "kl_max": 0.021858,
+      "positions": 255,
+      "top1_agreement": 0.97647,
+      "exit_code": 1
     },
     "llama-f16-decode-chat128": {
       "status": null,
@@ -47,8 +56,8 @@
       "kl_mean_stderr": null,
       "kl_p99": 0.049551,
       "kl_max": 0.081065,
-      "top1_agreement": null,
-      "positions": 126
+      "positions": 126,
+      "top1_agreement": null
     },
     "llama-f16-decode-window512": {
       "status": null,
@@ -56,8 +65,8 @@
       "kl_mean_stderr": null,
       "kl_p99": 0.01413,
       "kl_max": 0.214438,
-      "top1_agreement": null,
-      "positions": 255
+      "positions": 255,
+      "top1_agreement": null
     },
     "llama-f16-prefill-chat128": {
       "status": null,
@@ -65,8 +74,8 @@
       "kl_mean_stderr": null,
       "kl_p99": 0.038196,
       "kl_max": 0.078498,
-      "top1_agreement": null,
-      "positions": 126
+      "positions": 126,
+      "top1_agreement": null
     },
     "llama-f16-prefill-window512": {
       "status": null,
@@ -74,8 +83,8 @@
       "kl_mean_stderr": null,
       "kl_p99": 0.028189,
       "kl_max": 0.052528,
-      "top1_agreement": null,
-      "positions": 255
+      "positions": 255,
+      "top1_agreement": null
     },
     "llama-q8_0-decode-chat128": {
       "status": null,
@@ -83,8 +92,8 @@
       "kl_mean_stderr": null,
       "kl_p99": 0.036701,
       "kl_max": 0.045714,
-      "top1_agreement": null,
-      "positions": 126
+      "positions": 126,
+      "top1_agreement": null
     },
     "llama-q8_0-decode-window512": {
       "status": null,
@@ -92,8 +101,8 @@
       "kl_mean_stderr": null,
       "kl_p99": 0.024964,
       "kl_max": 0.079973,
-      "top1_agreement": null,
-      "positions": 255
+      "positions": 255,
+      "top1_agreement": null
     },
     "llama-q8_0-prefill-chat128": {
       "status": null,
@@ -101,8 +110,8 @@
       "kl_mean_stderr": null,
       "kl_p99": 0.052446,
       "kl_max": 0.120228,
-      "top1_agreement": null,
-      "positions": 126
+      "positions": 126,
+      "top1_agreement": null
     },
     "llama-q8_0-prefill-window512": {
       "status": null,
@@ -110,8 +119,8 @@
       "kl_mean_stderr": null,
       "kl_p99": 0.039969,
       "kl_max": 0.206576,
-      "top1_agreement": null,
-      "positions": 255
+      "positions": 255,
+      "top1_agreement": null
     },
     "mtp_test": {
       "status": "pass",

@@ -1,13 +1,13 @@
 # Ling-3.0-flash benchmarks
 
-AMD Strix Halo `gfx1151`, 128 GB unified memory. Gufo (the v0.17 build, gufo
-349b9d95, fork tag v0.17.0.0, plus the evidence kit; see
+AMD Strix Halo `gfx1151`, 128 GB unified memory. Gufo (the v0.17.1 build, gufo
+0.17.1.0 at 0cbd54d, plus the evidence kit; see
 [Benchmark method](QUALITY.md#benchmark-method)) versus
 llama.cpp `server-vulkan-v0.5.0` (`0.5.0-dev`, build 11146, commit 7fe450e19) on
 Vulkan with Mesa 26.0.8 RADV, at its production flags `-fa on -ctk q8_0 -ctv
 q8_0`. Both engines load the same two published files, **AD-Q4_K_S** (the
 production target) and **AD-Q5_K_M**. HTTP, greedy, thinking off, measured
-October 18, 2026 for Gufo and October 12, 2026 for llama.cpp. Positive gain
+October 19 and 20, 2026 for Gufo and October 12, 2026 for llama.cpp. Positive gain
 favors Gufo.
 [Quality and measurement details](QUALITY.md) · [Model identities](artifacts/model-identities.json)
 
@@ -31,11 +31,11 @@ sample per cell. Gufo runs `--speculative off`.
 <!-- bench:single-ar-q4ks -->
 | Ling-3.0-flash AD-Q4_K_S AR<br>Depth (tokens) | Gufo pp (tok/s) | llama.cpp pp (tok/s) | Gain | Gufo tg (tok/s) | llama.cpp tg (tok/s) | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1059.35 | 433.01 | +144.6% | 35.84 | 33.21 | +7.9% |
-| 32,768 | 827.65 | 148.85 | +456.0% | 33.60 | 24.27 | +38.4% |
-| 65,536 | 680.68 | 71.82 | +847.8% | 32.04 | 19.06 | +68.1% |
-| 131,072 | 465.87 | 38.61 | +1106.6% | 29.53 | 13.35 | +121.2% |
-| 196,608 | 319.45 | 25.04 | +1175.8% | 27.33 | 9.93 | +175.2% |
+| 0 | 1068.50 | 433.01 | +146.8% | 36.32 | 33.21 | +9.4% |
+| 32,768 | 838.76 | 148.85 | +463.5% | 33.98 | 24.27 | +40.0% |
+| 65,536 | 690.76 | 71.82 | +861.8% | 32.29 | 19.06 | +69.4% |
+| 131,072 | 475.21 | 38.61 | +1130.8% | 29.58 | 13.35 | +121.6% |
+| 196,608 | 328.55 | 25.04 | +1212.1% | 27.24 | 9.93 | +174.3% |
 <!-- /bench -->
 
 ![Single user, autoregressive](artifacts/charts/single-ar-q4ks.svg)
@@ -49,11 +49,11 @@ llama.cpp on machine B.
 <!-- bench:single-ar-q5km -->
 | Ling-3.0-flash AD-Q5_K_M AR<br>Depth (tokens) | Gufo pp (tok/s) | llama.cpp pp (tok/s) | Gain | Gufo tg (tok/s) | llama.cpp tg (tok/s) | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1009.71 | 402.82 | +150.7% | 34.49 | 32.04 | +7.6% |
-| 32,768 | 786.16 | 142.92 | +450.1% | 32.44 | 23.63 | +37.3% |
-| 65,536 | 650.63 | 69.28 | +839.1% | 30.94 | 18.58 | +66.5% |
-| 131,072 | 451.02 | 36.97 | +1120.0% | 28.62 | 12.86 | +122.6% |
-| 196,608 | 310.65 | 24.88 | +1148.6% | 26.53 | 9.66 | +174.6% |
+| 0 | 1015.91 | 402.82 | +152.2% | 35.00 | 32.04 | +9.2% |
+| 32,768 | 794.70 | 142.92 | +456.0% | 32.87 | 23.63 | +39.1% |
+| 65,536 | 658.43 | 69.28 | +850.4% | 31.27 | 18.58 | +68.3% |
+| 131,072 | 458.48 | 36.97 | +1140.1% | 28.74 | 12.86 | +123.5% |
+| 196,608 | 318.26 | 24.88 | +1179.2% | 26.54 | 9.66 | +174.7% |
 <!-- /bench -->
 
 ![Single user, autoregressive](artifacts/charts/single-ar-q5km.svg)
@@ -74,10 +74,10 @@ prompt's draft acceptance (0.01 to 1.06 accepted tokens per step, or 20 to 75% o
 <!-- bench:single-mtp-q4ks -->
 | Ling-3.0-flash AD-Q4_K_S MTP<br>Depth (tokens) | Gufo pp (tok/s) | Gufo tg mixed (tok/s) | llama.cpp AR tg mixed (tok/s) | Gain mixed | Gufo tg repetitive (tok/s) | llama.cpp AR tg repetitive (tok/s) | Gain repetitive |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1059.58 | 51.10 | 33.21 | +53.9% | 112.35 | 33.21 | +238.3% |
-| 32,768 | 825.20 | 46.16 | 24.27 | +90.2% | 92.66 | 24.27 | +281.8% |
-| 65,536 | 680.11 | 36.40 | 19.06 | +91.0% | 80.94 | 19.06 | +324.7% |
-| 131,072 | 466.23 | 28.81 | 13.35 | +115.8% | 66.30 | 13.35 | +396.6% |
+| 0 | 1064.41 | 52.53 | 33.21 | +58.2% | 115.13 | 33.21 | +246.7% |
+| 32,768 | 834.11 | 44.97 | 24.27 | +85.3% | 93.65 | 24.27 | +285.9% |
+| 65,536 | 688.79 | 35.89 | 19.06 | +88.3% | 81.46 | 19.06 | +327.4% |
+| 131,072 | 475.24 | 28.96 | 13.35 | +116.9% | 65.84 | 13.35 | +393.2% |
 <!-- /bench -->
 
 ![Single user, MTP](artifacts/charts/single-mtp-q4ks.svg)
@@ -87,10 +87,10 @@ prompt's draft acceptance (0.01 to 1.06 accepted tokens per step, or 20 to 75% o
 <!-- bench:single-mtp-q5km -->
 | Ling-3.0-flash AD-Q5_K_M MTP<br>Depth (tokens) | Gufo pp (tok/s) | Gufo tg mixed (tok/s) | llama.cpp AR tg mixed (tok/s) | Gain mixed | Gufo tg repetitive (tok/s) | llama.cpp AR tg repetitive (tok/s) | Gain repetitive |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1005.07 | 38.99 | 32.04 | +21.7% | 104.63 | 32.04 | +226.6% |
-| 32,768 | 787.05 | 42.82 | 23.63 | +81.2% | 86.83 | 23.63 | +267.5% |
-| 65,536 | 652.89 | 30.65 | 18.58 | +65.0% | 76.53 | 18.58 | +311.9% |
-| 131,072 | 451.61 | 33.59 | 12.86 | +161.2% | 63.32 | 12.86 | +392.4% |
+| 0 | 1009.21 | 45.18 | 32.04 | +41.0% | 109.64 | 32.04 | +242.2% |
+| 32,768 | 795.27 | 43.22 | 23.63 | +82.9% | 88.18 | 23.63 | +273.2% |
+| 65,536 | 660.49 | 35.11 | 18.58 | +89.0% | 76.82 | 18.58 | +313.5% |
+| 131,072 | 459.37 | 29.33 | 12.86 | +128.1% | 63.03 | 12.86 | +390.1% |
 <!-- /bench -->
 
 ![Single user, MTP](artifacts/charts/single-mtp-q5km.svg)
@@ -108,11 +108,11 @@ with at most 9 tokens re-prefilled.
 <!-- bench:multi-ar-q4ks -->
 | Ling-3.0-flash AD-Q4_K_S AR<br>Users | Gufo AR (tok/s) | llama.cpp AR (tok/s) | Gain |
 | ---: | ---: | ---: | ---: |
-| 1 | 35.71 | 29.84 | +19.7% |
-| 2 | 65.36 | 40.14 | +62.8% |
-| 4 | 110.28 | 61.84 | +78.3% |
-| 6 | 146.39 | 69.70 | +110.0% |
-| 8 | 166.34 | 78.93 | +110.7% |
+| 1 | 36.28 | 29.84 | +21.6% |
+| 2 | 66.92 | 40.14 | +66.7% |
+| 4 | 112.93 | 61.84 | +82.6% |
+| 6 | 149.85 | 69.70 | +115.0% |
+| 8 | 170.81 | 78.93 | +116.4% |
 <!-- /bench -->
 
 ![Multiple users, autoregressive](artifacts/charts/multi-ar-q4ks.svg)
@@ -122,11 +122,11 @@ with at most 9 tokens re-prefilled.
 <!-- bench:multi-ar-q5km -->
 | Ling-3.0-flash AD-Q5_K_M AR<br>Users | Gufo AR (tok/s) | llama.cpp AR (tok/s) | Gain |
 | ---: | ---: | ---: | ---: |
-| 1 | 34.44 | 28.82 | +19.5% |
-| 2 | 63.19 | 36.25 | +74.3% |
-| 4 | 107.36 | 57.38 | +87.1% |
-| 6 | 142.54 | 64.65 | +120.5% |
-| 8 | 160.93 | 78.96 | +103.8% |
+| 1 | 34.94 | 28.82 | +21.2% |
+| 2 | 63.77 | 36.25 | +75.9% |
+| 4 | 110.20 | 57.38 | +92.1% |
+| 6 | 146.65 | 64.65 | +126.8% |
+| 8 | 168.57 | 78.96 | +113.5% |
 <!-- /bench -->
 
 ![Multiple users, autoregressive](artifacts/charts/multi-ar-q5km.svg)
@@ -144,11 +144,11 @@ Repetitive prompts gain most at few users and flatten at 113-129 tok/s.
 <!-- bench:multi-mtp-q4ks -->
 | Ling-3.0-flash AD-Q4_K_S MTP<br>Users | Gufo mixed (tok/s) | llama.cpp mixed (tok/s) | Gain | Gufo repetitive (tok/s) | llama.cpp repetitive (tok/s) | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 51.10 | N/A | N/A | 112.19 | N/A | N/A |
-| 2 | 91.01 | N/A | N/A | 127.88 | N/A | N/A |
-| 4 | 118.53 | N/A | N/A | 133.77 | N/A | N/A |
-| 6 | 144.03 | N/A | N/A | 132.87 | N/A | N/A |
-| 8 | 162.03 | N/A | N/A | 133.73 | N/A | N/A |
+| 1 | 52.47 | N/A | N/A | 114.58 | N/A | N/A |
+| 2 | 94.53 | N/A | N/A | 131.66 | N/A | N/A |
+| 4 | 137.36 | N/A | N/A | 137.79 | N/A | N/A |
+| 6 | 147.13 | N/A | N/A | 136.75 | N/A | N/A |
+| 8 | 167.37 | N/A | N/A | 138.90 | N/A | N/A |
 <!-- /bench -->
 
 ![Multiple users, MTP](artifacts/charts/multi-mtp-q4ks.svg)
@@ -158,11 +158,11 @@ Repetitive prompts gain most at few users and flatten at 113-129 tok/s.
 <!-- bench:multi-mtp-q5km -->
 | Ling-3.0-flash AD-Q5_K_M MTP<br>Users | Gufo mixed (tok/s) | llama.cpp mixed (tok/s) | Gain | Gufo repetitive (tok/s) | llama.cpp repetitive (tok/s) | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 38.97 | N/A | N/A | 103.17 | N/A | N/A |
-| 2 | 80.46 | N/A | N/A | 119.30 | N/A | N/A |
-| 4 | 125.78 | N/A | N/A | 122.31 | N/A | N/A |
-| 6 | 139.78 | N/A | N/A | 122.52 | N/A | N/A |
-| 8 | 156.70 | N/A | N/A | 125.16 | N/A | N/A |
+| 1 | 45.11 | N/A | N/A | 109.83 | N/A | N/A |
+| 2 | 74.80 | N/A | N/A | 122.37 | N/A | N/A |
+| 4 | 126.09 | N/A | N/A | 128.24 | N/A | N/A |
+| 6 | 143.80 | N/A | N/A | 126.18 | N/A | N/A |
+| 8 | 163.90 | N/A | N/A | 128.72 | N/A | N/A |
 <!-- /bench -->
 
 ![Multiple users, MTP](artifacts/charts/multi-mtp-q5km.svg)
@@ -171,7 +171,7 @@ Repetitive prompts gain most at few users and flatten at 113-129 tok/s.
 
 Context capacity 133121, autoregressive, one session. Gufo's value is the peak
 device-global HIP memory counter during the request, which includes the default
-12 GiB expanded K/V store and matches the sysfs GTT peak (82.84 and 97.02 GiB).
+12 GiB expanded K/V store and matches the sysfs GTT peak (82.85 and 97.03 GiB).
 The HIP counter does not see llama.cpp's Vulkan allocations, so its value is the
 sysfs GTT peak over the whole table run; llama.cpp preallocates its K/V cache,
 and one value covers both workloads. Negative gain means Gufo uses more.
@@ -184,8 +184,8 @@ Q5_K_M, each at context 199296).
 <!-- bench:memory-q4ks -->
 | Ling-3.0-flash AD-Q4_K_S AR<br>Workload | Gufo GiB | llama.cpp GiB | Gain |
 | --- | ---: | ---: | ---: |
-| pp2048 + tg128 | 82.82 | 69.95 | -15.5% |
-| 16K prefix, pp4096 + tg128 | 82.82 | 69.95 | -15.5% |
+| pp2048 + tg128 | 82.83 | 69.95 | -15.5% |
+| 16K prefix, pp4096 + tg128 | 82.83 | 69.95 | -15.5% |
 <!-- /bench -->
 
 ![Memory occupation](artifacts/charts/memory-q4ks.svg)
@@ -195,8 +195,8 @@ Q5_K_M, each at context 199296).
 <!-- bench:memory-q5km -->
 | Ling-3.0-flash AD-Q5_K_M AR<br>Workload | Gufo GiB | llama.cpp GiB | Gain |
 | --- | ---: | ---: | ---: |
-| pp2048 + tg128 | 97.00 | 84.12 | -13.3% |
-| 16K prefix, pp4096 + tg128 | 97.00 | 84.12 | -13.3% |
+| pp2048 + tg128 | 97.01 | 84.12 | -13.3% |
+| 16K prefix, pp4096 + tg128 | 97.01 | 84.12 | -13.3% |
 <!-- /bench -->
 
 ![Memory occupation](artifacts/charts/memory-q5km.svg)

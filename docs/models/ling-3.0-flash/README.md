@@ -159,7 +159,7 @@ component cache (shared latent-row chunks, copied recurrent state) with a
   its adapter in `src/models/ling_3_flash/continuation_adapter.*`. Disk cache
   directories written by the earlier snapshot format are rebuilt cold. The
   benchmark figures on this card were measured on the component cache, with
-  the v0.17.0.0 build.
+  the v0.17.1 build.
 - **Tool-call streaming.** The Bailing parser publishes a tool call only after
   its first argument value opens or an argument finishes, so a header-only call
   (function name, no argument) is never published, and an end of stream there
