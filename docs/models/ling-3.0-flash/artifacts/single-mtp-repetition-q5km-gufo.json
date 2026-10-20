@@ -22,7 +22,7 @@
     "fingerprintId": "f3bf7553454ce41947a30c5f7df2bd7a4018ccb2681fad2196c008ddd511c8aa",
     "schemaVersion": "1.0.0"
   },
-  "measuredOn": "2026-10-18",
+  "measuredOn": "2026-10-19",
   "mode": "mtp",
   "model": {
     "id": "Ling-3.0-flash",
@@ -30,31 +30,30 @@
   },
   "notes": [
     "pp2048/tg128; depth is a cached conversation prefix of synthetic text (8-token reply); measured turn task is recorded per row; tolerance max(32, 0.500%) on cache_n and prompt_n; actual counts per sample in rows",
-    "synthetic text: 1.173 tokens/word, template overhead 21 tokens",
-    "gufo binary sha256 349b9d958b09cb979f293a196fe038a93bf81693ea7246448f684d95de51abfe (v0.17.0.0 release candidate 12)"
+    "synthetic text: 1.173 tokens/word, template overhead 21 tokens"
   ],
   "referenceName": "llama.cpp",
   "rows": {
     "0": {
-      "acceptance": 96.4,
+      "acceptance": 98.18,
       "acceptance_sd": null,
-      "accepted_per_step": 5.1,
+      "accepted_per_step": 5.4,
       "accepted_per_step_sd": null,
-      "command": "gufo serve --port 60757 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
+      "command": "gufo serve --port 53367 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
       "counts": [
         {
           "cache_n": 0,
           "completion_sha256": "62df33cd8a582d8f3786beb941c1d2e04d894dc11e0d56fbed7accf27dcbc7c9",
-          "draft_n": 111,
-          "draft_n_accepted": 107,
+          "draft_n": 110,
+          "draft_n_accepted": 108,
           "predicted_n": 128,
           "prompt_n": 2025
         }
       ],
-      "pp": 999.48,
+      "pp": 1008.34,
       "pp_sd": null,
       "samples": 1,
-      "tg": 104.63,
+      "tg": 109.64,
       "tg_sd": null,
       "workload": "repetition"
     },
@@ -63,7 +62,7 @@
       "acceptance_sd": null,
       "accepted_per_step": 5.1,
       "accepted_per_step_sd": null,
-      "command": "gufo serve --port 60757 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
+      "command": "gufo serve --port 53367 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
       "counts": [
         {
           "cache_n": 131224,
@@ -74,10 +73,10 @@
           "prompt_n": 2045
         }
       ],
-      "pp": 451.61,
+      "pp": 459.37,
       "pp_sd": null,
       "samples": 1,
-      "tg": 63.32,
+      "tg": 63.03,
       "tg_sd": null,
       "workload": "repetition"
     },
@@ -86,7 +85,7 @@
       "acceptance_sd": null,
       "accepted_per_step": 4.82,
       "accepted_per_step_sd": null,
-      "command": "gufo serve --port 60757 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
+      "command": "gufo serve --port 53367 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
       "counts": [
         {
           "cache_n": 32761,
@@ -97,33 +96,33 @@
           "prompt_n": 2043
         }
       ],
-      "pp": 787.05,
+      "pp": 795.27,
       "pp_sd": null,
       "samples": 1,
-      "tg": 86.83,
+      "tg": 88.18,
       "tg_sd": null,
       "workload": "repetition"
     },
     "65536": {
-      "acceptance": 96.4,
+      "acceptance": 98.15,
       "acceptance_sd": null,
-      "accepted_per_step": 5.1,
+      "accepted_per_step": 4.82,
       "accepted_per_step_sd": null,
-      "command": "gufo serve --port 60757 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
+      "command": "gufo serve --port 53367 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
       "counts": [
         {
           "cache_n": 65553,
           "completion_sha256": "b515c3f488f9314311cf88030d3b127d7c23eb4381f2e061d3aa44a604b762e4",
-          "draft_n": 111,
-          "draft_n_accepted": 107,
+          "draft_n": 108,
+          "draft_n_accepted": 106,
           "predicted_n": 128,
           "prompt_n": 2048
         }
       ],
-      "pp": 652.89,
+      "pp": 660.49,
       "pp_sd": null,
       "samples": 1,
-      "tg": 76.53,
+      "tg": 76.82,
       "tg_sd": null,
       "workload": "repetition"
     }
@@ -134,7 +133,7 @@
       "gufo",
       "serve",
       "--port",
-      "60757",
+      "53367",
       "--sessions",
       "1",
       "llm",
@@ -156,8 +155,8 @@
   },
   "source": {
     "buildMode": "nix-release",
-    "dirty": true,
-    "revision": "09e531119008316645c94da0fe289c528bb62f41"
+    "dirty": false,
+    "revision": "3186127220b071a884270ef5004d34bf6d675038"
   },
   "table": "single-mtp-repetition-q5km",
   "target": "gufo"

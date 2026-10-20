@@ -22,7 +22,7 @@
     "fingerprintId": "f3bf7553454ce41947a30c5f7df2bd7a4018ccb2681fad2196c008ddd511c8aa",
     "schemaVersion": "1.0.0"
   },
-  "measuredOn": "2026-10-18",
+  "measuredOn": "2026-10-19",
   "mode": "mtp",
   "model": {
     "id": "Ling-3.0-flash",
@@ -30,54 +30,53 @@
   },
   "notes": [
     "pp2048/tg128; depth is a cached conversation prefix of synthetic text (8-token reply); measured turn task is recorded per row; tolerance max(32, 0.500%) on cache_n and prompt_n; actual counts per sample in rows",
-    "synthetic text: 1.174 tokens/word, template overhead 21 tokens",
-    "gufo binary sha256 349b9d958b09cb979f293a196fe038a93bf81693ea7246448f684d95de51abfe (v0.17.0.0 release candidate 12)"
+    "synthetic text: 1.174 tokens/word, template overhead 21 tokens"
   ],
   "referenceName": "llama.cpp",
   "rows": {
     "0": {
-      "acceptance": 54.84,
+      "acceptance": 66.67,
       "acceptance_sd": null,
-      "accepted_per_step": 0.36,
+      "accepted_per_step": 0.73,
       "accepted_per_step_sd": null,
-      "command": "gufo serve --port 52471 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
+      "command": "gufo serve --port 44035 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
       "counts": [
         {
           "cache_n": 0,
-          "completion_sha256": "cdb752df6e079a718bb485d81f1d6ad69d58db87b1affe19eda0e79d95ec5703",
-          "draft_n": 62,
-          "draft_n_accepted": 34,
+          "completion_sha256": "1b4ee887d912e90265c6e995144724f095587b2c870f4530eda94ebab8975846",
+          "draft_n": 81,
+          "draft_n_accepted": 54,
           "predicted_n": 128,
           "prompt_n": 2029
         }
       ],
-      "pp": 1005.07,
+      "pp": 1009.21,
       "pp_sd": null,
       "samples": 1,
-      "tg": 38.99,
+      "tg": 45.18,
       "tg_sd": null,
       "workload": "prose"
     },
     "131072": {
-      "acceptance": 71.83,
+      "acceptance": 58.06,
       "acceptance_sd": null,
-      "accepted_per_step": 0.66,
+      "accepted_per_step": 0.16,
       "accepted_per_step_sd": null,
-      "command": "gufo serve --port 52471 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
+      "command": "gufo serve --port 44035 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
       "counts": [
         {
           "cache_n": 131209,
-          "completion_sha256": "4bde7996e1c9f02f372861d485017050a026f9d42ce1484382b92eb6268675f8",
-          "draft_n": 71,
-          "draft_n_accepted": 51,
+          "completion_sha256": "c17951e34aba68ad27029b800bbe2e4547f2ef2f813521c2358f6351e363b24a",
+          "draft_n": 31,
+          "draft_n_accepted": 18,
           "predicted_n": 128,
           "prompt_n": 2049
         }
       ],
-      "pp": 450.53,
+      "pp": 458.79,
       "pp_sd": null,
       "samples": 1,
-      "tg": 33.59,
+      "tg": 29.33,
       "tg_sd": null,
       "workload": "prose"
     },
@@ -86,7 +85,7 @@
       "acceptance_sd": null,
       "accepted_per_step": 0.8,
       "accepted_per_step_sd": null,
-      "command": "gufo serve --port 52471 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
+      "command": "gufo serve --port 44035 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
       "counts": [
         {
           "cache_n": 32757,
@@ -97,33 +96,33 @@
           "prompt_n": 2047
         }
       ],
-      "pp": 784.19,
+      "pp": 792.88,
       "pp_sd": null,
       "samples": 1,
-      "tg": 42.82,
+      "tg": 43.22,
       "tg_sd": null,
       "workload": "prose"
     },
     "65536": {
-      "acceptance": 39.13,
+      "acceptance": 66.67,
       "acceptance_sd": null,
-      "accepted_per_step": 0.08,
+      "accepted_per_step": 0.39,
       "accepted_per_step_sd": null,
-      "command": "gufo serve --port 52471 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
+      "command": "gufo serve --port 44035 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
       "counts": [
         {
           "cache_n": 65542,
-          "completion_sha256": "94fc9a3f80f91dfc67092fe0d1815cdfac4ceca3646430b96f4c497e649273a3",
-          "draft_n": 23,
-          "draft_n_accepted": 9,
+          "completion_sha256": "cace2a948d1fc0e23664cf1a78506df3b195ae9f7d5ae8ca84ddffa28d0f8e68",
+          "draft_n": 54,
+          "draft_n_accepted": 36,
           "predicted_n": 128,
           "prompt_n": 2051
         }
       ],
-      "pp": 649.2,
+      "pp": 659.4,
       "pp_sd": null,
       "samples": 1,
-      "tg": 30.65,
+      "tg": 35.11,
       "tg_sd": null,
       "workload": "prose"
     }
@@ -134,7 +133,7 @@
       "gufo",
       "serve",
       "--port",
-      "52471",
+      "44035",
       "--sessions",
       "1",
       "llm",
@@ -156,8 +155,8 @@
   },
   "source": {
     "buildMode": "nix-release",
-    "dirty": true,
-    "revision": "09e531119008316645c94da0fe289c528bb62f41"
+    "dirty": false,
+    "revision": "3186127220b071a884270ef5004d34bf6d675038"
   },
   "table": "single-mtp-q5km",
   "target": "gufo"

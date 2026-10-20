@@ -1,6 +1,6 @@
 # Ling-3.0-Flash quality
 
-**AD-Q4_K_S and AD-Q5_K_M: Gufo's decode and prefill paths stay within mean KL 0.0015 of the F32 arbiter on both text sets, against 0.0027 to 0.0061 for llama.cpp Vulkan.**
+For AD-Q4_K_S and AD-Q5_K_M, Gufo's decode and prefill paths stay within mean KL 0.0016 of the F32 arbiter on both text sets, against 0.0027 to 0.0061 for llama.cpp Vulkan.
 
 The arbiter is Gufo's scalar CPU implementation of the llama.cpp `bailingmoe3`
 graph over the same GGUF (`src/models/ling_3_flash/reference.cpp`, F32
@@ -15,13 +15,14 @@ dumps and bases.
 Cells are mean KL (nats) / 99th-percentile KL / top-1 agreement with the
 arbiter. llama.cpp's perplexity tool does not report top-1 in these runs.
 `llama-perplexity --kl-divergence` and Gufo's `logit_dump` score the same base
-files, so the scales are shared. Both quants' quality runs used machine B
-(engine fidelity does not depend on the machine's speed).
+files, so the scales are shared. The AD-Q5_K_M quality run used machine B and
+the AD-Q4_K_S run used machine A. A repeat of the AD-Q4_K_S run on machine B
+gave bit-identical results for every Gufo and llama.cpp step.
 
 | Chat set, 126 positions | AD-Q4_K_S | AD-Q5_K_M |
 | --- | ---: | ---: |
 | Gufo decode (one token per forward) | 4.92e-06 / 0.000222 / 100.0% | 1.96e-05 / 0.00051 / 100.0% |
-| Gufo prefill (bulk) | 0.000341 / 0.00284 / 100.0% | 0.000117 / 0.00271 / 100.0% |
+| Gufo prefill (bulk) | 0.00149 / 0.0187 / 99.2% | 0.000610 / 0.0141 / 99.2% |
 | llama.cpp Vulkan q8_0 K/V, decode | 0.00404 / 0.0367 | 0.00329 / 0.0324 |
 | llama.cpp Vulkan q8_0 K/V, prefill | 0.00506 / 0.0524 | 0.00452 / 0.0429 |
 | llama.cpp Vulkan f16 K/V, decode | 0.00359 / 0.0496 | 0.00367 / 0.0437 |
@@ -30,21 +31,31 @@ files, so the scales are shared. Both quants' quality runs used machine B
 | Novel text, 255 positions | AD-Q4_K_S | AD-Q5_K_M |
 | --- | ---: | ---: |
 | Gufo decode (one token per forward) | 0.000572 / 0.00853 / 99.2% | 0.00151 / 0.0196 / 99.2% |
-| Gufo prefill (bulk) | 0.000775 / 0.00852 / 96.9% | 0.00107 / 0.0131 / 100.0% |
+| Gufo prefill (bulk) | 0.000923 / 0.0102 / 97.6% | 0.00156 / 0.0140 / 98.8% |
 | llama.cpp Vulkan q8_0 K/V, decode | 0.00328 / 0.025 | 0.00287 / 0.0233 |
 | llama.cpp Vulkan q8_0 K/V, prefill | 0.0061 / 0.04 | 0.00562 / 0.0372 |
 | llama.cpp Vulkan f16 K/V, decode | 0.00313 / 0.0141 | 0.00273 / 0.0254 |
 | llama.cpp Vulkan f16 K/V, prefill | 0.00508 / 0.0282 | 0.005 / 0.0292 |
 
-One gate verdict: the raw AD-Q4_K_S Gufo bulk-prefill step on the novel text
-failed `logit_dump`'s top-1 gate (at least 0.98; measured 0.9686, 8 of 255
-positions) while its mean KL is 0.00078. The flips are near-ties between
-tokens, not distribution error; the status stays `fail` in
+One step fails its gate. The raw AD-Q4_K_S Gufo bulk-prefill step on the novel
+text fails `logit_dump`'s top-1 gate (at least 0.98; measured 0.9765, 6 of 255
+positions), although its mean KL is 0.00092. The previous card showed the same
+step failing at 0.9686. The flips are near-ties between tokens, not
+distribution error. The status stays `fail` in
 [quality-q4ks.json](artifacts/quality-q4ks.json). Every other step passed.
+
+The prefill rows changed from the previous card because the v0.17.1 build pins
+the order of the dot products in the KDA prefill kernels. The decode rows are
+unchanged. The Q5_K_M novel-text prefill row has the highest Gufo mean KL on
+this page, 0.00156.
 
 Reading the numbers:
 
-- Gufo's decode and bulk-prefill paths are 11 to 821 times closer to the arbiter than llama.cpp's Vulkan engine on the chat set (mean KL, like with like) and 1.8 to 7.9 times closer on the novel text. The standard error of Gufo's chat-set means is about half the mean (126 positions), so compare orders of magnitude, not digits.
+- Gufo's decode and bulk-prefill paths are 2.4 to 821 times closer to the
+  arbiter than llama.cpp's Vulkan engine on the chat set (mean KL, like with
+  like) and 1.8 to 6.6 times closer on the novel text. The standard error of
+  Gufo's chat-set means is 29% to 75% of the mean (126 positions), so compare
+  orders of magnitude, not digits.
 - llama.cpp's q8_0 and f16 K/V cells differ by less than the spread between
   prefill and decode, so K/V precision does not separate the engines.
 - The engine tests (the MTP and session suites) pass on both quant files:
@@ -120,12 +131,15 @@ The sessions, prompts and per-cell counts stay private.
 
 ## Benchmark method
 
-Gufo measured October 18, 2026 on the v0.17 build (fork tag v0.17.0.0) with
-the evidence kit (nix-release build mode), Fedora 44 kernel 7.2.9, ROCm 7.2.3,
-GCC 15.3.0, Gufo binary SHA-256
-`349b9d958b09cb979f293a196fe038a93bf81693ea7246448f684d95de51abfe`; each Gufo
-artifact in [artifacts](artifacts/) records that hash in its notes. llama.cpp
-was measured October 12, 2026 and is the `server-vulkan-v0.5.0` image (build
+I measured Gufo on October 19 and 20, 2026 on the v0.17.1 build (gufo 0.17.1.0,
+0cbd54d) with the evidence kit (nix-release build mode), Fedora 44 kernel
+7.2.9, ROCm 7.2.3, AMD clang 22, Gufo binary SHA-256
+`e5d1dfc7e8a0c36069d3bfaffd0cf51f0ed62e22057a3195c4b3bab0bc2a0f11`. Each Gufo
+artifact in [artifacts](artifacts/) records the evidence-kit revision
+`3186127220b071a884270ef5004d34bf6d675038`, which is 0cbd54d plus kit files
+only. The speed tables ran on the machine of each llama.cpp reference. The KL
+steps ran on October 19 (AD-Q5_K_M) and October 20 (AD-Q4_K_S). I measured
+llama.cpp on October 12, 2026 with the `server-vulkan-v0.5.0` image (build
 11146, commit 7fe450e19, Mesa 26.0.8 RADV).
 
 Gufo serves with `--sessions 1 llm --think off --max-pending-per-client 8

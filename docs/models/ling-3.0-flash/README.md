@@ -106,19 +106,20 @@ expanded K/V store, the sessions, and the working buffers.
   served (`--expanded-kv-bytes`, 12 GiB by default, 0 disables). It holds the
   expanded MLA keys and values that prefill reads. A smaller pool only slows
   deep-context speed, and outputs stay bit for bit identical.
-- **AD-Q5_K_M needs more than 100 GiB at the default store (measured 97.5 AR / 100.1 MTP on a 108 GiB limit).** On a
-  96 GiB limit pass `--expanded-kv-bytes 4294967296`, which frees about 8 GiB
-  (measured on the earlier Q4_K_S file: store 12 to 4 GiB cut 81.7 to 73.8 GiB),
-  so Q5_K_M should peak near 90 GiB (AR) and 92 GiB (MTP) there; this
-  Q5_K_M figure is an estimate, not a measurement.
-- **AD-Q4_K_S** fits both a 96 and a 108 GiB limit at the defaults.
-- **RAM cache:** a checkpoint is 79.19 MB of private state plus 8,068 B per
-  token with MTP off and 9,220 B per token with MTP, so a 196,608-token
-  conversation is about 1.67 GB and about 1.89 GB. Checkpoints of one
+- AD-Q5_K_M needs more than 100 GiB at the default store. I measured 97.5 GiB
+  with AR and 100.1 GiB with MTP on a 108 GiB limit. On a 96 GiB limit, pass
+  `--expanded-kv-bytes 4294967296`. That frees about 8 GiB. On the earlier
+  Q4_K_S file, cutting the store from 12 to 4 GiB cut the peak from 81.7 to
+  73.8 GiB. Q5_K_M should therefore peak near 90 GiB (AR) and 92 GiB (MTP)
+  there, but this figure is an estimate, not a measurement.
+- AD-Q4_K_S fits both a 96 and a 108 GiB limit at the defaults.
+- A RAM cache checkpoint is 79.19 MB of private state plus 8,068 B per token
+  with MTP off and 9,220 B per token with MTP. A 196,608-token conversation is
+  about 1.67 GB without MTP and about 1.89 GB with it. Checkpoints of one
   conversation share their latent rows in 512-row chunks, so later checkpoints
-  cost mostly their private state. Size `--cache-ram-bytes` for
-  the contexts you serve; about 15 GB suits four 196k-token conversations with
-  several checkpoints each.
+  cost mostly their private state. Size `--cache-ram-bytes` for the contexts you
+  serve. About 15 GB suits four 196k-token conversations with several
+  checkpoints each.
 
 ## How it runs
 
@@ -150,10 +151,10 @@ expanded K/V store, the sessions, and the working buffers.
 
 ## Serving
 
-Tool calls use the Bailing syntax with a grammar, and the reasoning block is
-split from the answer. The default sampling preset (`ling3`) is temperature
-0.6, top-p 0.95, top-k 20. The RAM and disk continuation caches use the
-component cache (shared latent-row chunks, copied recurrent state) with a
+The server splits the reasoning block from the answer, and tool calls use the
+Bailing syntax with a grammar. The default sampling preset (`ling3`) is
+temperature 0.6, top-p 0.95, top-k 20. The RAM and disk continuation caches use
+the component cache (shared latent-row chunks, copied recurrent state) with a
 9-token checkpoint tail and a minimum checkpoint of 128 tokens.
 
 ## Known limits
@@ -162,7 +163,7 @@ component cache (shared latent-row chunks, copied recurrent state) with a
   its adapter in `src/models/ling_3_flash/continuation_adapter.*`. Disk cache
   directories written by the earlier snapshot format are rebuilt cold. The
   benchmark figures on this card were measured on the component cache, with
-  the v0.17.0.0 build.
+  the v0.17.1 build.
 - **Tool-call streaming.** The Bailing parser publishes a tool call only after
   its first argument value opens or an argument finishes. A header-only call (a
   function name with no argument) is never published, and an end of stream there
