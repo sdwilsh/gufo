@@ -1,0 +1,5 @@
+[
+  {"name": "fact", "prompt": "Question: What is the capital city of Australia, and in which year did it become the seat of the federal government?\nAnswer:"},
+  {"name": "code", "prompt": "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number using an iterative loop.\"\"\"\n"},
+  {"name": "story", "prompt": "The lighthouse keeper had not spoken to another living soul in eleven years, so when a stranger knocked on the door in the middle of the storm, "}
+]

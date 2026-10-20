@@ -10,6 +10,7 @@ from copy import deepcopy
 import sys
 
 from cache_concurrency import background, system_prompt
+from check_report import check_line
 
 CODES = ("ALPHA", "BETA", "GAMMA", "DELTA")
 # Tokens around the divergence point a restore may still miss: template
@@ -42,8 +43,13 @@ def check_cache_shared_prefix(client, model, checks, chat_result):
         return result
 
     def answer(result, code):
-        assert result["text"].strip() == code and not result["tools"] \
-            and result["finish"] == "stop", result
+        label = next((name for name, value in checks.items() if value is result), "answer")
+        if not (result["text"].strip() == code and not result["tools"]
+                and result["finish"] == "stop"):
+            raise AssertionError(check_line(
+                label, f"text={code!r} no tools finish='stop'",
+                f"text={result['text']!r} tools={result['tools']} finish={result['finish']!r} "
+                f"prompt_tokens={result['usage']['prompt_tokens']}"))
 
     def group(label, tail_lines, slack):
         system = system_prompt(f"cache_shared_prefix_{label}", 220)
@@ -66,8 +72,11 @@ def check_cache_shared_prefix(client, model, checks, chat_result):
         for index in range(2, len(results)):
             cached = results[index]["usage"]["cached_tokens"]
             if cached < shared:
-                failures.append(f"{label}_{index}: reused {cached} tokens, expected at least "
-                                f"{shared} of the shared system prompt")
+                failures.append(check_line(
+                    f"{label}_{index}_reuse",
+                    f"cached_tokens >= {shared} (shared system prompt)",
+                    f"cached_tokens={cached} prompt_tokens="
+                    f"{results[index]['usage']['prompt_tokens']}"))
         for index, (messages, warm) in enumerate(zip(conversations, results)):
             cold = chat(f"{label}_cold_{index}", messages, cold=True)
             assert cold["usage"]["prompt_tokens"] == warm["usage"]["prompt_tokens"], (warm, cold)

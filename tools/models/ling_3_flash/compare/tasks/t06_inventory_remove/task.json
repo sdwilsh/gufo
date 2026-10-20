@@ -1,0 +1,5 @@
+{
+ "category": "feature",
+ "expected_tests": 6,
+ "prompt": "Extend inventory.Inventory with two methods and one exception. (1) class InsufficientStock(Exception) defined in inventory.py. (2) remove(sku, qty): subtract qty units; raise ValueError if qty <= 0; raise KeyError if the sku was never added; raise InsufficientStock if fewer than qty units are in stock (the stock must stay unchanged in that case); a sku whose count reaches 0 stays known with count 0. (3) low_stock(threshold): return a list of (sku, count) tuples for every known sku with count <= threshold, sorted by count ascending then sku alphabetically. Existing behaviour must keep working; add your own tests for the new methods in tests/test_inventory.py if you like."
+}

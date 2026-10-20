@@ -1,0 +1,704 @@
+#!/usr/bin/python3
+"""Ling-3.0-flash serve phase of the integration suite: agentic tool loops and the
+prompt-cache validation, with one row per agent-loop request. One JSON document
+on stdout (the only stdout writer); progress goes to stderr ([ling-serve]).
+
+usage: ling-serve-suite [--model PATH] [--work DIR] [--context N] [--sessions N]
+                        [--cache-ram-bytes N] [--hermes-steps N] [--no-sdk]
+                        [--cache-functional] [--startup-timeout SEC]
+
+Stages, each against its own `gufo serve llm --log-level debug` (the vendor
+sampling preset is the server default):
+  ling_agent   tests/functional/ling_agent.py (streaming Hermes-shaped tool
+               loops: reasoning stripped, echoed and thinking off, parallel and
+               typed calls, tool_choice, reasoning split, raw layout).
+  hermes       tests/functional/cache_hermes.py with real tool calls required
+               (LING_REQUIRE_REAL_TOOL_CALLS=1 unless already set): strip and
+               echo loops, review fork, compaction; every step is checked for
+               reuse of the previous prompt and against an uncached control.
+  restart      the same server command restarted over the same disk cache; the
+               last Hermes request must restore from disk.
+  stream_start tests/functional/run.py --suite stream-start (required). Every
+               run.py stage passes --speculative explicitly (run.py fails a
+               server whose loaded mode differs from the flag, absent = off) and
+               keeps "failure_reasons" (report.json errors, check= lines) and
+               the stdout/stderr tails on a failure.
+  device_loss  tests/functional/device_loss.py with libdevice_loss_faults.so from
+               /opt/gufo/lib: injected HIP errors, ten cases, each restarting the
+               server (required; no GPU reset, writes only under /work).
+  sdk          (informational unless --sdk-required) tests/functional/run.py
+               suites sampling-defaults, tools, messages-tools (#469) and
+               system-injection (#449); its server gets --cache-ram-bytes.
+               Its stderr tail and exit reason are kept in the document; on a
+               failure "failed_generations" holds the server's debug lines with
+               the raw text and parsed tool calls of the last requests (also
+               echoed on stderr).
+  tool_reasoning (informational, never fatal) run.py --suite tool-reasoning.
+  cache        (--cache-functional) ling-cache-suite --skip-hermes: the run.py
+               cache suites and long-context.
+
+The document carries "agent_requests": one row per request of every loop with
+  request_id (HTTP X-Request-ID), loop, turn, prompt_tokens,
+  previous_prompt_tokens (the loop's previous request), common_prefix (shared
+  with it, measured by the server), restored_position (cached_tokens),
+  restored_kind (prompt_end | stable | frontier | live | grid | learned |
+  live_checkpoint | disk | none | unknown), prefill_tokens, outcome
+  (hit_memory | hit_disk | miss) and miss_reason (+ the server's nearest
+  checkpoint and common prefix on a miss).
+Server logs stay in WORK/*.log; ling-int-suite prints them after every child has
+exited. Exit 0 only when every required stage passed.
+"""
+import argparse, importlib.machinery, importlib.util, json, os, re, subprocess, sys, time, http.client
+
+HOME = os.environ.get("HOME", "/work")
+HERE = os.path.dirname(os.path.abspath(__file__))
+FUNCTIONAL = os.environ.get("LING_FUNCTIONAL", "/opt/gufo/tests/functional")
+
+
+def log(msg):
+    print("[ling-serve] " + msg, file=sys.stderr, flush=True)
+
+
+def load_cache_suite():
+    for path in (os.path.join(HERE, "ling-cache-suite"), os.path.join(HERE, "..", "cache", "ling-cache-suite"),
+                 "/usr/local/bin/ling-cache-suite"):
+        if os.path.exists(path):
+            loader = importlib.machinery.SourceFileLoader("ling_cache_suite", path)
+            spec = importlib.util.spec_from_loader("ling_cache_suite", loader)
+            module = importlib.util.module_from_spec(spec)
+            loader.exec_module(module)
+            return module
+    raise SystemExit("ling-cache-suite not found")
+
+
+CS = load_cache_suite()
+
+
+def tail(path, n=4000):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - n))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def server_command(args, port, disk=None):
+    cmd = ["gufo", "serve", "llm", "--model", args.model, "--sessions", str(args.sessions),
+           "--context", str(args.context), "--speculative", args.speculative,
+           "--cache-ram-bytes", str(args.cache_ram_bytes), "--host", "127.0.0.1", "--port", str(port),
+           "--served-model-name", "functional-test", "--max-pending-per-client", "8",
+           "--log-level", "debug"]
+    if disk:
+        cmd += ["--cache-disk", disk, "--cache-disk-bytes", str(8 << 30),
+                "--cache-disk-staging-bytes", str(1 << 30)]
+    return cmd
+
+
+class Server:
+    def __init__(self, name, cmd, work, timeout):
+        self.name, self.cmd, self.timeout = name, cmd, timeout
+        self.log_path = os.path.join(work, name + ".log")
+        self.proc = None
+
+    def __enter__(self):
+        log("starting %s: %s" % (self.name, " ".join(self.cmd)))
+        self.started = time.monotonic()
+        self.logf = open(self.log_path, "wb")
+        self.proc = subprocess.Popen(self.cmd, stdout=self.logf, stderr=subprocess.STDOUT,
+                                     start_new_session=True)
+        port = int(self.cmd[self.cmd.index("--port") + 1])
+        CS.wait_health(port, self.proc, self.timeout)
+        self.startup_s = round(time.monotonic() - self.started, 1)
+        return self
+
+    def __exit__(self, *exc):
+        CS.stop(self.proc)
+        self.logf.close()
+        return False
+
+
+def run_child(cmd, out_path, err_path, timeout, env=None):
+    """Run a child with stdout and stderr in files; return (exit, reason)."""
+    with open(out_path, "wb") as out, open(err_path, "wb") as err:
+        try:
+            proc = subprocess.run(cmd, stdout=out, stderr=err, timeout=timeout, env=env)
+            return proc.returncode, "exit %d" % proc.returncode
+        except subprocess.TimeoutExpired:
+            return None, "timeout after %s s" % timeout
+        except OSError as e:
+            return None, "%s: %s" % (type(e).__name__, e)
+
+
+def check_line(name, expected, actual):
+    """One failed check as `check=NAME expected=... actual=...` on stderr (the
+    tests/functional/check_report.py shape)."""
+    def one(value, limit=500):
+        text = " ".join(str(value).split())
+        return text if len(text) <= limit else text[:limit] + "...[+%d chars]" % (len(text) - limit)
+    print("check=%s expected=%s actual=%s" % (name, one(expected), one(actual)), file=sys.stderr, flush=True)
+
+
+def fresh_dir(path):
+    """run.py refuses an existing --output directory; a second invocation in the
+    same pod moves the previous one aside instead of failing with EEXIST."""
+    if os.path.exists(path):
+        aside = "%s.%s-%d" % (path, time.strftime("%Y%m%dT%H%M%S"), os.getpid())
+        os.rename(path, aside)
+        log("moved previous %s to %s" % (path, aside))
+    return path
+
+
+GENERATION = re.compile(r"event=(generation|parsed)\b")
+
+
+def generation_lines(path, limit=24, width=6000):
+    """The server's debug lines with each request's raw generated text
+    (event=generation) and what the parser made of it (event=parsed: content
+    and tool calls), last `limit` of them. A failed check stops its suite, so
+    the failing request is among the last ones."""
+    try:
+        with open(path, errors="replace") as f:
+            lines = [l.rstrip("\n") for l in f if GENERATION.search(l)]
+    except OSError:
+        return []
+    return [l if len(l) <= width else l[:width] + "...[+%d chars]" % (len(l) - width)
+            for l in lines[-limit:]]
+
+
+def relay_stderr(path):
+    """Child progress goes to the pod log through this process's stderr."""
+    sys.stderr.write(tail(path, 200000))
+    sys.stderr.flush()
+
+
+# ---- rows -----------------------------------------------------------------
+
+EVENT = re.compile(r"event=(checkpoint|live_checkpoint|shared_prefix_learned)\b(.*)")
+RECEIVED = re.compile(r"request=(\S+) event=received")
+COMPLETED = re.compile(r"request=(\S+) event=completed")
+
+
+def parse_events(*logs):
+    """-> (events, received): events are (line_index, kind, tokens) in file order
+    across the logs; received maps request id -> line index."""
+    events, received, base = [], {}, 0
+    for path in logs:
+        try:
+            lines = open(path, errors="replace").read().splitlines()
+        except OSError:
+            continue
+        for i, line in enumerate(lines):
+            m = EVENT.search(line)
+            if m:
+                kv = dict(re.findall(r"(\w+)=(\S+)", m.group(2)))
+                kind = {"checkpoint": kv.get("kind", "checkpoint"), "live_checkpoint": "live_checkpoint",
+                        "shared_prefix_learned": "learned"}[m.group(1)]
+                if "tokens" in kv:
+                    events.append((base + i, kind, int(kv["tokens"])))
+            m = RECEIVED.search(line)
+            if m:
+                received.setdefault(m.group(1), base + i)
+        base += len(lines) + 1
+    return events, received
+
+
+def draft_rows(paths):
+    """Per completed request of the given server logs: the draft counters of its
+    completed line (request id, proposed, accepted, rounds, decode_tps)."""
+    rows = []
+    for path in paths:
+        try:
+            lines = open(path, errors="replace").read().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            m = COMPLETED.search(line)
+            if not m:
+                continue
+            kv = dict(re.findall(r"(\w+)=(\S+)", line))
+            proposed = int(kv.get("draft_proposed", 0))
+            accepted = int(kv.get("draft_accepted", 0))
+            rows.append({"log": os.path.basename(path), "request": m.group(1), "proposed": proposed,
+                         "accepted": accepted, "rounds": int(kv.get("draft_rounds", 0)),
+                         "acceptance": round(accepted / proposed, 3) if proposed else None,
+                         "decode_tps": kv.get("decode_tps")})
+    return rows
+
+
+def kind_of(row, events, received):
+    if not row.get("restored_position"):
+        return "none"
+    if row.get("outcome") == "hit_disk":
+        return "disk"
+    limit = received.get(row.get("request_id"), 1 << 60)
+    kind = "unknown"
+    for line, k, tokens in events:
+        if line < limit and tokens == row["restored_position"]:
+            kind = k
+    return kind
+
+
+def make_row(loop, turn, request_id, seq, prompt_tokens, cached, prefill, hit, disk, miss_reason,
+             previous, common, extra=None):
+    row = {"request_id": request_id, "request_seq": seq, "loop": loop, "turn": turn,
+           "prompt_tokens": prompt_tokens,
+           "previous_prompt_tokens": previous, "common_prefix": common,
+           "restored_position": cached, "prefill_tokens": prefill,
+           "outcome": ("hit_disk" if disk else "hit_memory" if hit else "miss"),
+           "miss_reason": None if hit else miss_reason}
+    row.update(extra or {})
+    return row
+
+
+def rows_from_ling_agent(report_path):
+    try:
+        cases = json.load(open(report_path))
+    except (OSError, ValueError):
+        return []
+    rows = []
+    for case in cases:
+        previous = None
+        for turn, record in enumerate(case.get("requests", [])):
+            usage = ((record.get("response") or {}).get("usage")) or {}
+            g = usage.get("gufo") or {}
+            if not g:
+                continue
+            seq = g.get("request_seq")
+            common = None
+            if previous is not None:
+                common = (g.get("recent_prefix_overlaps") or {}).get(str(previous["seq"]))
+            rows.append(make_row(
+                "ling_agent/" + case["name"], turn, record.get("http_request_id"), seq,
+                usage.get("prompt_tokens"), usage.get("cached_tokens", 0), g.get("prefill_tokens"),
+                g.get("cache_hit"), g.get("cache_disk_hit"), g.get("cache_miss_reason"),
+                previous["prompt_tokens"] if previous else None, common,
+                {"nearest_checkpoint_tokens": g.get("cache_checkpoint_tokens"),
+                 "miss_common_prefix": g.get("cache_common_prefix_tokens")}))
+            previous = {"seq": seq, "prompt_tokens": usage.get("prompt_tokens")}
+    return rows
+
+
+def rows_from_hermes(report_path):
+    try:
+        report = json.load(open(report_path))
+    except (OSError, ValueError):
+        return []
+    rows = []
+    for variant, data in report.get("variants", {}).items():
+        for step in data.get("steps", []) + data.get("control_requests", []):
+            rows.append(make_row(
+                "hermes/" + variant, step["name"], step.get("http_request_id"), step.get("request_seq"),
+                step["prompt_tokens"], step["cached_tokens"], step["prefill_tokens"],
+                step["cache_hit"], False, step.get("cache_miss_reason"),
+                step.get("previous_prompt_tokens"), step.get("common_prefix_with_previous"),
+                {"nearest_checkpoint_tokens": None,
+                 "miss_common_prefix": step.get("cache_common_prefix_tokens"),
+                 **{k: step[k] for k in ("comparison", "answer_equals_control", "difference",
+                                         "request_settings", "finish") if k in step}}))
+    rows.sort(key=lambda r: r["request_seq"] or 0)
+    return rows
+
+
+# ---- stages ---------------------------------------------------------------
+
+def stage_ling_agent(args, work):
+    out = {"name": "ling_agent", "required": True}
+    d = os.path.join(work, "ling-agent")
+    os.makedirs(d, exist_ok=True)
+    port = CS.free_port()
+    with Server("serve-ling-agent", server_command(args, port), work, args.startup_timeout) as server:
+        out["startup_s"] = server.startup_s
+        code, reason = run_child(
+            [sys.executable, FUNCTIONAL + "/ling_agent.py", "--base-url", "http://127.0.0.1:%d" % port,
+             "--model", "functional-test", "--output", d],
+            os.path.join(work, "ling-agent.stdout"), os.path.join(work, "ling-agent.stderr"), 3600)
+    relay_stderr(os.path.join(work, "ling-agent.stderr"))
+    out["exit_code"], out["exit_reason"] = code, reason
+    try:
+        summary = json.load(open(os.path.join(work, "ling-agent.stdout")))
+        out["cases"] = {c["name"]: c["status"] for c in summary["cases"]}
+        out["failed_cases"] = {c["name"]: c.get("error", "")[:300] for c in summary["cases"]
+                               if c["status"] != "pass"}
+    except (OSError, ValueError, KeyError) as e:
+        out["error"] = "no summary: %s" % e
+    out["status"] = "passed" if code == 0 and not out.get("error") else "failed"
+    out["log"] = server.log_path
+    return out
+
+
+def stage_hermes(args, work):
+    out = {"name": "hermes", "required": True}
+    d = os.path.join(work, "hermes")
+    os.makedirs(d, exist_ok=True)
+    disk = os.path.join(work, "disk-hermes")
+    port = CS.free_port()
+    cmd = server_command(args, port, disk)
+    env = {**os.environ, "LING_REQUIRE_REAL_TOOL_CALLS": os.environ.get("LING_REQUIRE_REAL_TOOL_CALLS", "1")}
+    logs = []
+    with Server("serve-hermes", cmd, work, args.startup_timeout) as server:
+        out["startup_s"] = server.startup_s
+        logs.append(server.log_path)
+        hermes = [sys.executable, FUNCTIONAL + "/cache_hermes.py", "--base-url", "http://127.0.0.1:%d/v1" % port,
+                  "--model", "functional-test", "--output", d + "/hermes.json", "--steps",
+                  str(args.hermes_steps), "--context", str(args.context)]
+        if env["LING_REQUIRE_REAL_TOOL_CALLS"] != "1":
+            hermes.append("--allow-synthetic")
+        code, reason = run_child(hermes, d + "/hermes.stdout", d + "/hermes.stderr", 7200, env)
+    relay_stderr(d + "/hermes.stderr")
+    out["exit_code"], out["exit_reason"] = code, reason
+    out["require_real_tool_calls"] = env["LING_REQUIRE_REAL_TOOL_CALLS"] == "1"
+    try:
+        report = json.load(open(d + "/hermes.json"))
+        out["status"], out["failures"] = report["status"], report["failures"]
+        out["variants"] = {v: {"steps_run": r["steps_run"], "real_tool_calls": r["real_tool_calls"],
+                               "prefill_tokens_per_step": r["tokens_prefilled_per_step"],
+                               "reused_tokens_per_step": r["tokens_reused_per_step"]}
+                           for v, r in report["variants"].items()}
+        probe = report["probe_request"]
+    except (OSError, ValueError, KeyError) as e:
+        out["status"], out["error"], probe = "failed", "hermes report: %s" % e, None
+    # Restart over the same disk cache: the last Hermes request restores from disk.
+    restart = out["restart"] = {}
+    if probe is not None:
+        port = CS.free_port()
+        try:
+            with Server("serve-hermes-restarted", server_command(args, port, disk), work,
+                        args.startup_timeout) as server2:
+                logs.append(server2.log_path)
+                restart["startup_s"] = server2.startup_s
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=3600)
+                c.request("POST", "/v1/chat/completions", json.dumps(probe),
+                          {"Content-Type": "application/json"})
+                http_resp = c.getresponse()
+                request_id = http_resp.getheader("X-Request-ID")
+                resp = json.loads(http_resp.read())
+                usage = resp["usage"]
+                g = usage["gufo"]
+                restart.update(prompt_tokens=usage["prompt_tokens"], cached_tokens=usage["cached_tokens"],
+                               restored_tokens=usage["cached_tokens"],
+                               prefill_tokens=g["prefill_tokens"], disk_hit=g["cache_disk_hit"],
+                               restore_ms=g["cache_restore_ms"], request_seq=g.get("request_seq"),
+                               http_request_id=request_id)
+                log("restart: restored %d of %d tokens from disk (disk_hit=%s)" % (
+                    usage["cached_tokens"], usage["prompt_tokens"], g["cache_disk_hit"]))
+                if not (g["cache_disk_hit"] and usage["cached_tokens"] > 0 and g["prefill_tokens"] < 2048 + 64):
+                    out["status"] = "failed"
+                    out["failures"] = out.get("failures", []) + [
+                        "restart: expected a disk restore leaving under one checkpoint step to "
+                        "prefill, got %s" % restart]
+        except Exception as e:  # noqa
+            out["status"] = "failed"
+            out["error"] = "restart: %s: %s" % (type(e).__name__, e)
+    out["logs"] = logs
+    return out
+
+
+def stage_sdk(args, work):
+    out = {"name": "sdk", "required": args.sdk_required}
+    d = fresh_dir(os.path.join(work, "sdk-suites"))
+    cmd = [sys.executable, FUNCTIONAL + "/run.py", "--record-baseline", "--sampling-preset", "ling3"]
+    for suite in args.sdk_suites.split(","):
+        cmd += ["--suite", suite]
+    cmd += ["--output", d, "--", "gufo", "serve", "llm", "--model", args.model, "--context",
+            str(args.context), "--sessions", "2", "--log-level", "debug",
+            "--cache-ram-bytes", str(args.cache_ram_bytes)]
+    cmd += ["--speculative", args.speculative]
+    code, reason = run_child(cmd, os.path.join(work, "sdk.stdout"), os.path.join(work, "sdk.stderr"), 2400)
+    out["exit_code"], out["exit_reason"] = code, reason
+    # Whatever the runner printed or wrote on failure stays in the document.
+    out["stderr_tail"] = tail(os.path.join(work, "sdk.stderr"), 6000)
+    out["stdout_tail"] = tail(os.path.join(work, "sdk.stdout"), 3000)
+    report = {}
+    try:
+        report = json.load(open(os.path.join(d, "report.json")))
+        out["report_status"] = report.get("status")
+        out["suites"] = {n: r.get("status") for n, r in report.get("suites", {}).items()}
+        if report.get("error"):
+            out["error"] = report["error"][:600]
+    except (OSError, ValueError) as e:
+        out["report_error"] = "no report.json (%s: %s)" % (type(e).__name__, e)
+    out["status"] = "passed" if code == 0 else "failed"
+    out["draft_logs"] = sorted(os.path.join(d, n) for n in os.listdir(d)
+                               if n.endswith(".log")) if os.path.isdir(d) else []
+    if out["status"] != "passed":
+        out["failure_reasons"] = functional_failure(d, report)
+        # Every log of a failed run (suite logs, server logs) goes into the
+        # document, which ling-int-suite prints: nothing else reaches the pod
+        # log from this stage.
+        logs = {}
+        failed = [n for n, st in (out.get("suites") or {}).items() if st != "passed"]
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            names = []
+        out["output_dir_listing"] = names[:200]
+        for name in names:
+            path = os.path.join(d, name)
+            wanted = (name.endswith(".log") or name.endswith(".err") or name == "report.json"
+                      or any(name.startswith(f) for f in failed))
+            if wanted and os.path.isfile(path):
+                text = open(path, errors="replace").read()
+                # Tracebacks and errors first: the tail alone can hide them.
+                errors = [l for l in text.splitlines()
+                          if re.search(r"Error|Traceback|\"error\"|assert", l)]
+                logs[name] = {"error_lines": [l[:600] for l in errors[:40]], "tail": text[-20000:]}
+        out["failed_run_logs"] = logs
+        # The raw text each failing request generated and its parsed tool calls
+        # (the server runs with --log-level debug). They travel in the stdout
+        # document and are echoed on stderr so the pod log shows them as text.
+        generations = {}
+        for name in ("server.log", "server-restarted.log"):
+            lines = generation_lines(os.path.join(d, name))
+            if lines:
+                generations[name] = lines
+        out["failed_generations"] = generations
+        for name, lines in generations.items():
+            log("sdk failed: last generations in %s (raw text, parsed calls):" % name)
+            for line in lines:
+                print("[ling-serve] " + line, file=sys.stderr)
+        for name in failed:
+            for line in (logs.get(name + ".log") or {}).get("error_lines", [])[:10]:
+                check_line("sdk/" + name, "suite passes", line)
+        sys.stderr.flush()
+    return out
+
+
+def functional_failure(d, report):
+    """Why a run.py child failed, from its report.json and suite logs: the
+    runner-level errors (server start, loaded-mode/measurement validation, baseline
+    comparison) that leave every suite "passed", then each failed suite's check=
+    lines (or its error). Empty when nothing was recorded."""
+    reasons = []
+    for key in ("error", "measurements_error", "comparison_error"):
+        if report.get(key):
+            reasons.append("%s: %s" % (key, report[key]))
+    for name, row in (report.get("suites") or {}).items():
+        if row.get("status") == "passed":
+            continue
+        try:
+            text = open(os.path.join(d, name + ".log"), errors="replace").read()
+        except OSError:
+            text = ""
+        checks = [l for l in text.splitlines() if l.startswith("check=")]
+        reasons += ["%s: %s" % (name, l) for l in checks[:5]] or [
+            "%s: %s" % (name, row.get("error") or row.get("status"))]
+    return reasons
+
+
+def stage_functional(args, work, name, suite, timeout, required):
+    """tests/functional/run.py --suite SUITE against Ling in baseline mode. The
+    server gets --speculative explicitly: run.py checks the loaded mode against
+    the flag (absent means off), and Ling loads MTP by default. On a failure the
+    stage keeps both output tails and the reasons from report.json, which
+    run.py's exit code alone does not carry."""
+    out = {"name": name, "required": required}
+    d = fresh_dir(os.path.join(work, suite))
+    cmd = [sys.executable, FUNCTIONAL + "/run.py", "--record-baseline", "--sampling-preset", "ling3",
+           "--suite", suite, "--output", d, "--", "gufo", "serve", "llm", "--model", args.model,
+           "--context", str(args.context), "--sessions", "2", "--log-level", "debug",
+           "--speculative", args.speculative]
+    stdout, stderr = os.path.join(work, suite + ".stdout"), os.path.join(work, suite + ".stderr")
+    code, reason = run_child(cmd, stdout, stderr, timeout)
+    relay_stderr(stderr)
+    out["exit_code"], out["exit_reason"] = code, reason
+    report = {}
+    try:
+        report = json.load(open(os.path.join(d, "report.json")))
+        out["report_status"] = report.get("status")
+        out["suites"] = {n: r.get("status") for n, r in report.get("suites", {}).items()}
+    except (OSError, ValueError) as e:
+        out["report_error"] = "no report.json (%s: %s)" % (type(e).__name__, e)
+    out["status"] = "passed" if code == 0 else "failed"
+    if out["status"] != "passed":
+        out["failure_reasons"] = functional_failure(d, report)
+        out["stdout_tail"] = tail(stdout, 6000)
+        out["stderr_tail"] = tail(stderr, 6000)
+        detail = out["failure_reasons"] or [out.get("report_error") or out.get("suites")]
+        check_line(name, "run.py --suite %s exits 0" % suite, "%s; %s" % (reason, "; ".join(
+            str(r) for r in detail)))
+    return out
+
+
+def stage_stream_start(args, work):
+    """Upstream's generic stream-start suite (headers are committed at admission,
+    keepalives cover the whole prefill, a queued stream gets its headers after the
+    bound) against Ling. Required. One server, two sessions; writes only under WORK."""
+    return stage_functional(args, work, "stream_start", "stream-start", 3600, True)
+
+
+def stage_tool_reasoning(args, work):
+    """Upstream's tool-reasoning suite against Ling: informational, never fatal."""
+    return stage_functional(args, work, "tool_reasoning", "tool-reasoning", 2400, False)
+
+
+def stage_device_loss(args, work):
+    """Upstream's opt-in device-loss runner (tests/functional/device_loss.py): HIP
+    errors injected in the server process by an LD_PRELOAD helper, never a GPU
+    reset. Needs only /work (case dirs, logs), one GPU, no capabilities. Every case
+    restarts the server, so this is the longest serve stage."""
+    out = {"name": "device_loss", "required": True}
+    fault = os.environ.get("LING_DEVICE_LOSS_LIB", "/opt/gufo/lib/libdevice_loss_faults.so")
+    d = os.path.join(work, "device-loss")
+    if not os.path.exists(fault):
+        out["status"], out["error"] = "failed", "fault library missing: " + fault
+        check_line("device_loss", "fault library present", out["error"])
+        return out
+    cmd = [sys.executable, FUNCTIONAL + "/device_loss.py", "--fault-library", fault, "--output", d,
+           "--startup-timeout", str(args.startup_timeout),
+           "--request-timeout", "120", "--case-timeout", str(args.device_loss_case_timeout),
+           "--", "gufo", "serve", "llm", "--model", args.model,
+           "--sessions", "2", "--context", "4096", "--think", "off", "--speculative", "off"]
+    code, reason = run_child(cmd, os.path.join(work, "device-loss.stdout"),
+                             os.path.join(work, "device-loss.stderr"), args.device_loss_timeout)
+    relay_stderr(os.path.join(work, "device-loss.stderr"))
+    out["exit_code"], out["exit_reason"] = code, reason
+    try:
+        report = json.load(open(os.path.join(d, "report.json")))
+        out["cases"] = {c["case"]: c["status"] for c in report["cases"]}
+        for c in report["cases"]:
+            if c["status"] != "pass":
+                check_line("device_loss/" + c["case"], "status=pass", c.get("error", c["status"]))
+    except (OSError, ValueError, KeyError) as e:
+        out["report_error"] = "no report.json (%s: %s)" % (type(e).__name__, e)
+    out["status"] = "passed" if code == 0 and not out.get("report_error") else "failed"
+    if out["status"] != "passed":
+        out["stdout_tail"] = tail(os.path.join(work, "device-loss.stdout"), 3000)
+    out["logs"] = sorted(os.path.join(d, n, "server.log") for n in (os.listdir(d) if os.path.isdir(d) else [])
+                         if os.path.exists(os.path.join(d, n, "server.log")))
+    return out
+
+
+def stage_cache(args, work):
+    out = {"name": "cache", "required": True}
+    code, reason = run_child(
+        ["ling-cache-suite", "--model", args.model, "--skip-hermes",
+         "--speculative", args.speculative,
+         "--context", str(args.context), "--sessions", str(args.sessions),
+         "--cache-ram-bytes", str(args.cache_ram_bytes)],
+        os.path.join(work, "cache.stdout"), os.path.join(work, "cache.stderr"), 14400)
+    out["exit_code"], out["exit_reason"] = code, reason
+    relay_stderr(os.path.join(work, "cache.stderr"))
+    try:
+        out["summary"] = json.load(open(os.path.join(work, "cache.stdout")))
+    except (OSError, ValueError):
+        out["stdout_tail"] = tail(os.path.join(work, "cache.stdout"), 3000)
+    # A clean exit and the child's own verdict must agree.
+    out["status"] = ("passed" if code == 0 and (out.get("summary") or {}).get("status") == "passed"
+                     else "failed")
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default=os.environ.get(
+        "MODEL", "/models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf"))
+    ap.add_argument("--work", default=os.path.join(HOME, "serve"))
+    ap.add_argument("--context", type=int, default=32768)
+    ap.add_argument("--sessions", type=int, default=4)
+    ap.add_argument("--cache-ram-bytes", type=int, default=6 << 30)
+    ap.add_argument("--hermes-steps", type=int, default=5)
+    ap.add_argument("--startup-timeout", type=int, default=1800)
+    ap.add_argument("--no-sdk", action="store_true")
+    ap.add_argument("--speculative", choices=("off", "mtp"), default="mtp",
+                    help="speculative mode of every server this suite starts, passed explicitly "
+                         "(Ling's default is mtp; device_loss stays off)")
+    ap.add_argument("--sdk-suites", default="sampling-defaults,tools,messages-tools,system-injection")
+    ap.add_argument("--sdk-required", action="store_true",
+                    help="the sdk stage is fatal (the --speculative mtp pass sets it)")
+    ap.add_argument("--cache-functional", action="store_true")
+    ap.add_argument("--skip-ling-agent", action="store_true")
+    ap.add_argument("--skip-hermes", action="store_true")
+    ap.add_argument("--skip-stream-start", action="store_true")
+    ap.add_argument("--skip-device-loss", action="store_true")
+    ap.add_argument("--device-loss-timeout", type=int, default=3600,
+                    help="seconds for the whole device_loss stage (a hung server fails it)")
+    ap.add_argument("--device-loss-case-timeout", type=int, default=420,
+                    help="seconds per device_loss case before its server is killed")
+    ap.add_argument("--skip-tool-reasoning", action="store_true")
+    args = ap.parse_args()
+    os.makedirs(args.work, exist_ok=True)
+    os.makedirs(HOME + "/tmp", exist_ok=True)
+    t0 = time.monotonic()
+    doc = {"tool": "ling-serve-suite", "image": os.environ.get("GUFO_IMAGE"), "model": args.model,
+           "settings": {"context": args.context, "sessions": args.sessions,
+                        "cache_ram_bytes": args.cache_ram_bytes, "hermes_steps": args.hermes_steps},
+           "env": CS.gpu_and_memory(), "stages": []}
+    if not os.path.exists(args.model):
+        doc.update(status="skipped", reason="model missing")
+        print(json.dumps(doc, separators=(",", ":")), flush=True)
+        return 77
+    rows, logs, logs_for_drafts = [], [], []
+    plan = []
+    if not args.skip_ling_agent:
+        plan.append(("ling_agent", stage_ling_agent))
+    if not args.skip_hermes:
+        plan.append(("hermes", stage_hermes))
+    if not args.skip_stream_start:
+        plan.append(("stream_start", stage_stream_start))
+    if not args.skip_device_loss:
+        plan.append(("device_loss", stage_device_loss))
+    if not args.no_sdk:
+        plan.append(("sdk", stage_sdk))
+    if not args.skip_tool_reasoning:
+        plan.append(("tool_reasoning", stage_tool_reasoning))
+    if args.cache_functional:
+        plan.append(("cache", stage_cache))
+    ok = True
+    for name, fn in plan:
+        log("stage " + name)
+        started = time.monotonic()
+        try:
+            result = fn(args, args.work)
+        except Exception as e:  # noqa
+            result = {"name": name,
+                      "required": name == "sdk" and args.sdk_required or name not in ("sdk", "tool_reasoning"),
+                      "status": "failed",
+                      "error": "%s: %s" % (type(e).__name__, e)}
+        result["seconds"] = round(time.monotonic() - started, 1)
+        doc["stages"].append(result)
+        logs += result.get("logs", [result["log"]] if "log" in result else []) if name != "device_loss" else []
+        if name == "ling_agent":
+            rows += rows_from_ling_agent(os.path.join(args.work, "ling-agent", "report.json"))
+        elif name == "hermes":
+            rows += rows_from_hermes(os.path.join(args.work, "hermes", "hermes.json"))
+            probe = result.get("restart") or {}
+            if probe.get("request_seq") is not None:
+                rows.append(make_row("hermes/restart", "probe_after_restart", probe.get("http_request_id"),
+                                     probe["request_seq"], probe["prompt_tokens"], probe["cached_tokens"],
+                                     probe["prefill_tokens"], probe["disk_hit"], probe["disk_hit"], None,
+                                     None, None))
+        if name == "sdk":
+            logs_for_drafts += result.get("draft_logs", [])
+        elif name in ("ling_agent", "hermes"):
+            logs_for_drafts += result.get("logs", [result["log"]] if "log" in result else [])
+        if result.get("required") and result["status"] != "passed":
+            ok = False
+    # Name each restored checkpoint: the kind comes from the server's own
+    # checkpoint events before the request's receipt.
+    events, received = parse_events(*logs)
+    for row in rows:
+        row["restored_kind"] = kind_of(row, events, received)
+    doc["agent_requests"] = rows
+    doc["server_logs"] = logs
+    doc["server_cache"] = CS.cache_lines(*logs)
+    doc["server_events"] = CS.snapshot_events(*logs)
+    if args.speculative != "off":
+        drafts = draft_rows(logs_for_drafts)
+        doc["draft_requests"] = drafts
+        doc["draft_totals"] = {"requests": len(drafts),
+                               "requests_with_drafts": sum(1 for r in drafts if r["proposed"] > 0),
+                               "proposed": sum(r["proposed"] for r in drafts),
+                               "accepted": sum(r["accepted"] for r in drafts)}
+        if doc["draft_totals"]["proposed"] == 0:
+            ok = False
+            doc["error"] = "speculative mode %s proposed no drafts" % args.speculative
+    doc["status"] = "passed" if ok else "failed"
+    doc["seconds"] = round(time.monotonic() - t0, 1)
+    print(json.dumps(doc, separators=(",", ":")), flush=True)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

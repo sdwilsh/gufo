@@ -1,0 +1,71 @@
+{
+  "model": "Ling-3.0-flash",
+  "repository": "sdwilsh/Ling-3.0-flash-GGUF",
+  "source": "bartowski BF16 conversion of inclusionAI/Ling-3.0-flash; AtomicChat Atomic Dynamic recipes and imatrix; 917 of 917 tensor types and shapes match AtomicChat's files, plus the 21 NextN tensors (938 total)",
+  "quants": {
+    "Ling-3.0-flash-AD-Q4_K_S": {
+      "unsharded_bytes": 75981701568,
+      "shards": {
+        "Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf": {
+          "bytes": 44797227616,
+          "sha256": "2be134529a49adde75f144164c2e1a57533b39f0bdf7beab5337461b30ae3c9f"
+        },
+        "Ling-3.0-flash-AD-Q4_K_S-00002-of-00002.gguf": {
+          "bytes": 31184474144,
+          "sha256": "ab85ee0989690904c47d7098a140524ed46653614c912dae0490c04c273a763d"
+        }
+      }
+    },
+    "Ling-3.0-flash-AD-Q5_K_M": {
+      "unsharded_bytes": 91576648128,
+      "shards": {
+        "Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf": {
+          "bytes": 31660549472,
+          "sha256": "b16ca636ddbdc4d9c43b429e4989efbeb67cfc34567f995895278f8a5f580e23"
+        },
+        "Ling-3.0-flash-AD-Q5_K_M-00002-of-00003.gguf": {
+          "bytes": 31523973888,
+          "sha256": "e851bf4907c987a5999adaa0f9d28ba6f28701f8404e3becdb545755cff05e04"
+        },
+        "Ling-3.0-flash-AD-Q5_K_M-00003-of-00003.gguf": {
+          "bytes": 28392125088,
+          "sha256": "63916691d10600f2986f7872e6b9cd4a777c220533bb728b29391194eb23c384"
+        }
+      }
+    }
+  },
+  "gufo": {
+    "build": "quant-support commit plus the evidence kit",
+    "build_mode": "nix-release",
+    "dirty": false,
+    "binary_sha256": "550b089ae314dcbbc2ca0eaabdd752642442ede4e3d4ef30f015a3e5a0f54e7f",
+    "test_binaries_sha256": {
+      "ling_3_flash_logit_dump": "b9c275a793a25b94d39577e43670259b7d06c1c8af43886225ce9771223e61b4",
+      "ling_3_flash_mtp_test": "3345eae6f6bc41c03c2e20daf84d71f6920d9d9bf9a6a4b9b3b6645d7559f435",
+      "ling_3_flash_session_test": "58a75fa52d3312f0504e9bae8a730243563e6d909ac04fa005d00d6a3547c629"
+    },
+    "toolchain": "ROCm 7.2.3, GCC 15.3.0, kernel 7.2.9"
+  },
+  "llama_cpp": {
+    "version": "0.5.0-dev (build 11146, commit 7fe450e19)",
+    "image": "server-vulkan-v0.5.0",
+    "mesa": "26.0.8 (RADV, from the llama.cpp image)",
+    "kv": "q8_0"
+  },
+  "machines": {
+    "AD-Q4_K_S": "machine A (speed tables)",
+    "AD-Q5_K_M": "machine B, board replaced before the campaign (speed tables)",
+    "quality": "machine B for both quants"
+  },
+  "hardware": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S, gfx1151, 20 compute units, 128 GB LPDDR5X unified memory",
+  "kl_bases_sha256": {
+    "AD-Q4_K_S": {
+      "chat128.kl": "087096abe9313b2df74d01d3c2c0d277c46793620d73e2b2e32534c4313a5e6e",
+      "window512.kl": "059db4f6b2534d2f614e17a9c61a8ae4545f755503338207620dfaf22b0d02e0"
+    },
+    "AD-Q5_K_M": {
+      "chat128.kl": "4132b92c7c6d22255d498f15c7865ee90a50c6e8cec171f5907ae5afb8251f26",
+      "window512.kl": "24d157ed78308379d8b142687752c2e76f2f56175f0f9a910ad2cf892bb4e4e1"
+    }
+  }
+}

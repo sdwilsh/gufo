@@ -167,6 +167,15 @@ public:
     kCancelled,
   };
 
+  /// Dialect of tool calls the loaded model writes. kDefault models are
+  /// parsed in the grammar's format; kBailing models (Ling-3.0-flash) write
+  /// their chat template's `<tool_call>name<arg_key>..` format, steered by the
+  /// Bailing tool grammar and read by the Bailing parser.
+  enum class ToolCallSyntax : std::uint8_t {
+    kDefault,
+    kBailing,
+  };
+
   enum class InitialOutputState : std::uint8_t {
     kAuto,
     kReasoning,
@@ -240,6 +249,14 @@ public:
     std::string cache_miss_reason;
     std::size_t cache_common_prefix_tokens{0};
     std::size_t cache_checkpoint_tokens{0};
+    /// Admission sequence number of this request, the prompt length of the
+    /// previously admitted request and the prefix both share (0 for the
+    /// first), and the shared prefix with each of the last 8 admitted prompts
+    /// (sequence number, tokens; newest first).
+    std::uint64_t request_seq{0};
+    std::size_t previous_prompt_tokens{0};
+    std::size_t previous_common_prefix_tokens{0};
+    std::vector<std::pair<std::uint64_t, std::size_t>> recent_prefix_overlaps;
     FinishReason finish_reason{FinishReason::kStop};
     std::string stop_sequence;
     bool incremental_prefill_supported{false};
@@ -309,6 +326,9 @@ public:
   [[nodiscard]] virtual InitialOutputState initial_output_state(
       const ChatRequest&) const {
     return InitialOutputState::kAuto;
+  }
+  [[nodiscard]] virtual ToolCallSyntax tool_call_syntax() const {
+    return ToolCallSyntax::kDefault;
   }
 
   virtual Result complete(std::string_view prompt, std::size_t max_tokens,

@@ -26,6 +26,7 @@ import sys
 import time
 import traceback
 import zlib
+from check_report import check_line
 from metrics import compare, comparison_status, join_server_timings, timing_measurement
 
 TESTS = Path(__file__).resolve().parent
@@ -182,6 +183,29 @@ def compare_runs(baseline_dir, candidate_dir):
     return comparison
 
 
+CONNECTION_FAILURES = ("Connection error", "APIConnectionError", "ConnectionRefused",
+                       "ConnectionReset", "RemoteProtocolError", "RemoteDisconnected",
+                       "ReadTimeout", "server exited")
+
+
+def report_failure(label, output, error, tail_lines=60):
+    """Print one check= line per failed condition, and the server log tail when
+    the failure looks like a lost connection (a crashed or hung server)."""
+    log = output / (label + ".log")
+    text = log.read_text(errors="replace") if log.is_file() else ""
+    lines = [line for line in text.splitlines() if line.startswith("check=")]
+    print(f"==== {label} failed: {error} ====", flush=True)
+    for line in lines or [check_line(label, "suite exits 0 and reports success", error)]:
+        print(line, flush=True)
+    if any(marker in text or marker in error for marker in CONNECTION_FAILURES):
+        name = "server-restarted.log" if label.endswith("-disk") else "server.log"
+        server_log = output / name
+        tail = server_log.read_text(errors="replace").splitlines()[-tail_lines:] \
+            if server_log.is_file() else ["(no server log)"]
+        print(f"==== {name} tail ({label}) ====", flush=True)
+        print("\n".join(tail), flush=True)
+
+
 @contextlib.contextmanager
 def server(command, log_path, startup_timeout, environment=None):
     def interrupt(signum, frame):
@@ -239,7 +263,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True,
                         help="New report directory; existing results are never overwritten")
-    parser.add_argument("--sampling-preset", choices=("qwen38", "deepseek4"), required=True)
+    parser.add_argument("--sampling-preset", choices=("qwen38", "deepseek4", "ling3"), required=True)
     parser.add_argument("--suite", action="append", choices=("all", *SUITES), required=True,
                         help="Repeat to select affected suites; use all for an explicit full run")
     parser.add_argument("--expected-input-modalities", choices=("text", "text,image"),
@@ -373,6 +397,7 @@ def main():
             row["status"] = "passed"
         except Exception as error:
             row.update(status="failed", error=str(error), traceback=traceback.format_exc())
+            report_failure(label, output, row["error"])
         row["seconds"] = round(time.monotonic() - started, 3)
         write_json(report_path, report)
         print(f"{label}: {row['status']} ({row['seconds']}s)", flush=True)
@@ -500,6 +525,12 @@ def main():
             report["metric_accounting"] = validate_metrics_report(output)
     except (ValueError, OSError, KeyError, AssertionError) as error:
         report.update(status="failed", measurements_error=str(error))
+        # Every suite can have passed here; name the failure on stdout too.
+        print(check_line("execution", "loaded mode and per-request measurements are valid",
+                         error), flush=True)
+    if "error" in report:
+        print(check_line("runner", "the server runs every selected suite", report["error"]),
+              flush=True)
     report["functional_status"] = report["status"]
     report["completed_ns"] = time.time_ns()
     write_json(report_path, report)
@@ -511,6 +542,8 @@ def main():
             report["status"] = comparison["status"]
         except (ValueError, KeyError, OSError) as error:
             report.update(status="failed", comparison_error=str(error))
+            print(check_line("comparison", "the baseline comparison completes", error),
+                  flush=True)
     write_json(report_path, report)
     print(f"{report['mode']} {report['status']}: {report_path}", flush=True)
     return {"passed": 0, "failed": 1, "inconclusive": 2}[report["status"]]

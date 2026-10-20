@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Evict files from the page cache without privileges and verify it.
+
+usage: cold-files PATH...
+
+For each path: posix_fadvise(DONTNEED), then map the file read-only and ask
+mincore(2) which pages are resident. Prints resident/total pages per file and
+exits 1 when any page is still resident (for example because another process
+maps the file), so `model-bench --drop-caches "cold-files /models/*.gguf"`
+skips the loading table instead of reporting a warm-cache time.
+"""
+import ctypes
+import os
+import sys
+
+PROT_READ = 1
+MAP_SHARED = 1
+PAGE = os.sysconf("SC_PAGE_SIZE")
+
+
+def resident_pages(path: str) -> tuple[int, int]:
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mmap.restype = ctypes.c_void_p
+    libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
+                          ctypes.c_int, ctypes.c_long]
+    libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        size = os.fstat(fd).st_size
+        os.fsync(fd)  # dirty pages are not evictable
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        if size == 0:
+            return 0, 0
+        pages = (size + PAGE - 1) // PAGE
+        base = libc.mmap(None, size, PROT_READ, MAP_SHARED, fd, 0)
+        if base in (None, ctypes.c_void_p(-1).value):
+            raise OSError(ctypes.get_errno(), "mmap failed", path)
+        try:
+            vector = (ctypes.c_ubyte * pages)()
+            if libc.mincore(base, size, vector) != 0:
+                raise OSError(ctypes.get_errno(), "mincore failed", path)
+            return sum(byte & 1 for byte in vector), pages
+        finally:
+            libc.munmap(base, size)
+    finally:
+        os.close(fd)
+
+
+def main(paths: list[str]) -> int:
+    if not paths:
+        print(__doc__, file=sys.stderr)
+        return 2
+    warm = 0
+    for path in paths:
+        resident, pages = resident_pages(path)
+        print(f"{path}: {resident}/{pages} pages resident")
+        warm += resident
+    return 1 if warm else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

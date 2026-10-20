@@ -1,0 +1,1 @@
+{"text": "novel", "kl_mean": 0.006067, "top1_agreement": 0.96397, "source": "llama.cpp b11146 Vulkan f16 KV vs the CPU-f16 base, 16 chunks x 512 (baseline/floor-novel-container.log run1)"}

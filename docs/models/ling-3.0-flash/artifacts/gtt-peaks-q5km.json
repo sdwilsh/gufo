@@ -1,0 +1,35 @@
+{
+  "gufo/memory": {
+    "gtt_peak_gib": 97.027
+  },
+  "gufo/multi-ar": {
+    "gtt_peak_gib": 88.48
+  },
+  "gufo/multi-mtp": {
+    "gtt_peak_gib": 91.441
+  },
+  "gufo/multi-repetition-ar": {
+    "gtt_peak_gib": 84.679
+  },
+  "gufo/single-ar": {
+    "gtt_peak_gib": 97.521
+  },
+  "gufo/single-mtp": {
+    "gtt_peak_gib": 100.087
+  },
+  "qualify/single-ar": {
+    "gtt_peak_gib": 84.767
+  },
+  "qualify/single-mtp": {
+    "gtt_peak_gib": 86.859
+  },
+  "ref-q8-b/multi-ar": {
+    "gtt_peak_gib": 84.033
+  },
+  "ref-q8/memory": {
+    "gtt_peak_gib": 84.12
+  },
+  "ref-q8/single-ar": {
+    "gtt_peak_gib": 84.767
+  }
+}

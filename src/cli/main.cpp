@@ -11,6 +11,7 @@
 #include "src/cli/serve/serve.hpp"
 #include "src/cli/transcribe/transcribe.hpp"
 #include "src/cli/video/video.hpp"
+#include "src/core/runtime_environment.hpp"
 
 #ifndef GUFO_RELEASE_VERSION
 #define GUFO_RELEASE_VERSION "development"
@@ -173,6 +174,9 @@ int run(std::span<const char* const> args) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+  // Before any HIP call: a missing $TMPDIR crashes the runtime on first use.
+  if (!gufo::core::RequireTempDirectory())
+    return 1;
   const std::span<const char* const> args(argv, static_cast<std::size_t>(argc));
   return run(args);
 }

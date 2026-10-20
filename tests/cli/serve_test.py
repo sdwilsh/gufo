@@ -37,6 +37,9 @@ def main():
         else:
             check(["serve", modality, "--sessions", "0"], 2,
                   "server limits must be positive")
+        if modality == "llm":
+            check(["serve", modality, "--help"], 0,
+                  "Ling defaults to mtp when its GGUF has the MTP block")
         check(["serve", modality, "unexpected"], 2, "Unexpected argument")
         check(["serve", modality, "--port", "65536"], 2, "--port must")
         check(["serve", modality, "--host", "bad.address"], 2, "--host must")

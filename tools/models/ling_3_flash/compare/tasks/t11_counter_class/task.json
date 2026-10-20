@@ -1,0 +1,5 @@
+{
+ "category": "refactor",
+ "expected_tests": 8,
+ "prompt": "Refactor away global state. counter.py keeps its counts in a module-level dict, and app.Server uses the module functions, so two servers in one process share counts. Introduce class Counter in counter.py with methods hit(name) -> int (new count), count(name) -> int, total() -> int and reset(); keep the existing module-level functions hit/count/total/reset working by delegating to a module-level default instance named default_counter. Change app.Server to accept an optional counter argument (Server(counter=None)); when omitted each Server gets its own fresh Counter (NOT the shared default). Server.handle(path) must record the hit on its own counter. Existing tests must still pass."
+}
