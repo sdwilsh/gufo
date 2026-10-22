@@ -776,6 +776,15 @@ std::shared_ptr<models::ling_3_flash::Model> LoadLingModel(
   return model;
 }
 
+std::unique_ptr<models::ling_3_flash::Session> CreateLingSession(
+    models::ling_3_flash::Model& model) {
+  std::string error;
+  auto session = model.CreateSession(kDefaultContext, &error);
+  if (!session)
+    std::cerr << "Ling-3.0-flash session creation failed: " << error << '\n';
+  return session;
+}
+
 models::ling_3_flash::ChatTemplateOptions LingChatOptions(
     const PromptOptions& opt) {
   models::ling_3_flash::ChatTemplateOptions options;
@@ -852,12 +861,9 @@ int RunLingPrompt(const PromptOptions& opt, const core::GgufReader& reader,
   auto model = LoadLingModel(opt, reader, load_start);
   if (!model)
     return 1;
-  std::string error;
-  auto session = model->CreateSession(kDefaultContext, &error);
-  if (!session) {
-    std::cerr << "Ling-3.0-flash session creation failed: " << error << '\n';
+  auto session = CreateLingSession(*model);
+  if (!session)
     return 1;
-  }
   try {
     std::vector<std::int32_t> prompt;
     if (opt.use_chat_template) {
@@ -882,12 +888,9 @@ int RunLingChat(const PromptOptions& opt, const core::GgufReader& reader,
   auto model = LoadLingModel(opt, reader, load_start);
   if (!model)
     return 1;
-  std::string error;
-  auto session = model->CreateSession(kDefaultContext, &error);
-  if (!session) {
-    std::cerr << "Ling-3.0-flash session creation failed: " << error << '\n';
+  auto session = CreateLingSession(*model);
+  if (!session)
     return 1;
-  }
   std::cout << "=== Gufo Interactive Chat (Ling-3.0-flash) ===\n"
             << "Type 'exit' or Ctrl+D to quit.\n\n";
   std::vector<models::ling_3_flash::ChatMessage> history;
