@@ -37,6 +37,25 @@ enum class TokenType : std::int32_t {
   kByte = 6,
 };
 
+/// Appends the UTF-8 encoding of `cp` to `out`.
+inline void AppendUtf8(std::string& out, char32_t cp) {
+  if (cp < 0x80) {
+    out.push_back(static_cast<char>(cp));
+  } else if (cp < 0x800) {
+    out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+    out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+  } else if (cp < 0x10000) {
+    out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+    out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+  } else {
+    out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+    out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+  }
+}
+
 /// Byte-level BPE tokenizer for the GGUF `gpt2` model with the `bailingmoe2`
 /// pre-tokenizer (llama.cpp's greedy regex, evaluated with ICU). Mirrors
 /// llama.cpp b11146. Every user-defined token found in the text becomes one
