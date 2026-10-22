@@ -74,8 +74,7 @@ std::uint16_t HalfBits(float f) {
 }
 
 /// Quantises F32 rows (k % 32 == 0) to GGUF Q8_0: 34-byte blocks.
-std::vector<std::uint8_t> QuantizeQ8_0(const std::vector<float>& w,
-                                       std::size_t k) {
+std::vector<std::uint8_t> QuantizeQ8_0(const std::vector<float>& w) {
   const std::size_t nblocks = w.size() / 32;
   std::vector<std::uint8_t> out(nblocks * 34);
   for (std::size_t b = 0; b < nblocks; ++b) {
@@ -94,7 +93,6 @@ std::vector<std::uint8_t> QuantizeQ8_0(const std::vector<float>& w,
           static_cast<std::int8_t>(std::clamp(q, -127, 127)));
     }
   }
-  (void)k;
   return out;
 }
 
@@ -166,7 +164,7 @@ void Name(char* buf, std::size_t n, const char* what, std::size_t a,
 void TestQ8(std::uint32_t rows, std::uint32_t k) {
   constexpr std::uint32_t kTok = 67;
   const auto wf = Randn(std::size_t{rows} * k, 0.5F);
-  const auto wq = QuantizeQ8_0(wf, k);
+  const auto wq = QuantizeQ8_0(wf);
   const auto wd = DequantQ8_0Rows(wq, rows, k);
   const auto x = Randn(std::size_t{kTok} * k);
   const auto ref = RefGemm(wd, x, kTok, k, rows);
@@ -249,7 +247,7 @@ void TestQ8(std::uint32_t rows, std::uint32_t k) {
 // to the same token in a 1-token call, including when n exceeds the LDS
 // sub-batch size (k = 6144 fits only 4 tokens).
 void TestQ8BatchInvariant(std::uint32_t rows, std::uint32_t k) {
-  const auto wq = QuantizeQ8_0(Randn(std::size_t{rows} * k, 0.5F), k);
+  const auto wq = QuantizeQ8_0(Randn(std::size_t{rows} * k, 0.5F));
   const auto x = Randn(std::size_t{8} * k);
   Dev<std::uint8_t> dw(wq);
   Dev<float> dx(x);
@@ -284,7 +282,7 @@ void TestQ8Strided() {
   // offset 4096; everything else must stay untouched.
   constexpr std::uint32_t rows = 6144, k = 2560, ldy = 20512, n = 70,
                           off = 4096;
-  const auto wq = QuantizeQ8_0(Randn(std::size_t{rows} * k, 0.5F), k);
+  const auto wq = QuantizeQ8_0(Randn(std::size_t{rows} * k, 0.5F));
   const auto wd = DequantQ8_0Rows(wq, rows, k);
   const auto x = Randn(std::size_t{n} * k);
   const auto ref = RefGemm(wd, x, n, k, rows);
@@ -485,7 +483,7 @@ void TestGemmInvariance(bool q8, std::uint32_t rows, std::uint32_t k,
   std::vector<std::uint8_t> wbytes;
   std::vector<float> wd;  // dequantised (F16-exact for the F16 case)
   if (q8) {
-    wbytes = QuantizeQ8_0(Randn(std::size_t{rows} * k, 0.5F), k);
+    wbytes = QuantizeQ8_0(Randn(std::size_t{rows} * k, 0.5F));
     wd = DequantQ8_0Rows(wbytes, rows, k);
   } else {
     wbytes.resize(std::size_t{rows} * k * 2);
@@ -687,7 +685,7 @@ void RunBench() {
       {20512, 2560}, {6144, 2560}, {2560, 4096},
       {2560, 6144},  {768, 2560},  {2560, 768}};
   for (const auto& [rows, k] : shapes) {
-    const auto wq = QuantizeQ8_0(Randn(std::size_t{rows} * k, 0.5F), k);
+    const auto wq = QuantizeQ8_0(Randn(std::size_t{rows} * k, 0.5F));
     for (std::uint32_t n : {16U, 32U, 64U, 128U, 512U, 2048U})
       BenchGemm(true, rows, k, n, wq);
   }
@@ -940,7 +938,7 @@ void TestGroupedGemv() {
     std::vector<std::vector<std::uint8_t>> wq;
     std::vector<std::unique_ptr<Dev<std::uint8_t>>> dw;
     for (int i = 0; i < 3; ++i) {
-      wq.push_back(QuantizeQ8_0(Randn(std::size_t{rows[i]} * k, 0.5F), k));
+      wq.push_back(QuantizeQ8_0(Randn(std::size_t{rows[i]} * k, 0.5F)));
       dw.push_back(std::make_unique<Dev<std::uint8_t>>(wq.back()));
     }
     for (std::uint32_t n : {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U}) {
