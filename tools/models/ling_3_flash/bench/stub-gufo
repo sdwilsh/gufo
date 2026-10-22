@@ -65,9 +65,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(f"{len(payload):x}\r\n".encode() + payload + b"\r\n")
             self.wfile.flush()
 
-        key = hashlib.sha256(json.dumps(messages, sort_keys=True).encode()).hexdigest()
-        cached = n_prompt - 1 if key in SEEN else 0
-        SEEN.add(key)
+        cached = n_prompt - 1 if seed in SEEN else 0
+        SEEN.add(seed)
         n_fill = n_prompt - cached
         prefill_ms = n_fill / 800.0 * 1000.0
         for i in range(n_out):

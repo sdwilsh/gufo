@@ -368,7 +368,7 @@ def main():
                     name, row.get("error", "failed")[:300])]
                 print("==== failed suite log: %s (%s) ====" % (name, row.get("error", "")[:300]),
                       file=sys.stderr)
-                print(text[:2000] + ("\n[...]\n" if len(text) > 8000 else "") + text[-6000:]
+                print(text[:2000] + "\n[...]\n" + text[-6000:]
                       if len(text) > 8000 else text, file=sys.stderr, flush=True)
         if failed_conditions or phase.get("status") != "passed":
             report_failed("functional", failed_conditions or [
