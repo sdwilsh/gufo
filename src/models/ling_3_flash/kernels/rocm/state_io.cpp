@@ -139,10 +139,7 @@ bool CopyIn(const Staging& st, void* device, const std::uint8_t* host,
       return false;
     }
   }
-  if (!Check(hipStreamSynchronize(st.stream), "snapshot copy in sync", error)) {
-    return false;
-  }
-  return true;
+  return Check(hipStreamSynchronize(st.stream), "snapshot copy in sync", error);
 }
 
 }  // namespace
