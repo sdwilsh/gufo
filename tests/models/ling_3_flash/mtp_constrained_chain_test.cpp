@@ -61,6 +61,7 @@
 #include "src/models/ling_3_flash/mtp.hpp"
 #include "src/models/ling_3_flash/mtp_sampling.hpp"
 #include "src/models/ling_3_flash/tool_calls.hpp"
+#include "tests/models/ling_3_flash/bailing_raw_arguments.hpp"
 #include "tests/models/ling_3_flash/sampled_distribution.hpp"
 
 namespace l3 = gufo::models::ling_3_flash;
@@ -69,6 +70,7 @@ using gufo::tests::ling::Calibration;
 using gufo::tests::ling::kStopOutcome;
 using gufo::tests::ling::KsUniform;
 using gufo::tests::ling::Pit;
+using gufo::tests::ling::RawArgumentValues;
 using gufo::tests::ling::Sequence;
 using Constraint = sampling::JsonConstraint;
 
@@ -775,26 +777,10 @@ void CheckArguments(const Model& model, const Sequence& s, ArgumentCheck* out) {
         continue;
       }
       ++out->content_calls;
-      // The raw value text by a sequential scan of the call's pairs: a raw
-      // value ends at the first value closer (it cannot contain one), so a
-      // key-like text inside an earlier value is skipped.
-      std::optional<std::string> raw;
-      for (std::size_t at = call.begin; at < call.end;) {
-        const auto key = text.find("<arg_key>", at);
-        const auto key_end = text.find("</arg_key>", key);
-        const auto value = text.find("<arg_value>", key_end);
-        const auto close = text.find("</arg_value>", value);
-        if (key == std::string::npos || key_end == std::string::npos ||
-            value == std::string::npos || close == std::string::npos ||
-            close >= call.end) {
-          break;
-        }
-        if (text.substr(key + 9, key_end - key - 9) == "content") {
-          raw = text.substr(value + 11, close - value - 11);
-        }
-        at = close + 12;
-      }
-      const bool same = raw && argument.is_string && argument.value == *raw;
+      const auto raw = RawArgumentValues(text, call.begin, call.end);
+      const auto found = raw.find("content");
+      const bool same = found != raw.end() && argument.is_string &&
+                        argument.value == found->second;
       out->mismatches += same ? 0 : 1;
       if (!same && out->mismatches <= 3) {
         std::printf("       argument mismatch: text=[%s] parsed=[%s]\n",

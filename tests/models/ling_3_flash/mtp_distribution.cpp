@@ -93,8 +93,6 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
-#include <map>
-#include <optional>
 #include <random>
 #include <span>
 #include <sstream>
@@ -107,6 +105,7 @@
 #include "src/core/sampling.hpp"
 #include "src/models/ling_3_flash/chat_template.hpp"
 #include "src/models/ling_3_flash/tool_calls.hpp"
+#include "tests/models/ling_3_flash/bailing_raw_arguments.hpp"
 #include "tests/models/ling_3_flash/model_tool.hpp"
 #include "tests/models/ling_3_flash/sampled_distribution.hpp"
 
@@ -445,23 +444,7 @@ void CheckCalls(const std::string& generated, bool thinking,
   out->sequences_with_calls += scan.calls.empty() ? 0 : 1;
   for (const auto& call : scan.calls) {
     ++out->calls;
-    // Raw values by a sequential scan of the call's pairs: a raw value ends
-    // at the first value closer, so key-like text inside a value is skipped.
-    std::map<std::string, std::string> raw;
-    for (std::size_t at = call.begin; at < call.end;) {
-      const auto key = text.find("<arg_key>", at);
-      const auto key_end = text.find("</arg_key>", key);
-      const auto value = text.find("<arg_value>", key_end);
-      const auto close = text.find("</arg_value>", value);
-      if (key == std::string::npos || key_end == std::string::npos ||
-          value == std::string::npos || close == std::string::npos ||
-          close >= call.end) {
-        break;
-      }
-      raw[text.substr(key + 9, key_end - key - 9)] =
-          text.substr(value + 11, close - value - 11);
-      at = close + 12;
-    }
+    const auto raw = RawArgumentValues(text, call.begin, call.end);
     for (const auto& argument : call.arguments) {
       if (bind && argument.name == "mode_bits") {
         ++out->integer_arguments;
