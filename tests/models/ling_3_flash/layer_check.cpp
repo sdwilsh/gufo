@@ -40,6 +40,13 @@ constexpr double kLocalGate = 1e-2;
 constexpr double kSelfPrefillGate = 1e-3;
 constexpr double kSelfDecodeGate = 5e-2;
 
+/// Records a fatal error in the report; the tool's exit code is 1.
+int Fail(Report& report, json::Value message) {
+  report.Set("status", "error");
+  report.Set("error", std::move(message));
+  return 1;
+}
+
 std::string LayerFile(const std::string& dir, const char* name, int layer) {
   char buf[64];
   std::snprintf(buf, sizeof(buf), "/%s.l%02d.f32", name, layer);
@@ -155,35 +162,25 @@ int RunInvariance(const Args& args, Report& report,
   const std::uint32_t layers = model->LayerCount();
   const std::size_t want = std::size_t{n} * l3::kHidden;
   if (n < 20) {
-    report.Set("status", "error");
-    report.Set("error", "--invariance needs at least 20 tokens");
-    return 1;
+    return Fail(report, "--invariance needs at least 20 tokens");
   }
   auto session = model->CreateSession(model->MaxContext(), &error);
   if (!session) {
-    report.Set("status", "error");
-    report.Set("error", error);
-    return 1;
+    return Fail(report, error);
   }
   std::vector<float> cur;
   if (first == 0) {
     l3::GpuDumpRecorder rec({}, {"embd"});
     if (!session->Feed(tokens, {.sink = &rec}, &error)) {
-      report.Set("status", "error");
-      report.Set("error", "embedding run: " + error);
-      return 1;
+      return Fail(report, "embedding run: " + error);
     }
     const auto e = rec.Get("embd", 0);
     cur.assign(e.begin(), e.end());
   } else if (!ReadF32Dump(args.Str("--chain-in"), &cur)) {
-    report.Set("status", "error");
-    report.Set("error", "--layer-first needs --chain-in (F32 n x hidden)");
-    return 1;
+    return Fail(report, "--layer-first needs --chain-in (F32 n x hidden)");
   }
   if (cur.size() < want) {
-    report.Set("status", "error");
-    report.Set("error", "chain input is shorter than n x hidden");
-    return 1;
+    return Fail(report, "chain input is shorter than n x hidden");
   }
   cur.resize(want);
 
@@ -228,10 +225,8 @@ int RunInvariance(const Args& args, Report& report,
                                    std::size_t{pos} * l3::kHidden,
                                    std::size_t{len} * l3::kHidden),
                                nullptr, &error)) {
-          report.Set("status", "error");
-          report.Set("error", variants[vi].name + " layer " +
+          return Fail(report, variants[vi].name + " layer " +
                                   std::to_string(il) + ": " + error);
-          return 1;
         }
         pos += len;
       }
@@ -242,9 +237,7 @@ int RunInvariance(const Args& args, Report& report,
         ok = session->ReadKdaState(il, &sn.state, &sn.conv, &error);
       }
       if (!ok) {
-        report.Set("status", "error");
-        report.Set("error", "state read: " + error);
-        return 1;
+        return Fail(report, "state read: " + error);
       }
     }
     auto row = json::Value::object();
@@ -327,10 +320,8 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
         }
       }
     } catch (const std::exception& e) {
-      report.Set("status", "error");
-      report.Set("error",
-                 std::string("cannot read reference index.json: ") + e.what());
-      return 1;
+      return Fail(report,
+                  std::string("cannot read reference index.json: ") + e.what());
     }
   }
 
@@ -345,16 +336,12 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
   const std::uint32_t layers = model->LayerCount();
   const bool free_run = first == 0;
   if (!free_run && self_mode) {
-    report.Set("status", "error");
-    report.Set(
-        "error",
+    return Fail(
+        report,
         "--layer-first needs --reference-dir (no free run to self-check)");
-    return 1;
   }
   if (n > model->PrefillCapacity()) {
-    report.Set("status", "error");
-    report.Set("error", "more tokens than --max-batch");
-    return 1;
+    return Fail(report, "more tokens than --max-batch");
   }
   auto tj = json::Value::array();
   for (const auto t : tokens) {
@@ -365,18 +352,14 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
   // ---- free run ----
   auto session = model->CreateSession(model->MaxContext(), &error);
   if (!session) {
-    report.Set("status", "error");
-    report.Set("error", error);
-    return 1;
+    return Fail(report, error);
   }
   l3::GpuDumpRecorder free_dump;
   std::vector<l3::StepTiming> timings;
   if (free_run &&
       !session->Feed(tokens, {.sink = &free_dump, .timings = &timings},
                      &error)) {
-    report.Set("status", "error");
-    report.Set("error", "free run: " + error);
-    return 1;
+    return Fail(report, "free run: " + error);
   }
   const auto top = free_run ? session->Argmax() : -1;
   std::fprintf(
@@ -394,9 +377,7 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
                        "\"hidden\": 2560,\n  \"tokens\": [" +
                            tokens_json + "],\n",
                        &error)) {
-    report.Set("status", "error");
-    report.Set("error", error);
-    return 1;
+    return Fail(report, error);
   }
   if (free_run) {
     report.Set("free_dump_dir", free_path);
@@ -436,11 +417,9 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
     inputs[k] = il == 0 ? embd() : h_out_of(static_cast<int>(il) - 1);
     expected[k] = h_out_of(static_cast<int>(il));
     if (inputs[k].size() < want || expected[k].size() < want) {
-      report.Set("status", "error");
-      report.Set("error", "missing or short reference tensors for layer " +
+      return Fail(report, "missing or short reference tensors for layer " +
                               std::to_string(il) + " (need " +
                               std::to_string(n) + " tokens)");
-      return 1;
     }
     inputs[k].resize(want);
     expected[k].resize(want);
@@ -484,10 +463,8 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
           std::span<float> o(out.data() + std::size_t{t} * l3::kHidden,
                              std::size_t{len} * l3::kHidden);
           if (!session->RunBlock(il, t, in, o, &pass->dump, &error)) {
-            report.Set("status", "error");
-            report.Set("error", std::string(pass->name) + " layer " +
+            return Fail(report, std::string(pass->name) + " layer " +
                                     std::to_string(il) + ": " + error);
-            return 1;
           }
         }
       } else if (pass == &split) {
@@ -498,17 +475,13 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
                                &pass->dump, &error) ||
             !session->RunBlock(il, split_at, in_all.subspan(cut),
                                out_all.subspan(cut), &pass->dump, &error)) {
-          report.Set("status", "error");
-          report.Set("error", std::string(pass->name) + " layer " +
+          return Fail(report, std::string(pass->name) + " layer " +
                                   std::to_string(il) + ": " + error);
-          return 1;
         }
       } else if (!one_by_one) {
         if (!session->RunBlock(il, 0, inputs[k], out, &pass->dump, &error)) {
-          report.Set("status", "error");
-          report.Set("error", std::string(pass->name) + " layer " +
+          return Fail(report, std::string(pass->name) + " layer " +
                                   std::to_string(il) + ": " + error);
-          return 1;
         }
       } else {
         for (std::uint32_t t = 0; t < n; ++t) {
@@ -517,11 +490,9 @@ int Run(const Args& args, Report& report, std::shared_ptr<l3::Model> model) {
           std::span<float> o(out.data() + std::size_t{t} * l3::kHidden,
                              l3::kHidden);
           if (!session->RunBlock(il, t, in, o, &pass->dump, &error)) {
-            report.Set("status", "error");
-            report.Set("error", std::string(pass->name) + " layer " +
+            return Fail(report, std::string(pass->name) + " layer " +
                                     std::to_string(il) + " token " +
                                     std::to_string(t) + ": " + error);
-            return 1;
           }
         }
       }
