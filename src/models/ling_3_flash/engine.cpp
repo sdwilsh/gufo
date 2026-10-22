@@ -275,6 +275,30 @@ bool Session::Evaluate(std::int32_t token, std::string* error_msg) {
   return Feed(std::span<const std::int32_t>(&token, 1), {}, error_msg);
 }
 
+template<typename Lane>
+bool Session::AdmitBatchLane(std::span<Lane> lanes, std::size_t i,
+                             const Model& model, std::size_t admitted) {
+  Lane& lane = lanes[i];
+  const Session* s = lane.session;
+  if (s->model_.get() != &model) {
+    lane.error = "batch lane belongs to another model";
+    return false;
+  }
+  if (std::any_of(lanes.begin(), lanes.begin() + i,
+                  [&](const Lane& o) { return o.session == s; })) {
+    lane.error = "session appears twice in one batch";
+    return false;
+  }
+  if (admitted == model.executor_->batch_row_limit()) {
+    lane.error = "a batch holds at most " +
+                 std::to_string(model.executor_->batch_row_limit()) +
+                 " sessions";
+    lane.deferred = true;
+    return false;
+  }
+  return true;
+}
+
 void Session::EvaluateBatch(std::span<BatchLane> lanes) {
   std::vector<rocm::BatchSegment> segments;
   std::vector<BatchLane*> members;
@@ -295,20 +319,7 @@ void Session::EvaluateBatch(std::span<BatchLane> lanes) {
     if (model == nullptr) {
       model = s->model_.get();
     }
-    if (s->model_.get() != model) {
-      lane.error = "batch lane belongs to another model";
-      continue;
-    }
-    if (std::any_of(lanes.begin(), lanes.begin() + i,
-                    [&](const BatchLane& o) { return o.session == s; })) {
-      lane.error = "session appears twice in one batch";
-      continue;
-    }
-    if (segments.size() == model->executor_->batch_row_limit()) {
-      lane.error = "a batch holds at most " +
-                   std::to_string(model->executor_->batch_row_limit()) +
-                   " sessions";
-      lane.deferred = true;
+    if (!AdmitBatchLane(lanes, i, *model, segments.size())) {
       continue;
     }
     // Evaluate's own checks (Feed), in its order and with its effects.
@@ -1096,20 +1107,7 @@ void Session::DecodeBatch(std::span<BatchDecode> lanes) {
     if (model == nullptr) {
       model = s->model_.get();
     }
-    if (s->model_.get() != model) {
-      fail(d, "batch lane belongs to another model");
-      continue;
-    }
-    if (std::any_of(lanes.begin(), lanes.begin() + i,
-                    [&](const BatchDecode& o) { return o.session == s; })) {
-      fail(d, "session appears twice in one batch");
-      continue;
-    }
-    if (ready.size() == model->executor_->batch_row_limit()) {
-      fail(d, "a batch holds at most " +
-                  std::to_string(model->executor_->batch_row_limit()) +
-                  " sessions");
-      d.deferred = true;
+    if (!AdmitBatchLane(lanes, i, *model, ready.size())) {
       continue;
     }
     const auto t0 = Clock::now();

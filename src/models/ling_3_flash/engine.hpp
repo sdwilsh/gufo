@@ -550,6 +550,12 @@ private:
   friend class Model;
   friend class ContinuationAdapter;
   Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
+  /// The lane checks EvaluateBatch and DecodeBatch share: lanes[i] runs on
+  /// `model`, appears once, and fits beside `admitted` lanes. On a refusal it
+  /// sets the lane's error (and deferred for a full batch).
+  template<typename Lane>
+  static bool AdmitBatchLane(std::span<Lane> lanes, std::size_t i,
+                             const Model& model, std::size_t admitted);
 
   std::shared_ptr<Model> model_;
   std::unique_ptr<rocm::Session> session_;
