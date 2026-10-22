@@ -232,16 +232,11 @@ bool Executor::RestoreSnapshot(Session& session, std::uint32_t rows,
     return false;
   }
   auto& st = session.state_;
-  if (session.continuation_hooks_ != nullptr) {
-    // A component-cache slot preserves its borrowed rows before they change.
-    try {
-      session.continuation_hooks_->BeforeWrite(0, session.capacity(), 0,
-                                               session.capacity());
-    } catch (const std::exception& e) {
-      if (error_msg != nullptr)
-        *error_msg = e.what();
-      return false;
-    }
+  // A component-cache slot preserves its borrowed rows before they change.
+  if (session.continuation_hooks_ != nullptr &&
+      !CallBeforeWrite(*session.continuation_hooks_, 0, session.capacity(), 0,
+                       session.capacity(), error_msg)) {
+    return false;
   }
   const TransferScope in_flight(session.transfers_);
   const std::lock_guard<std::mutex> lock(transfer_mutex_);

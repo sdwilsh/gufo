@@ -600,6 +600,10 @@ private:
   bool FinishForward(Session& session, const ForwardRequest& request,
                      std::uint32_t n, std::uint32_t from, std::uint32_t layers,
                      bool graph, std::string* error_msg);
+  /// Calls hooks.BeforeWrite; a refusal returns false with its message.
+  [[nodiscard]] static bool CallBeforeWrite(
+      ContinuationHooks& hooks, std::uint32_t first, std::uint32_t end,
+      std::uint32_t mtp_first, std::uint32_t mtp_end, std::string* error_msg);
 
   const DeviceModel& model_;
   Options options_;

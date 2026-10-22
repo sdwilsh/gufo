@@ -1248,6 +1248,17 @@ bool Executor::ForwardGraph(Session& session, const ForwardRequest& r,
          FinishForward(session, r, n, from, layers, true, error);
 }
 
+bool Executor::CallBeforeWrite(ContinuationHooks& hooks, std::uint32_t first,
+                               std::uint32_t end, std::uint32_t mtp_first,
+                               std::uint32_t mtp_end, std::string* error) {
+  try {
+    hooks.BeforeWrite(first, end, mtp_first, mtp_end);
+  } catch (const std::exception& e) {
+    return Fail(error, e.what());
+  }
+  return true;
+}
+
 bool Executor::Forward(Session& session, const ForwardRequest& r,
                        std::string* error) {
   step_start_ = std::chrono::steady_clock::now();
@@ -1293,16 +1304,13 @@ bool Executor::Forward(Session& session, const ForwardRequest& r,
                   "token id " + std::to_string(t) + " outside the vocabulary");
     }
   }
-  if (session.continuation_hooks_ != nullptr) {
-    // Before anything is launched or replayed: a refusal leaves the session
-    // untouched. MTP rows q = first_pos - 1 .. first_pos + n - 2 are rewritten.
-    try {
-      session.continuation_hooks_->BeforeWrite(
-          first_pos, first_pos + n, first_pos > 0 ? first_pos - 1 : 0,
-          first_pos + n - 1);
-    } catch (const std::exception& e) {
-      return Fail(error, e.what());
-    }
+  // Before anything is launched or replayed: a refusal leaves the session
+  // untouched. MTP rows q = first_pos - 1 .. first_pos + n - 2 are rewritten.
+  if (session.continuation_hooks_ != nullptr &&
+      !CallBeforeWrite(*session.continuation_hooks_, first_pos, first_pos + n,
+                       first_pos > 0 ? first_pos - 1 : 0, first_pos + n - 1,
+                       error)) {
+    return false;
   }
   const std::uint32_t layers = layer_count();
   // Small-batch steps replay a per-session graph from their second occurrence
@@ -1488,12 +1496,9 @@ bool Executor::ForwardBatch(std::span<BatchSegment> segments,
         s.error = "session slot is not ready for execution";
         continue;
       }
-      try {
-        hooks->BeforeWrite(first_pos, first_pos + n,
-                           first_pos > 0 ? first_pos - 1 : 0,
-                           first_pos + n - 1);
-      } catch (const std::exception& e) {
-        s.error = e.what();
+      if (!CallBeforeWrite(*hooks, first_pos, first_pos + n,
+                           first_pos > 0 ? first_pos - 1 : 0, first_pos + n - 1,
+                           &s.error)) {
         continue;
       }
     }
@@ -1706,13 +1711,10 @@ bool Executor::MtpDraft(Session& session, const DraftRequest& r,
       (!r.logits.empty() && r.logits.size() < kVocabRows)) {
     return Fail(error, "MTP draft request is out of range");
   }
-  if (session.continuation_hooks_ != nullptr) {
-    try {
-      session.continuation_hooks_->BeforeWrite(0, 0, r.position,
-                                               r.position + 1);
-    } catch (const std::exception& e) {
-      return Fail(error, e.what());
-    }
+  if (session.continuation_hooks_ != nullptr &&
+      !CallBeforeWrite(*session.continuation_hooks_, 0, 0, r.position,
+                       r.position + 1, error)) {
+    return false;
   }
   const DeviceMtp& m = *model_.mtp();
   Buffers& b = *b_;
@@ -1840,16 +1842,12 @@ bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
     // ForwardBatch segment is kRejected): it keeps its row in the pass so
     // chained peers keep theirs, but writes nothing to its session.
     if (ContinuationHooks* hooks = d.session->continuation_hooks_) {
-      try {
-        if (!hooks->Ready()) {
-          d.failed = true;
-          d.error = "MTP draft lane slot is not ready for execution";
-        } else {
-          hooks->BeforeWrite(0, 0, d.position, d.position + 1);
-        }
-      } catch (const std::exception& e) {
+      if (!hooks->Ready()) {
         d.failed = true;
-        d.error = e.what();
+        d.error = "MTP draft lane slot is not ready for execution";
+      } else if (!CallBeforeWrite(*hooks, 0, 0, d.position, d.position + 1,
+                                  &d.error)) {
+        d.failed = true;
       }
     }
   }
@@ -2038,13 +2036,10 @@ bool Executor::RunBlock(Session& session, std::uint32_t il,
   if (n > options_.max_batch || first_pos + n > session.capacity()) {
     return Fail(error, "block batch exceeds the executor or session limits");
   }
-  if (session.continuation_hooks_ != nullptr) {
-    try {
-      session.continuation_hooks_->BeforeWrite(first_pos, first_pos + n,
-                                               first_pos, first_pos + n);
-    } catch (const std::exception& e) {
-      return Fail(error, e.what());
-    }
+  if (session.continuation_hooks_ != nullptr &&
+      !CallBeforeWrite(*session.continuation_hooks_, first_pos, first_pos + n,
+                       first_pos, first_pos + n, error)) {
+    return false;
   }
   Buffers& b = *b_;
   if (!UploadInputs({}, n, first_pos, error) ||
