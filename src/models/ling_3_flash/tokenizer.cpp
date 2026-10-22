@@ -55,6 +55,12 @@ const std::array<char32_t, 256>& ByteToCodepoint() {
   return table;
 }
 
+bool IsSpecialType(std::int32_t type) noexcept {
+  return type == static_cast<int>(TokenType::kControl) ||
+         type == static_cast<int>(TokenType::kUserDefined) ||
+         type == static_cast<int>(TokenType::kUnknown);
+}
+
 std::string ByteSpelling(std::uint8_t byte) {
   std::string out;
   AppendUtf8(out, ByteToCodepoint()[byte]);
@@ -335,10 +341,7 @@ std::unique_ptr<LingTokenizer> LingTokenizer::CreateFromVocabulary(
 
   t->id_to_bytes_.resize(tokens.size());
   for (std::size_t i = 0; i < tokens.size(); ++i) {
-    const auto type = t->token_type_[i];
-    const bool special = type == static_cast<int>(TokenType::kControl) ||
-                         type == static_cast<int>(TokenType::kUserDefined) ||
-                         type == static_cast<int>(TokenType::kUnknown);
+    const bool special = IsSpecialType(t->token_type_[i]);
     t->id_to_bytes_[i] = special ? tokens[i] : UnspellBytes(tokens[i]);
     if (special && !tokens[i].empty()) {
       t->specials_.emplace_back(tokens[i], static_cast<TokenId>(i));
@@ -706,10 +709,7 @@ bool LingTokenizer::IsSpecialToken(TokenId id) const noexcept {
   if (id >= token_type_.size()) {
     return false;
   }
-  const auto type = token_type_[id];
-  return type == static_cast<int>(TokenType::kControl) ||
-         type == static_cast<int>(TokenType::kUserDefined) ||
-         type == static_cast<int>(TokenType::kUnknown);
+  return IsSpecialType(token_type_[id]);
 }
 
 }  // namespace gufo::models::ling_3_flash
