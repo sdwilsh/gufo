@@ -37,6 +37,12 @@ bool Fail(std::string* error, const std::string& message) {
   return false;
 }
 
+float ElapsedMs(hipEvent_t start, hipEvent_t stop) {
+  float ms = 0.0F;
+  (void)hipEventElapsedTime(&ms, start, stop);
+  return ms;
+}
+
 template<class T>
 bool Alloc(T** out, std::size_t count, const char* what, std::size_t* total,
            std::string* error) {
@@ -1796,11 +1802,7 @@ bool Executor::MtpDraft(Session& session, const DraftRequest& r,
     return false;
   }
   launch_.wall_ms = StepMs();
-  {
-    float ms = 0.0F;
-    (void)hipEventElapsedTime(&ms, draft_events_[0], draft_events_[1]);
-    launch_.device_ms = ms;
-  }
+  launch_.device_ms = ElapsedMs(draft_events_[0], draft_events_[1]);
   if (r.op_profile != nullptr) {
     FinishProfile(r.op_profile);
   }
@@ -1956,11 +1958,7 @@ bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
                 "MTP draft batch: injected failure after launch (test hook)");
   }
   launch_.wall_ms = StepMs();
-  {
-    float ms = 0.0F;
-    (void)hipEventElapsedTime(&ms, draft_events_[0], draft_events_[1]);
-    launch_.device_ms = ms;
-  }
+  launch_.device_ms = ElapsedMs(draft_events_[0], draft_events_[1]);
   for (std::uint32_t i = 0; i < count; ++i) {
     if (lanes[i].failed) {
       continue;
