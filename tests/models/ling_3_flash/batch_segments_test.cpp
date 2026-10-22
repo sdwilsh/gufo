@@ -25,15 +25,12 @@
 #include "src/models/ling_3_flash/kernels/rocm/device_model.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/executor.hpp"
 #include "src/models/ling_3_flash/weights.hpp"
+#include "tests/models/ling_3_flash/batch_lanes.hpp"
 #include "tests/models/ling_3_flash/model_tool.hpp"
 
 namespace gufo::tests::ling::segments_tool {
 
 namespace rocm = l3::rocm;
-
-std::int32_t Tok(std::uint32_t i) {
-  return static_cast<std::int32_t>((i * 2654435761U + 12345U) % 150000U);
-}
 
 template<class T>
 bool SameBytes(const std::vector<T>& a, const std::vector<T>& b) {

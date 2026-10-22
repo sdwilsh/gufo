@@ -27,9 +27,12 @@
 
 #include "src/core/runtime_environment.hpp"
 #include "src/models/ling_3_flash/engine.hpp"
+#include "tests/models/ling_3_flash/batch_lanes.hpp"
 
 namespace l3 = gufo::models::ling_3_flash;
 namespace sampling = gufo::sampling;
+using gufo::tests::ling::Item;
+using gufo::tests::ling::Tok;
 
 namespace {
 
@@ -49,10 +52,6 @@ struct Script {
   std::uint64_t graph_replays{0};  ///< HIP graph replays of the whole script
 };
 
-std::int32_t Tok(std::uint32_t i) {
-  return static_cast<std::int32_t>((i * 2654435761U + 12345U) % 150000U);
-}
-
 std::string DigestLine(Script* out, const char* what, std::uint32_t step,
                        const l3::Session& s) {
   const auto logits = s.Logits();
@@ -70,13 +69,6 @@ std::string DigestLine(Script* out, const char* what, std::uint32_t step,
                 step, s.Position(), s.Argmax(),
                 static_cast<unsigned long long>(h));
   return buf;
-}
-
-l3::Session::BatchLane Item(l3::Session* session, std::int32_t token) {
-  l3::Session::BatchLane lane;
-  lane.session = session;
-  lane.token = token;
-  return lane;
 }
 
 void Digest(Script* out, const char* what, std::uint32_t step,

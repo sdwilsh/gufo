@@ -43,11 +43,10 @@
 #include "src/cli/serve/inference_backend.hpp"
 
 #define LING_TOOL_NO_MAIN
+#include "tests/models/ling_3_flash/batch_lanes.hpp"
 #include "tests/models/ling_3_flash/session_test.cpp"
 
 namespace gufo::tests::ling::batch_tool {
-
-using Bytes = std::vector<std::uint8_t>;
 
 struct Rng {
   std::uint64_t s;
@@ -62,16 +61,6 @@ struct Rng {
     return static_cast<std::size_t>(Next() % n);
   }
 };
-
-/// The whole state of a session: its snapshot payload.
-bool State(const l3::Session& s, Bytes* out, std::string* error) {
-  auto snap = s.SaveSnapshot(error);
-  if (!snap) {
-    return false;
-  }
-  out->assign(snap->bytes().begin(), snap->bytes().end());
-  return true;
-}
 
 /// Name of the first snapshot section where two payloads differ.
 std::string FirstDiff(const Bytes& a, const Bytes& b, bool mtp) {
@@ -101,13 +90,6 @@ std::string FirstDiff(const Bytes& a, const Bytes& b, bool mtp) {
   if (offset < s.mtp)
     return "mtp_carry";
   return "mtp_cache";
-}
-
-l3::Session::BatchLane Item(l3::Session* session, std::int32_t token) {
-  l3::Session::BatchLane lane;
-  lane.session = session;
-  lane.token = token;
-  return lane;
 }
 
 bool SameLogits(std::span<const float> a, std::span<const float> b) {
