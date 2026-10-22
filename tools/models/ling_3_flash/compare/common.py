@@ -9,6 +9,7 @@ import http.server
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -245,7 +246,6 @@ def open_refs(pid, prefix):
 
 def shard_files(model):
     """All files of a GGUF model: every NNNNN-of-MMMMM shard, or the file itself."""
-    import re
     path = Path(model)
     m = re.match(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", path.name)
     if not m:
@@ -378,17 +378,17 @@ class Server:
             pass
         return memory
 
-    def log_head(self, lines=60):
+    def _log_lines(self):
         try:
-            return self.log_path.read_text(errors="replace").splitlines()[:lines]
+            return self.log_path.read_text(errors="replace").splitlines()
         except OSError:
             return []
 
+    def log_head(self, lines=60):
+        return self._log_lines()[:lines]
+
     def log_tail(self, lines=40):
-        try:
-            return self.log_path.read_text(errors="replace").splitlines()[-lines:]
-        except OSError:
-            return []
+        return self._log_lines()[-lines:]
 
 
 # ------------------------------------------------------------ seeding proxy

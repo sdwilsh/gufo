@@ -83,13 +83,12 @@ def parse_md_bench(text):
         if set("".join(cells)) <= set("-: "):
             continue
         record = dict(zip(header, cells))
-        for key in ("t/s",):
-            if key in record and "±" in record[key]:
-                mean, _, std = record[key].partition("±")
-                try:
-                    record["tps_mean"], record["tps_std"] = float(mean), float(std)
-                except ValueError:
-                    pass
+        if "t/s" in record and "±" in record["t/s"]:
+            mean, _, std = record["t/s"].partition("±")
+            try:
+                record["tps_mean"], record["tps_std"] = float(mean), float(std)
+            except ValueError:
+                pass
         rows.append(record)
     return rows
 
@@ -354,9 +353,7 @@ def agent_phase(args, server, spec, work, label=None):
                                     "finish": s.get("finish_reason"),
                                     "calls": [(c["name"], c["valid"]) for c in s.get("calls", [])]}
                                    for s in episode["step_log"]]
-        proc = getattr(server, "proc", None)
-        if proc is not None and proc.poll() is not None:
-            raise RuntimeError(f"gufo serve exited with {proc.returncode} during the agent phase")
+        _require_alive(server, "agent")
         if not episode["passed"]:
             compact["grade_tail"] = episode["grade"]["output_tail"][-700:]
         row("agent", compact)
@@ -489,7 +486,7 @@ def agent_modes_phase(args, spec, work):
             serve["memory"] = server.stop()
             serve["log_tail"] = server.log_tail(30)
             serve["decode"] = decode_stats(server, [("agent", start)])
-            serve["upload_fallback_lines"] = [l for l in server.log_head(100000) if "span alloc failed" in l][:5]
+            serve["upload_fallback_lines"] = _upload_fallback_lines(server)
     out["comparison"] = compare_modes(out["modes"], args.agent_speculative)
     row("agent_comparison", out["comparison"])
     modes = args.agent_speculative
@@ -649,10 +646,13 @@ def main(argv=None):
             return 2
     log(f"model {args.model}: {spec['label']} ({spec['model']}); work {work}")
 
+    def save_summary():
+        (work / "summary.json").write_text(json.dumps(summary, indent=1))
+
     def finish():
         summary["finished_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         summary["cgroup_memory"] = common.cgroup_memory()
-        (work / "summary.json").write_text(json.dumps(summary, indent=1))
+        save_summary()
         print(json.dumps(summary, indent=1))
         return 2 if harness_failed else 0
 
@@ -666,12 +666,12 @@ def main(argv=None):
                 harness_failed = True
             else:
                 summary["phases"]["bench"]["status"] = "passed"
-            (work / "summary.json").write_text(json.dumps(summary, indent=1))
+            save_summary()
         shared_parts = list(args.parts)
         if "agent" in args.parts and args.agent_speculative:
             summary["phases"]["agent"] = agent_modes_phase(args, spec, work)
             shared_parts.remove("agent")
-            (work / "summary.json").write_text(json.dumps(summary, indent=1))
+            save_summary()
         if "agent" in shared_parts or "eval" in shared_parts:
             if args.serve_url:
                 port = int(args.serve_url.rsplit(":", 1)[1])
@@ -712,8 +712,7 @@ def main(argv=None):
                 if hasattr(server, "stop"):
                     summary["memory"] = {"serve": server.stop(), "peaks_after_phase": marks}
                     summary["serve"]["log_tail"] = server.log_tail(30)
-                    summary["serve"]["upload_fallback_lines"] = [
-                        l for l in server.log_head(100000) if "span alloc failed" in l][:5]
+                    summary["serve"]["upload_fallback_lines"] = _upload_fallback_lines(server)
                 summary["serve"]["decode"] = decode_stats(server, phase_starts)
     except Exception:  # a harness bug or environment failure, not a model score
         summary["errors"].append(traceback.format_exc())
@@ -723,6 +722,10 @@ def main(argv=None):
 
 
 COMPLETED_FIELD = re.compile(r"\b(decode_tps|generated_tokens|draft_accepted|draft_proposed|draft_rounds)=([0-9.]+)")
+
+
+def _upload_fallback_lines(server):
+    return [l for l in server.log_head(100000) if "span alloc failed" in l][:5]
 
 
 def _log_lines(server):

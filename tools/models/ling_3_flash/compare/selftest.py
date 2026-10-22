@@ -5,6 +5,8 @@ Covers sandbox confinement, tool-call validation, grader anti-cheating,
 statistics, harness exit codes, episode transcripts (side file, log chunks,
 decoder), and per-repeat seeds.
 Run: python3 selftest.py"""
+import argparse
+import json
 import os
 import subprocess
 import sys
@@ -14,9 +16,14 @@ from pathlib import Path
 
 import agent
 import common
+import compare
 import transcripts
 
 HERE = Path(__file__).resolve().parent
+
+
+def scratch_dir():
+    return Path(tempfile.mkdtemp(dir=os.environ.get("TMPDIR")))
 
 
 class SandboxTest(unittest.TestCase):
@@ -85,7 +92,7 @@ class SandboxTest(unittest.TestCase):
              "tool_calls": [],
              "usage": {"prompt_tokens": 80, "completion_tokens": 3, "prompt_tokens_details": {"cached_tokens": 48}},
              "metrics": {"cache_hit": True, "prefill_tokens": 32}}]
-        work = Path(tempfile.mkdtemp(dir=os.environ.get("TMPDIR")))
+        work = scratch_dir()
         row = agent.run_episode(self.task, None, work, 1, 4, 60, 128, 4096,
                                 complete=lambda *a: replies.pop(0))
         first, second = row["turns"]
@@ -101,7 +108,7 @@ class SandboxTest(unittest.TestCase):
                     "usage": {"prompt_tokens": 80, "completion_tokens": 3, "cached_tokens": 48,
                               "draft_tokens": 2, "draft_tokens_accepted": 1,
                               "gufo": {"cache_hit": True, "prefill_tokens": 32}}}]
-        work = Path(tempfile.mkdtemp(dir=os.environ.get("TMPDIR")))
+        work = scratch_dir()
         row = agent.run_episode(self.task, None, work, 1, 4, 60, 128, 4096,
                                 complete=lambda *a: replies.pop(0), repeat=0)
         turn = row["turns"][0]
@@ -119,7 +126,7 @@ class SandboxTest(unittest.TestCase):
                             {"id": None, "name": "list_dir", "arguments": raw_ok}]},
             {"http_status": 200, "seconds": 0.1, "finish_reason": "stop", "content": "done", "reasoning": "ok",
              "tool_calls": [], "usage": {"prompt_tokens": 80, "completion_tokens": 3}}]
-        work = Path(tempfile.mkdtemp(dir=os.environ.get("TMPDIR")))
+        work = scratch_dir()
         row = agent.run_episode(self.task, None, work, 1, 4, 60, 128, 4096,
                                 complete=lambda *a: replies.pop(0), repeat=0)
         record = row["transcript"]
@@ -141,7 +148,7 @@ class SandboxTest(unittest.TestCase):
 
 class TranscriptTest(unittest.TestCase):
     def setUp(self):
-        self.work = Path(tempfile.mkdtemp(dir=os.environ.get("TMPDIR")))
+        self.work = scratch_dir()
         self.records = [{"key": transcripts.episode_key("mtp", "t09_ini_comments", r, 7008 + 1000 * r),
                          "turns": [{"content": "x" * 400 + str(r), "reasoning": "\u00fc\n" * 50,
                                     "tool_calls": [{"arguments": '{"path": "a.py"}'}]}]} for r in range(2)]
@@ -217,9 +224,7 @@ class StatsTest(unittest.TestCase):
 
 class BenchFailureTest(unittest.TestCase):
     def run_bench(self, script, jsonl):
-        import argparse
-        import compare
-        work = Path(tempfile.mkdtemp(dir=os.environ.get("TMPDIR")))
+        work = scratch_dir()
         fake = work / "gufo"
         fake.write_text("#!/bin/sh\n" + script)
         fake.chmod(0o755)
@@ -263,7 +268,7 @@ class HarnessExit(unittest.TestCase):
     def test_agent_speculative_modes_end_to_end(self):
         # Fake gufo runs the flaky mock server (a malformed and an unknown call first).
         # Two serve modes x 3 repeats x 2 tasks, with transcripts also chunked into the log.
-        work = Path(tempfile.mkdtemp(dir=os.environ.get("TMPDIR")))
+        work = scratch_dir()
         model = work / "model.gguf"
         model.write_bytes(b"GGUF")
         done = self.run_cli("--model", "ling", "--model-path", str(model), "--gufo", str(HERE / "fake_gufo.py"),
@@ -272,7 +277,6 @@ class HarnessExit(unittest.TestCase):
                             "--startup-timeout", "60", "--seed-base", "7000", "--agent-transcript-log",
                             env={"FAKE_MOCK_ARGS": "--flaky"})
         self.assertEqual(done.returncode, 0, done.stderr[-2000:])
-        import json
         summary = json.loads(done.stdout)
         agent_phase = summary["phases"]["agent"]
         self.assertEqual(set(agent_phase["modes"]), {"mtp", "off"})
@@ -339,14 +343,13 @@ class HarnessExit(unittest.TestCase):
                 self.assertEqual(record["turns"][-1]["content"], "Done: summary.")
 
     def test_shared_server_records_decode_stats(self):
-        work = Path(tempfile.mkdtemp(dir=os.environ.get("TMPDIR")))
+        work = scratch_dir()
         model = work / "model.gguf"
         model.write_bytes(b"GGUF")
         done = self.run_cli("--model", "ling", "--model-path", str(model), "--gufo", str(HERE / "fake_gufo.py"),
                             "--work", str(work), "--part", "agent", "--agent-tasks", "t01",
                             "--agent-repeats", "1", "--port", "18492", "--startup-timeout", "60")
         self.assertEqual(done.returncode, 0, done.stderr[-2000:])
-        import json
         serve = json.loads(done.stdout)["serve"]
         self.assertGreater(serve["decode"]["agent"]["requests"], 0)
 
