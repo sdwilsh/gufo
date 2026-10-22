@@ -362,26 +362,19 @@ std::string RenderChat(std::span<const ChatMessage> messages,
       data(PythonJsonDumps(tool.definition_json));
     }
     out += kToolsEpilogue;
-    if (marker) {
-      out += kRoleEnd;
-    } else {
+    if (!marker) {
       out += "detailed thinking " + thinking;
-      out += kRoleEnd;
     }
   } else if (first_is_system) {
-    if (marker) {
-      data(first_content);
-      out += kRoleEnd;
-    } else {
-      data(first_content);
+    data(first_content);
+    if (!marker) {
       out += '\n';
       out += "detailed thinking " + thinking;
-      out += kRoleEnd;
     }
   } else {
     out += "detailed thinking " + thinking;
-    out += kRoleEnd;
   }
+  out += kRoleEnd;
 
   for (std::size_t i = 0; i < messages.size(); ++i) {
     const ChatMessage& m = messages[i];
