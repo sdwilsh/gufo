@@ -20,6 +20,7 @@
 #include "src/core/image.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/ling_3_flash/config.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/tokenizer.hpp"
@@ -248,9 +249,7 @@ void PrintModelLoadTime(std::chrono::steady_clock::time_point start,
   output << '\n';
 }
 
-bool IsLing3Flash(const core::GgufReader& reader) {
-  return reader.GetMetadataString("general.architecture") == "bailingmoe3";
-}
+using models::ling_3_flash::IsLing3Flash;
 
 bool IsDeepSeekV4Flash(const core::GgufReader& reader) {
   return reader.GetMetadataString("general.architecture") == "deepseek4";

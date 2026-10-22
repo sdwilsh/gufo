@@ -73,6 +73,10 @@ struct Config {
       const core::GgufReader& reader, std::string* error_msg = nullptr);
 };
 
+[[nodiscard]] inline bool IsLing3Flash(const core::GgufReader& reader) {
+  return reader.GetMetadataString("general.architecture") == "bailingmoe3";
+}
+
 }  // namespace gufo::models::ling_3_flash
 
 #endif  // GUFO_MODELS_LING_3_FLASH_CONFIG_HPP_

@@ -37,6 +37,7 @@
 
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
+#include "src/models/ling_3_flash/config.hpp"
 #include "src/models/ling_3_flash/engine.hpp"
 #include "src/models/ling_3_flash/weights.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
@@ -1207,9 +1208,7 @@ int RunQwen38FlashNextBenchmark(
   return 0;
 }
 
-bool IsLing3Flash(const core::GgufReader& reader) {
-  return reader.GetMetadataString("general.architecture") == "bailingmoe3";
-}
+using models::ling_3_flash::IsLing3Flash;
 
 std::string JsonString(std::string_view text) {
   std::string out = "\"";
