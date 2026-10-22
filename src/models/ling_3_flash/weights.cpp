@@ -1,5 +1,6 @@
 #include "src/models/ling_3_flash/weights.hpp"
 
+#include <algorithm>
 #include <array>
 #include <initializer_list>
 #include <span>
@@ -78,10 +79,7 @@ struct Binder {
            std::to_string(rows) + ", " + std::to_string(depth) + "]");
       return t;
     }
-    bool type_ok = false;
-    for (auto type : types) {
-      type_ok = type_ok || info->type == type;
-    }
+    const bool type_ok = std::ranges::find(types, info->type) != types.end();
     const Format format = FormatOf(info->type);
     if (!type_ok || format.block == 0 || cols % format.block != 0) {
       Fail("tensor " + name + " has unsupported format " +
@@ -206,19 +204,12 @@ std::size_t TensorRef::RowBytes() const noexcept {
 }
 
 bool IsAllowedExpertGateUpType(GgmlType type) noexcept {
-  for (const auto t : kExpertGateUpTypes) {
-    if (t == type)
-      return true;
-  }
-  return false;
+  return std::ranges::find(kExpertGateUpTypes, type) !=
+         kExpertGateUpTypes.end();
 }
 
 bool IsAllowedExpertDownType(GgmlType type) noexcept {
-  for (const auto t : kExpertDownTypes) {
-    if (t == type)
-      return true;
-  }
-  return false;
+  return std::ranges::find(kExpertDownTypes, type) != kExpertDownTypes.end();
 }
 
 bool HasMtpBlock(const core::GgufReader& reader) {
