@@ -156,8 +156,7 @@ struct Uploader {
 
 bool DeviceModel::BuildDraftHead(DeviceModel& m, std::string* error_msg) {
   const DeviceTensor& head = m.output_;
-  if (head.type != WeightType::kF16 || head.cols % 32 != 0 ||
-      head.cols % 64 != 0 || head.depth != 1) {
+  if (head.type != WeightType::kF16 || head.cols % 64 != 0 || head.depth != 1) {
     if (error_msg != nullptr) {
       *error_msg =
           "the output head is not an F16 matrix the draft head can "
