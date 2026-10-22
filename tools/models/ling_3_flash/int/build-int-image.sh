@@ -72,7 +72,7 @@ for v in build/bench/moe_var-*; do
   case "$v" in *.log | *.res) continue ;; esac
   [ -x "$v" ] && cp "$v" "$ctx/bin/ling-moe-decode-bench-var-${v##*/moe_var-}"
 done
-cp "$here/ling-int-suite" "$here/ling-int-bench" "$here/ling-serve-suite" "$here/ling-token26" "$here/../cache/ling-cache-suite" "$ctx/"
+cp "$here/ling-int-suite" "$here/ling-int-bench" "$here/ling-serve-suite" "$here/ling-token26" "$here/check_line.py" "$here/../cache/ling-cache-suite" "$ctx/"
 cp -r tests/functional "$ctx/functional"; rm -rf "$ctx/functional/__pycache__"
 # tests/functional/{tool_reasoning,pi_agent}.py import gufo.* from <root>/tools.
 cp -r tools/gufo "$ctx/tools-gufo"; rm -rf "$ctx/tools-gufo/__pycache__" "$ctx"/tools-gufo/*/__pycache__

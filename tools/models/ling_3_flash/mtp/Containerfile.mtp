@@ -36,7 +36,8 @@ COPY compare_routing.py /opt/gufo/compare_routing.py
 COPY functional/ /opt/gufo/tests/functional/
 COPY tools-gufo/ /opt/gufo/tools/gufo/
 COPY flake.lock /opt/gufo/flake.lock
-COPY gufo gfx1151_peak ling-mtp-suite ling-int-suite ling-int-bench ling-serve-suite ling-cache-suite /usr/local/bin/
+COPY gufo gfx1151_peak ling-mtp-suite ling-int-suite ling-int-bench ling-serve-suite ling-cache-suite \
+     check_line.py /usr/local/bin/
 RUN chmod -R a+rX /opt/gufo /usr/local/lib/gufo && chmod a+rx /usr/local/bin/* /opt/gufo/tests/ling_3_flash_* \
   && mkdir -p /work && chmod 1777 /work
 # Restricted PSS: non-root, read-only rootfs. The only writable path is /work (emptyDir).

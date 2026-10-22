@@ -51,6 +51,8 @@ has exited. Exit 0 only when every required stage passed.
 """
 import argparse, importlib.machinery, importlib.util, json, os, re, subprocess, sys, time, http.client
 
+from check_line import check_line
+
 HOME = os.environ.get("HOME", "/work")
 HERE = os.path.dirname(os.path.abspath(__file__))
 FUNCTIONAL = os.environ.get("LING_FUNCTIONAL", "/opt/gufo/tests/functional")
@@ -130,15 +132,6 @@ def run_child(cmd, out_path, err_path, timeout, env=None):
             return None, "timeout after %s s" % timeout
         except OSError as e:
             return None, "%s: %s" % (type(e).__name__, e)
-
-
-def check_line(name, expected, actual):
-    """One failed check as `check=NAME expected=... actual=...` on stderr (the
-    tests/functional/check_report.py shape)."""
-    def one(value, limit=500):
-        text = " ".join(str(value).split())
-        return text if len(text) <= limit else text[:limit] + "...[+%d chars]" % (len(text) - limit)
-    print("check=%s expected=%s actual=%s" % (name, one(expected), one(actual)), file=sys.stderr, flush=True)
 
 
 def fresh_dir(path):

@@ -33,7 +33,7 @@ python3 "$here/make_corpus.py" . "$ctx/corpus" "$novel/input_text.txt"
 cp "$int/run-suite" "$ctx/run-suite"
 cp "${PARENT_GUFO:-build/base-release/gufo}" "$ctx/base/gufo-parent"
 cp build/release/gufo "$ctx/gufo"; cp "$peak" "$ctx/gfx1151_peak"; cp tools/prof/prof.py "$ctx/prof.py"
-cp "$here/ling-mtp-suite" "$int/ling-int-suite" "$int/ling-int-bench" "$int/ling-serve-suite" tools/models/ling_3_flash/cache/ling-cache-suite "$ctx/"
+cp "$here/ling-mtp-suite" "$int/ling-int-suite" "$int/ling-int-bench" "$int/ling-serve-suite" "$int/check_line.py" tools/models/ling_3_flash/cache/ling-cache-suite "$ctx/"
 cp -r tests/functional "$ctx/functional"; rm -rf "$ctx/functional/__pycache__"
 # tests/functional/{tool_reasoning,pi_agent}.py import gufo.* from <root>/tools.
 cp -r tools/gufo "$ctx/tools-gufo"; rm -rf "$ctx/tools-gufo/__pycache__" "$ctx"/tools-gufo/*/__pycache__
