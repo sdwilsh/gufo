@@ -1833,6 +1833,60 @@ GenerationEnd EndOf(TextGenerationBackend::FinishReason reason) {
           .truncated = reason != TextGenerationBackend::FinishReason::kStop};
 }
 
+// Adds the Bailing calls of `text_from_tools` (parsed.text from `marker`) to
+// `parsed`, with the prose around them as its trailing text.
+void ParseBailingCalls(
+    ParsedGeneration& parsed, std::string_view text_from_tools,
+    std::size_t marker, std::span<const tokenization::ChatTool> tools,
+    ChatRequest::ToolChoice choice,
+    TextGenerationBackend::InitialOutputState initial_output_state,
+    GenerationEnd end, bool partial) {
+  // Declared tools are the contract only for tool_choice required/named;
+  // under auto an unknown name still becomes a call so the client's
+  // unknown-tool error path can answer it (vLLM would drop it).
+  QuoteTracker call_quotes;
+  call_quotes.Reset(parsed.text);
+  const auto scan = models::ling_3_flash::ScanBailingToolCalls(
+      text_from_tools, models::ling_3_flash::BailingTools(tools),
+      end.model_stopped, choice == ChatRequest::ToolChoice::kAuto,
+      [&](std::size_t at) {
+        return call_quotes.QuotedAt(marker + at) ||
+               (partial && call_quotes.UnclosedAt(marker + at));
+      },
+      partial,
+      // Argument bytes belong to the call, not to prose quotation: an
+      // unmatched backtick in a value must not quote the next call.
+      [&](std::size_t end) { call_quotes.Reset(parsed.text, marker + end); });
+  for (const auto& call : scan.calls) {
+    ParsedToolCall converted;
+    converted.id = RandomId("call_");
+    converted.name = call.name;
+    converted.arguments = BailingArguments(call.arguments);
+    if (call.partial) {
+      converted.partial_arguments = ArgumentsPrefix(converted);
+      if (call.pending)
+        PartialStringArgument(converted, call.pending->first,
+                              call.pending->second);
+    }
+    parsed.tool_calls.push_back(std::move(converted));
+  }
+  // Prose between and after calls stays content. After a clean stop a
+  // malformed call is reported there too instead of silently vanishing;
+  // after a length stop unfinished markup is withheld.
+  if (!parsed.tool_calls.empty()) {
+    parsed.trailing_text = BailingProse(text_from_tools, scan, !end.truncated);
+    if (initial_output_state ==
+        TextGenerationBackend::InitialOutputState::kReasoning) {
+      // After the reasoning phase a stray </think> is swallowed, as in
+      // vLLM's CONTENT/THINK_END transition (e.g. `<tool_call>..` closed
+      // reasoning implicitly and the model still writes </think>).
+      for (std::size_t at;
+           (at = parsed.trailing_text.find("</think>")) != std::string::npos;)
+        parsed.trailing_text.erase(at, 8);
+    }
+  }
+}
+
 ParsedGeneration ParseGeneration(
     std::string_view raw,
     TextGenerationBackend::InitialOutputState initial_output_state,
@@ -1949,53 +2003,8 @@ ParsedGeneration ParseGeneration(
     // Scanning both dialects would turn a literal call inside an argument into
     // an additional API invocation.
     if (syntax == ToolSyntax::kBailing) {
-      // Declared tools are the contract only for tool_choice required/named;
-      // under auto an unknown name still becomes a call so the client's
-      // unknown-tool error path can answer it (vLLM would drop it).
-      QuoteTracker call_quotes;
-      call_quotes.Reset(parsed.text);
-      const auto scan = models::ling_3_flash::ScanBailingToolCalls(
-          text_from_tools, models::ling_3_flash::BailingTools(tools),
-          end.model_stopped, choice == ChatRequest::ToolChoice::kAuto,
-          [&](std::size_t at) {
-            return call_quotes.QuotedAt(marker + at) ||
-                   (partial && call_quotes.UnclosedAt(marker + at));
-          },
-          partial,
-          // Argument bytes belong to the call, not to prose quotation: an
-          // unmatched backtick in a value must not quote the next call.
-          [&](std::size_t end) {
-            call_quotes.Reset(parsed.text, marker + end);
-          });
-      for (const auto& call : scan.calls) {
-        ParsedToolCall converted;
-        converted.id = RandomId("call_");
-        converted.name = call.name;
-        converted.arguments = BailingArguments(call.arguments);
-        if (call.partial) {
-          converted.partial_arguments = ArgumentsPrefix(converted);
-          if (call.pending)
-            PartialStringArgument(converted, call.pending->first,
-                                  call.pending->second);
-        }
-        parsed.tool_calls.push_back(std::move(converted));
-      }
-      // Prose between and after calls stays content. After a clean stop a
-      // malformed call is reported there too instead of silently vanishing;
-      // after a length stop unfinished markup is withheld.
-      if (!parsed.tool_calls.empty()) {
-        parsed.trailing_text =
-            BailingProse(text_from_tools, scan, !end.truncated);
-        if (initial_output_state ==
-            TextGenerationBackend::InitialOutputState::kReasoning) {
-          // After the reasoning phase a stray </think> is swallowed, as in
-          // vLLM's CONTENT/THINK_END transition (e.g. `<tool_call>..` closed
-          // reasoning implicitly and the model still writes </think>).
-          for (std::size_t at; (at = parsed.trailing_text.find("</think>")) !=
-                               std::string::npos;)
-            parsed.trailing_text.erase(at, 8);
-        }
-      }
+      ParseBailingCalls(parsed, text_from_tools, marker, tools, choice,
+                        initial_output_state, end, partial);
     } else if (text_from_tools.starts_with(
                    tokenization::QwenToolSyntax::kCallOpen)) {
       ParseQwenCalls(parsed.text, tools, &parsed.tool_calls, nullptr,
