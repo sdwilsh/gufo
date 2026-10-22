@@ -91,7 +91,7 @@ std::string UnspellBytes(std::string_view text) {
     for (std::size_t k = 1; k < len; ++k) {
       cp = (cp << 6) | (static_cast<std::uint8_t>(text[i + k]) & 0x3F);
     }
-    if (const auto it = inverse.find(cp); it != inverse.end() && len > 0) {
+    if (const auto it = inverse.find(cp); it != inverse.end()) {
       out.push_back(static_cast<char>(it->second));
     } else {
       out.append(text.substr(i, len));

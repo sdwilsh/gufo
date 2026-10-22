@@ -423,7 +423,7 @@ std::string RenderChat(std::span<const ChatMessage> messages,
       }
       for (std::size_t k = 0; k < m.tool_calls.size(); ++k) {
         const auto& call = m.tool_calls[k];
-        if ((k == 0 && !content.empty()) || k != 0) {
+        if (k != 0 || !content.empty()) {
           out += '\n';
         }
         out += BailingToolSyntax::kCallOpen;

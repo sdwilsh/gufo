@@ -1186,16 +1186,20 @@ void Session::DecodeBatch(std::span<BatchDecode> lanes) {
         fail(d, e.what());
         continue;
       }
-      if (w.copying) {
-        // Its rows are the chain; it takes no part in the draft steps.
-      } else if (s->hooks_.fixed_drafts != 0) {
-        w.k = std::min(s->hooks_.fixed_drafts, cap - 1);
-      } else if (w.c.sampled) {
-        // The width of the lane's own history, as DecodeStep (seeded replay).
-        w.k = s->draft_length_.Choose(cap - 1, false, s->session_->position());
-      } else {
-        w.cohort = true;
-        w.k = cap - 1;  // the cohort width, capped below
+      // A copying lane's rows are the chain; it takes no part in the draft
+      // steps.
+      if (!w.copying) {
+        if (s->hooks_.fixed_drafts != 0) {
+          w.k = std::min(s->hooks_.fixed_drafts, cap - 1);
+        } else if (w.c.sampled) {
+          // The width of the lane's own history, as DecodeStep (seeded
+          // replay).
+          w.k =
+              s->draft_length_.Choose(cap - 1, false, s->session_->position());
+        } else {
+          w.cohort = true;
+          w.k = cap - 1;  // the cohort width, capped below
+        }
       }
     }
     d.ms += ms_since(t0);
@@ -1261,7 +1265,7 @@ void Session::DecodeBatch(std::span<BatchDecode> lanes) {
   // their row (the chained hidden input stays at its index).
   std::vector<Work*> drafting;
   for (Work& w : work) {
-    if (w.k > 0 && !(!w.c.sampled && w.s->hooks_.source)) {
+    if (w.k > 0 && (w.c.sampled || !w.s->hooks_.source)) {
       drafting.push_back(&w);
     }
   }
