@@ -44,6 +44,7 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/ling_3_flash/gpu_dump.hpp"
 #include "src/models/ling_3_flash/reference.hpp"
 #include "src/models/ling_3_flash/weights.hpp"
 
@@ -233,7 +234,7 @@ int main(int argc, char** argv) {
         std::snprintf(name, sizeof(name), "h_out.l%02d.f32", il - 1);
       }
       std::vector<float> in;
-      if (!l3::ReadF32File(teacher_dir + "/" + name, &in) ||
+      if (!l3::ReadF32Dump(teacher_dir + "/" + name, &in) ||
           in.size() % l3::kHidden != 0 || in.empty()) {
         std::fprintf(stderr, "cannot read teacher input %s/%s\n",
                      teacher_dir.c_str(), name);
@@ -251,7 +252,7 @@ int main(int argc, char** argv) {
         std::snprintf(name, sizeof(name), "h_out.l%02d.f32", il - 1);
       }
       std::vector<float> in;
-      (void)l3::ReadF32File(teacher_dir + "/" + name, &in);
+      (void)l3::ReadF32Dump(teacher_dir + "/" + name, &in);
       tokens = static_cast<std::uint32_t>(in.size() / l3::kHidden);
       std::vector<float> out(l3::kHidden);
       for (std::uint32_t t = 0; t < tokens; ++t) {

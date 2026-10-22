@@ -74,11 +74,6 @@ private:
   std::map<std::pair<std::string, int>, Series> series_;
 };
 
-/// Reads a raw float32 file; returns false when it is missing or its size is
-/// not a multiple of 4 bytes. Used for teacher-input dumps.
-[[nodiscard]] bool ReadF32File(const std::string& path,
-                               std::vector<float>* out);
-
 /// Single-token, float32, scalar reference of the Ling-3.0-flash trunk
 /// (PLAN.md section 1). Weights are decoded row by row from the mapped file
 /// and released after use, so resident memory stays small. The trunk Step()

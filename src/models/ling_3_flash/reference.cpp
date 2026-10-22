@@ -152,22 +152,6 @@ bool DumpRecorder::Write(const std::string& dir,
   return true;
 }
 
-bool ReadF32File(const std::string& path, std::vector<float>* out) {
-  std::ifstream in(path, std::ios::binary | std::ios::ate);
-  if (!in) {
-    return false;
-  }
-  const auto bytes = static_cast<std::size_t>(in.tellg());
-  if (bytes % sizeof(float) != 0) {
-    return false;
-  }
-  out->resize(bytes / sizeof(float));
-  in.seekg(0);
-  in.read(reinterpret_cast<char*>(out->data()),
-          static_cast<std::streamsize>(bytes));
-  return static_cast<bool>(in);
-}
-
 // ---- ReferenceModel --------------------------------------------------------
 
 ReferenceModel::ReferenceModel(const ModelWeights& weights,
