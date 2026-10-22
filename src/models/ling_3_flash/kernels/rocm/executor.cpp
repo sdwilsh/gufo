@@ -30,6 +30,13 @@ bool Check(hipError_t status, const char* what, std::string* error) {
   return false;
 }
 
+bool Fail(std::string* error, const std::string& message) {
+  if (error != nullptr) {
+    *error = message;
+  }
+  return false;
+}
+
 template<class T>
 bool Alloc(T** out, std::size_t count, const char* what, std::size_t* total,
            std::string* error) {
@@ -1247,45 +1254,43 @@ bool Executor::Forward(Session& session, const ForwardRequest& r,
   launch_ = {};
   const auto n = static_cast<std::uint32_t>(r.tokens.size());
   const std::uint32_t first_pos = session.position();
-  const auto fail = [&](const std::string& message) {
-    if (error != nullptr) {
-      *error = message;
-    }
-    return false;
-  };
   if (first_layer() != 0) {
-    return fail("forward needs the trunk from block 0 (layer_first is set)");
+    return Fail(error,
+                "forward needs the trunk from block 0 (layer_first is set)");
   }
   if (n == 0 || n > options_.max_batch) {
-    return fail("forward batch of " + std::to_string(n) +
-                " tokens outside 1.." + std::to_string(options_.max_batch));
+    return Fail(error, "forward batch of " + std::to_string(n) +
+                           " tokens outside 1.." +
+                           std::to_string(options_.max_batch));
   }
   if (first_pos + n > session.capacity()) {
-    return fail("context overflow: " + std::to_string(first_pos) + " + " +
-                std::to_string(n) + " > " + std::to_string(session.capacity()));
+    return Fail(error, "context overflow: " + std::to_string(first_pos) +
+                           " + " + std::to_string(n) + " > " +
+                           std::to_string(session.capacity()));
   }
   std::uint32_t from = n;
   if (!r.logits.empty() || !r.argmax.empty()) {
     from = r.logits_from == UINT32_MAX ? n - 1 : r.logits_from;
     if (from >= n || (!r.logits.empty() &&
                       r.logits.size() < std::size_t{n - from} * kVocabRows)) {
-      return fail("logits buffer too small for rows " + std::to_string(from) +
-                  ".." + std::to_string(n));
+      return Fail(error, "logits buffer too small for rows " +
+                             std::to_string(from) + ".." + std::to_string(n));
     }
     if (!r.argmax.empty() &&
         (r.argmax.size() < n - from || n - from > options_.logit_group)) {
-      return fail("argmax buffer too small for rows " + std::to_string(from) +
-                  ".." + std::to_string(n));
+      return Fail(error, "argmax buffer too small for rows " +
+                             std::to_string(from) + ".." + std::to_string(n));
     }
   }
   if (r.rollback &&
       (!options_.mtp || n < 2 || n > kMaxDecodeTokens || r.sink != nullptr)) {
-    return fail("rollback points need MTP and a verify chunk of 2.." +
-                std::to_string(kMaxDecodeTokens) + " tokens");
+    return Fail(error, "rollback points need MTP and a verify chunk of 2.." +
+                           std::to_string(kMaxDecodeTokens) + " tokens");
   }
   for (const std::int32_t t : r.tokens) {
     if (t < 0 || static_cast<std::uint32_t>(t) >= kVocab) {
-      return fail("token id " + std::to_string(t) + " outside the vocabulary");
+      return Fail(error,
+                  "token id " + std::to_string(t) + " outside the vocabulary");
     }
   }
   if (session.continuation_hooks_ != nullptr) {
@@ -1296,7 +1301,7 @@ bool Executor::Forward(Session& session, const ForwardRequest& r,
           first_pos, first_pos + n, first_pos > 0 ? first_pos - 1 : 0,
           first_pos + n - 1);
     } catch (const std::exception& e) {
-      return fail(e.what());
+      return Fail(error, e.what());
     }
   }
   const std::uint32_t layers = layer_count();
@@ -1316,7 +1321,7 @@ bool Executor::Forward(Session& session, const ForwardRequest& r,
       if (launched) {
         // Inputs were being uploaded or the graph ran: a device failure.
         NoteDeviceError();
-        return fail(graph_error);
+        return Fail(error, graph_error);
       }
       // Capture is not executed, so the eager path below starts from the
       // untouched state. A capture another thread's runtime call invalidated
@@ -1547,10 +1552,7 @@ bool Executor::ForwardBatch(std::span<BatchSegment> segments,
       (void)hipStreamSynchronize(stream_);
       (void)hipStreamSynchronize(branch_stream_);
     }
-    if (error != nullptr) {
-      *error = message;
-    }
-    return false;
+    return Fail(error, message);
   };
   const std::uint32_t layers = layer_count();
   if (!UploadRows(tokens, positions, &message) ||
@@ -1691,31 +1693,25 @@ bool Executor::MtpAfterForward(Session& session, std::uint32_t n,
 
 bool Executor::MtpDraft(Session& session, const DraftRequest& r,
                         std::int32_t* argmax, std::string* error) {
-  const auto fail = [&](const std::string& message) {
-    if (error != nullptr) {
-      *error = message;
-    }
-    return false;
-  };
   SessionState& st = session.state_;
   const bool host_h = !r.h_host.empty();
   if (!options_.mtp || st.mtp_cache == nullptr ||
       (!host_h && !session.mtp_valid_) ||
       (host_h && (r.h_host.size() != kHidden ||
                   (!r.h_out.empty() && r.h_out.size() != kHidden)))) {
-    return fail("MTP draft needs an MTP session with a valid cache");
+    return Fail(error, "MTP draft needs an MTP session with a valid cache");
   }
   if (r.token < 0 || static_cast<std::uint32_t>(r.token) >= kVocab ||
       r.position >= session.capacity() ||
       (!r.logits.empty() && r.logits.size() < kVocabRows)) {
-    return fail("MTP draft request is out of range");
+    return Fail(error, "MTP draft request is out of range");
   }
   if (session.continuation_hooks_ != nullptr) {
     try {
       session.continuation_hooks_->BeforeWrite(0, 0, r.position,
                                                r.position + 1);
     } catch (const std::exception& e) {
-      return fail(e.what());
+      return Fail(error, e.what());
     }
   }
   const DeviceMtp& m = *model_.mtp();
@@ -1807,7 +1803,7 @@ bool Executor::MtpDraft(Session& session, const DraftRequest& r,
     FinishProfile(r.op_profile);
   }
   if (index < 0) {
-    return fail("MTP draft logits are not comparable");
+    return Fail(error, "MTP draft logits are not comparable");
   }
   if (argmax != nullptr) {
     *argmax = index;
@@ -1816,15 +1812,9 @@ bool Executor::MtpDraft(Session& session, const DraftRequest& r,
 }
 
 bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
-  const auto fail = [&](const std::string& message) {
-    if (error != nullptr) {
-      *error = message;
-    }
-    return false;
-  };
   const auto count = static_cast<std::uint32_t>(lanes.size());
   if (!options_.mtp || count == 0 || count > batch_row_limit()) {
-    return fail("MTP draft batch needs an MTP executor and 1..8 lanes");
+    return Fail(error, "MTP draft batch needs an MTP executor and 1..8 lanes");
   }
   for (std::size_t i = 0; i < lanes.size(); ++i) {
     DraftLane& d = lanes[i];
@@ -1836,12 +1826,13 @@ bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
         std::any_of(lanes.begin(), lanes.begin() + i, [&](const DraftLane& o) {
           return o.session == d.session;
         })) {
-      return fail("MTP draft batch needs distinct sessions with valid caches");
+      return Fail(error,
+                  "MTP draft batch needs distinct sessions with valid caches");
     }
     if (d.token < 0 || static_cast<std::uint32_t>(d.token) >= kVocab ||
         d.position >= d.session->capacity() ||
         (!d.logits.empty() && d.logits.size() < kVocabRows)) {
-      return fail("MTP draft batch request is out of range");
+      return Fail(error, "MTP draft batch request is out of range");
     }
     // Draft rows lie at or past the MTP frontier and need no preservation;
     // DecodeBatch admits only ready lanes, so this never refuses in serving.
@@ -1888,7 +1879,7 @@ bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
   std::string message;
   if (!UploadRows(tokens, positions, &message)) {
     NoteDeviceError();
-    return fail(message);
+    return Fail(error, message);
   }
   // A refused lane's placeholder row computes on finite values: zero its
   // hidden input and the attention output the block never writes for it.
@@ -1921,7 +1912,7 @@ bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
     NoteDeviceError();
     (void)hipStreamSynchronize(stream_);
     (void)hipStreamSynchronize(branch_stream_);
-    return fail(message);
+    return Fail(error, message);
   }
   dense::RmsNormRows(b.h, m.layer_output_norm.f32(), b.mtp_hn, count, kHidden,
                      1, kRmsEps, stream_);
@@ -1959,11 +1950,12 @@ bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
     NoteDeviceError();
     (void)hipStreamSynchronize(stream_);
     (void)hipStreamSynchronize(branch_stream_);
-    return fail(message);
+    return Fail(error, message);
   }
   if (draft_failure_in_ > 0 && --draft_failure_in_ == 0) {
     NoteDeviceError();
-    return fail("MTP draft batch: injected failure after launch (test hook)");
+    return Fail(error,
+                "MTP draft batch: injected failure after launch (test hook)");
   }
   launch_.wall_ms = StepMs();
   {
@@ -1976,7 +1968,7 @@ bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
       continue;
     }
     if (index[i] < 0) {
-      return fail("MTP draft logits are not comparable");
+      return Fail(error, "MTP draft logits are not comparable");
     }
     lanes[i].argmax = index[i];
   }
@@ -1986,15 +1978,9 @@ bool Executor::MtpDraftBatch(std::span<DraftLane> lanes, std::string* error) {
 bool Executor::MtpRollback(Session& session, std::uint32_t first_pos,
                            std::uint32_t n, std::uint32_t keep,
                            std::string* error, BatchSegment::Placement at) {
-  const auto fail = [&](const std::string& message) {
-    if (error != nullptr) {
-      *error = message;
-    }
-    return false;
-  };
   if (!options_.mtp || keep == 0 || keep > n || n > kMaxDecodeTokens ||
       at.ckpt0 + n - 1 > kMaxDrafts || session.position() != first_pos + n) {
-    return fail("rollback does not match the last verify step");
+    return Fail(error, "rollback does not match the last verify step");
   }
   if (keep == n) {
     return true;
@@ -2041,28 +2027,23 @@ bool Executor::RunBlock(Session& session, std::uint32_t il,
                         std::uint32_t first_pos, std::span<const float> in,
                         std::span<float> out, GpuTensorSink* sink,
                         std::string* error) {
-  const auto fail = [&](const std::string& message) {
-    if (error != nullptr) {
-      *error = message;
-    }
-    return false;
-  };
   if (il < first_layer() || il >= first_layer() + layer_count()) {
-    return fail("block " + std::to_string(il) + " is not resident");
+    return Fail(error, "block " + std::to_string(il) + " is not resident");
   }
   if (in.empty() || in.size() % kHidden != 0 || out.size() != in.size()) {
-    return fail("block input must be whole hidden rows and match the output");
+    return Fail(error,
+                "block input must be whole hidden rows and match the output");
   }
   const auto n = static_cast<std::uint32_t>(in.size() / kHidden);
   if (n > options_.max_batch || first_pos + n > session.capacity()) {
-    return fail("block batch exceeds the executor or session limits");
+    return Fail(error, "block batch exceeds the executor or session limits");
   }
   if (session.continuation_hooks_ != nullptr) {
     try {
       session.continuation_hooks_->BeforeWrite(first_pos, first_pos + n,
                                                first_pos, first_pos + n);
     } catch (const std::exception& e) {
-      return fail(e.what());
+      return Fail(error, e.what());
     }
   }
   Buffers& b = *b_;
