@@ -1951,12 +1951,7 @@ int RunLingBenchmark(const BenchOptions& options,
           std::cerr << "Error running prefill profile: " << error << '\n';
           return 1;
         }
-        double total_ms = 0.0;
-        for (const auto& op : ops) {
-          // "name/part" entries break an operation down; they are inside it.
-          if (op.name.find('/') == std::string::npos)
-            total_ms += op.ms;
-        }
+        const double total_ms = LingOpTotal(ops);
         std::cout << "{\"record\": \"op_profile\", \"n_prompt\": "
                   << prompt_length << ", \"n_depth\": " << depth
                   << ", \"ms\": " << std::fixed << std::setprecision(4)
@@ -2118,12 +2113,7 @@ int RunLingBenchmark(const BenchOptions& options,
             return 1;
           }
         }
-        double total_ms = 0.0;
-        for (const auto& op : ops) {
-          // "name/part" entries break an operation down; they are inside it.
-          if (op.name.find('/') == std::string::npos)
-            total_ms += op.ms;
-        }
+        const double total_ms = LingOpTotal(ops);
         const double steps = static_cast<double>(generation_length);
         std::cout << "{\"record\": \"op_profile\", \"n_gen\": "
                   << generation_length << ", \"n_depth\": " << depth
