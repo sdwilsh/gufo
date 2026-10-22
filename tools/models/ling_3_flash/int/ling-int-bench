@@ -98,7 +98,7 @@ child stderr go to stderr with the prefix [ling-bench]. Only /work is written.
 Every stage is bit-for-bit the same code path as the server's, but timings are
 only meaningful on the real gfx1151 node.
 """
-import argparse, ctypes, glob, json, os, platform, re, subprocess, sys, time
+import argparse, ctypes, glob, json, os, platform, re, shutil, subprocess, sys, threading, time
 
 GUFO = "gufo"
 PROF = "/usr/local/lib/gufo/prof.py"
@@ -157,8 +157,6 @@ def run(cmd, timeout, env=None, **kw):
                          errors="replace", start_new_session=True, env=env, **kw)
     err_lines = []
 
-    import threading
-
     def pump():
         for line in p.stderr:
             sys.stderr.write(line)
@@ -178,7 +176,6 @@ def read_stdout(p, timeout):
     """Reads the child's stdout to EOF (stderr belongs to the caller's pump
     thread: communicate() would read it too and split its lines) and returns
     (stdout, exit code or "timeout")."""
-    import threading
     expired = threading.Event()
 
     def kill():
@@ -233,39 +230,26 @@ def stage_peak(a):
     return {"exit": code, "seconds": secs, "rows": rows, "raw": out[-6000:], "stderr_tail": err[-1500:]}
 
 
+def bench_body(cmd, code, out, err, secs):
+    records = bench_records(out)
+    depth_fill = [l for l in err.splitlines() if l.startswith("[depth ")]
+    return {"command": cmd, "exit": code, "seconds": secs, "records": records,
+            "depth_fill_log": depth_fill, "stderr_tail": err[-2500:]}
+
+
 def stage_bench(a):
     cmd = [GUFO, "bench", "-m", a.model, "-p", "2048", "-n", "128", "-d", a.depths,
            "-r", str(a.repetitions), "-o", "jsonl", "--op-profile",
            "--speculative", "off"]
     code, out, err, secs = run(cmd, a.bench_timeout)
-    records = []
-    for line in out.splitlines():
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                records.append(json.loads(line))
-            except ValueError:
-                records.append({"record": "unparsed", "text": line[:300]})
-    depth_fill = [l for l in err.splitlines() if l.startswith("[depth ")]
-    return {"command": cmd, "exit": code, "seconds": secs, "records": records,
-            "depth_fill_log": depth_fill, "stderr_tail": err[-2500:]}
+    return bench_body(cmd, code, out, err, secs)
 
 
 def bench_stage(a, args, repetitions=None):
     cmd = [GUFO, "bench", "-m", a.model, *args, "-r", str(repetitions or a.repetitions), "-o", "jsonl",
            "--speculative", "off"]
     code, out, err, secs = run(cmd, a.bench_timeout)
-    records = []
-    for line in out.splitlines():
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                records.append(json.loads(line))
-            except ValueError:
-                records.append({"record": "unparsed", "text": line[:300]})
-    depth_fill = [l for l in err.splitlines() if l.startswith("[depth ")]
-    return {"command": cmd, "exit": code, "seconds": secs, "records": records,
-            "depth_fill_log": depth_fill, "stderr_tail": err[-2500:]}
+    return bench_body(cmd, code, out, err, secs)
 
 
 def stage_small(a):
@@ -589,18 +573,11 @@ BW_OPS = ("moe.expert_gate_up", "moe.expert_down", "mla.attention", "shexp.gate_
 
 def stage_mtp_profile(a):
     corpus = fit_corpus()
-    peak = peak_dram_read() if shutil_which("gfx1151_peak") else None
+    peak = peak_dram_read() if shutil.which("gfx1151_peak") else None
     cmd = [GUFO, "bench", "-m", a.model, "-n", "64", "-d", "0,65536", "-r", "2",
            "--speculative", "mtp", "--op-profile", "--text-file", corpus, "-o", "jsonl"]
     code, out, err, secs = run(cmd, a.bench_timeout)
-    records = []
-    for line in out.splitlines():
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                records.append(json.loads(line))
-            except ValueError:
-                records.append({"record": "unparsed", "text": line[:300]})
+    records = bench_records(out)
     prof = [r for r in records if r.get("record") == "mtp_profile"]
     bandwidth, launch, cycles = [], [], []
     for r in prof:
@@ -667,24 +644,7 @@ def stage_mtp_profile(a):
     return body
 
 
-def shutil_which(name):
-    import shutil
-    return shutil.which(name)
-
-
 HEAD_AB_TOOL = "/opt/gufo/tests/ling_3_flash_mtp_head_ab"
-
-
-def _jsonl(text):
-    out = []
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                out.append(json.loads(line))
-            except ValueError:
-                out.append({"record": "unparsed", "text": line[:300]})
-    return out
 
 
 def stage_mtp_head_ab(a):
@@ -697,7 +657,7 @@ def stage_mtp_head_ab(a):
     for label in ("prose", "code"):
         cmd += ["--corpus", "%s=%s/%s.txt" % (label, corpus_dir, label)]
     code, out, err, secs = run(cmd, a.bench_timeout)
-    body["acceptance"] = {"command": cmd, "exit": code, "seconds": secs, "records": _jsonl(out),
+    body["acceptance"] = {"command": cmd, "exit": code, "seconds": secs, "records": bench_records(out),
                           "stderr_tail": err[-2500:]}
     corpus = fit_corpus()
     profiles = {}
@@ -710,7 +670,7 @@ def stage_mtp_head_ab(a):
             pcmd = [binary, "bench", "-m", a.model, "-n", "64", "-d", "0,65536", "-r", "2",
                     "--speculative", "mtp", "--op-profile", "--text-file", corpus, "-o", "jsonl"]
             pcode, pout, perr, psecs = run(pcmd, a.bench_timeout)
-            records = _jsonl(pout)
+            records = bench_records(pout)
             entry = {"command": pcmd, "exit": pcode, "seconds": psecs, "draft": [], "cycles": []}
             for r in records:
                 if r.get("record") != "mtp_profile":
@@ -751,7 +711,6 @@ class MemorySampler:
     """Polls the device's GTT/VRAM use while a child runs; keeps the peak."""
 
     def __init__(self, period=2.0):
-        import threading
         self.period, self.peak_gtt, self.peak_vram, self.samples = period, 0, 0, 0
         self.peak_utc = None
         self.base = gtt_used()
@@ -882,7 +841,6 @@ def fit_run(a, store, mtp, corpus):
            "--text-file", corpus, "-o", "jsonl"]
     cmd += ["--speculative", "mtp" if mtp else "off"]
     log("run: " + " ".join(cmd))
-    import threading
     body = {"expanded_kv_bytes": store, "expanded_kv_gib": round(store / (1 << 30), 2),
             "speculative": "mtp" if mtp else "off", "command": cmd, "start_utc": utc(),
             "note": ("after_load.hip_mem_info is hipMemGetInfo called from this driver process "
@@ -914,14 +872,7 @@ def fit_run(a, store, mtp, corpus):
         th.start()
         out, code = read_stdout(p, a.bench_timeout)
         th.join(5)
-    records = []
-    for line in out.splitlines():
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                records.append(json.loads(line))
-            except ValueError:
-                records.append({"record": "unparsed", "text": line[:300]})
+    records = bench_records(out)
     err = "".join(err_lines)
     body.update(end_utc=utc(), exit=code, seconds=round(time.monotonic() - t0, 1),
                 after_load=after_load, device_memory=mem.report(), records=records,
