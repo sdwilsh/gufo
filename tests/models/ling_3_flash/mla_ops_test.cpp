@@ -21,12 +21,15 @@
 #include "src/models/ling_3_flash/kernels/rocm/kernels.hpp"
 #include "src/models/ling_3_flash/layout.hpp"
 #include "tests/models/ling_3_flash/parent_digests.hpp"
+#include "tests/models/ling_3_flash/test_fnv.hpp"
 #include "tests/models/ling_3_flash/test_rng.hpp"
 
 namespace L = gufo::models::ling_3_flash;
 namespace mla = gufo::models::ling_3_flash::rocm::mla;
 
 namespace {
+
+using gufo::tests::ling::Fnv;
 
 constexpr std::uint32_t kH = L::kHeads;
 constexpr std::uint32_t kLat = L::kMlaLatent;
@@ -703,14 +706,6 @@ void TestNonAbsorbedInvariance() {
                 tried3, bad3 == 0 ? "PASS" : "FAIL");
     g_failures += (bad == 0 ? 0 : 1) + (bad3 == 0 ? 0 : 1);
   }
-}
-
-std::uint64_t Fnv(const void* p, std::size_t bytes) {
-  std::uint64_t h = 1469598103934665603ULL;
-  const auto* b = static_cast<const std::uint8_t*>(p);
-  for (std::size_t i = 0; i < bytes; ++i)
-    h = (h ^ b[i]) * 1099511628211ULL;
-  return h;
 }
 
 // Output bits of the non-absorbed prefill against the parent kernels (golden

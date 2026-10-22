@@ -15,12 +15,15 @@
 #include "src/core/runtime_environment.hpp"
 #include "src/models/ling_3_flash/kernels/rocm/kernels.hpp"
 #include "tests/models/ling_3_flash/parent_digests.hpp"
+#include "tests/models/ling_3_flash/test_fnv.hpp"
 #include "tests/models/ling_3_flash/test_rng.hpp"
 
 namespace dn = gufo::models::ling_3_flash::rocm::dense;
 using gufo::models::ling_3_flash::rocm::WeightType;
 
 namespace {
+
+using gufo::tests::ling::Fnv;
 
 int g_failures = 0;
 gufo::tests::ling::Rng g_rng(20260101);
@@ -454,14 +457,6 @@ void TestF16(std::uint32_t rows, std::uint32_t k) {
 }
 
 // ---- prefill GEMM: split / tile-shape invariance and large-n accuracy -------
-std::uint64_t Fnv(const void* p, std::size_t bytes) {
-  std::uint64_t h = 1469598103934665603ULL;
-  const auto* b = static_cast<const std::uint8_t*>(p);
-  for (std::size_t i = 0; i < bytes; ++i)
-    h = (h ^ b[i]) * 1099511628211ULL;
-  return h;
-}
-
 /// Host emulation of the WMMA GEMM for one output: F16-rounded operands,
 /// F32 accumulation adding 8 products at a time with truncation toward zero.
 float EmulateDot(const float* w, const float* x, std::size_t k) {

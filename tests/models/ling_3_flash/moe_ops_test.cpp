@@ -25,6 +25,7 @@
 #include "src/models/ling_3_flash/kernels/rocm/kernels.hpp"
 #include "src/models/ling_3_flash/layout.hpp"
 #include "tests/models/ling_3_flash/parent_digests.hpp"
+#include "tests/models/ling_3_flash/test_fnv.hpp"
 #include "tests/models/ling_3_flash/test_rng.hpp"
 
 namespace {
@@ -44,6 +45,7 @@ void CheckHip(hipError_t e, const char* what) {
   }
 }
 
+using gufo::tests::ling::Fnv;
 using gufo::tests::ling::Rng;
 
 template<typename T>
@@ -551,15 +553,6 @@ void TestCombine(int n, hipStream_t st) {
          static_cast<std::size_t>(n) * kHidden);
 }
 
-// ---- prefill: split / tile-variant invariance (bit-exact) -------------------
-std::uint64_t Fnv(const void* p, std::size_t bytes) {
-  std::uint64_t h = 1469598103934665603ULL;
-  const auto* b = static_cast<const std::uint8_t*>(p);
-  for (std::size_t i = 0; i < bytes; ++i)
-    h = (h ^ b[i]) * 1099511628211ULL;
-  return h;
-}
-
 // ---- decode / routing: golden digests of the parent kernels (bit-exact) ---
 /// Checks `key`'s digests against parent_digests::kDecode; a key without a
 /// golden fails too, so a new case must be added on purpose.
@@ -724,6 +717,7 @@ void TestRouteDigest(int n, hipStream_t st) {
   }
 }
 
+// ---- prefill: split / tile-variant invariance (bit-exact) -------------------
 /// Runs gate/up + down over `n` tokens in one call (default dispatch), then
 /// again with every token tile variant, then as several chunks of the same
 /// tokens. Every run must match the first one bit for bit, because an output
