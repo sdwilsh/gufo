@@ -1,0 +1,14 @@
+[
+ {
+  "name": "story",
+  "prompt": "\"The forecast is written in Exeter by people who have never been wet.\" Brigid pointed with her chin at the iron ring at the end of the quay. \"Watch the gull.\"\n\nOn the post that was no longer a post, only a stump of grey timber they had unearthed that week beside the iron ring, there stood a single herring gull, hunched, "
+ },
+ {
+  "name": "code",
+  "prompt": "    // Mean of the good samples between two timestamps, or no value (NaN)\n    // if none qualify. The range is half open: [from, to).\n    double mean_between(std::int64_t from, std::int64_t to) const {\n        double total = 0.0;\n        std::size_t count = 0;\n        for (std::size_t i = 0; i < size_; ++i) {\n            const Sample& s = at(i);\n"
+ },
+ {
+  "name": "zh",
+  "prompt": "晓岚不好意思地笑了。她把铅笔放下，望着窗外的雾，说：“阿婆，如果堤坝修好了，渡口还会有人来吗？”\n\n外婆没有马上回答。她把剥好的豆子倒进一只搪瓷盆里，水声很轻，像雨落在棉被上。过了很久，她才说：“有人，就有渡口。没有人，修得再好也是一堵墙。你看那些孩子，每天走过这条河去上学，他们不是为了桥才来的，是为了"
+ }
+]

@@ -27,13 +27,21 @@ PROMPT = (
 )
 
 
-def assert_edit(result):
-    assert "<tool_call>" in result["reasoning"], (
+def assert_edit(result, require_marker=True):
+    """Whether the reasoning quoted the opener, the boundary under test.
+
+    Qwen and DeepSeek fixtures quote it as asked. Ling-3.0-flash names the
+    corruption without copying the opener, so its run records that the
+    boundary was not exercised rather than claim it; the call itself is
+    checked either way."""
+    exercised = "<tool_call>" in result["reasoning"]
+    assert exercised or not require_marker, (
         "quoted tool marker is missing from reasoning; fixture did not exercise the boundary", result)
     assert not result["text"].strip() and result["finish"] == "tool_calls", result
     assert len(result["tools"]) == 1, result
     call = result["tools"][0]["function"]
     assert call["name"] == "edit" and json.loads(call["arguments"]) == ARGUMENTS, result
+    return exercised
 
 
 def response_result(client, request, streaming):
@@ -59,8 +67,12 @@ def response_result(client, request, streaming):
                 finish="tool_calls" if calls else "stop", usage=response.usage.to_dict())
 
 
-def check_reasoning_separator(client, model, checks, chat_result, server_log=None):
-    """Reasoning framing is not visible text, with or without constraints (#439)."""
+def check_reasoning_separator(client, model, checks, chat_result, server_log=None, context="",
+                              checkpoint_tail=0):
+    """Reasoning framing is not visible text, with or without constraints (#439).
+
+    `context` is a neutral system prompt for runners that retain no short
+    prompt; the second request of each pair must restore the first's."""
     from cache_growth import check_unchanged_retry, log_offset
     function = {"name": "unused", "description": "Not needed for arithmetic.",
                 "parameters": {"type": "object", "properties": {},
@@ -80,7 +92,10 @@ def check_reasoning_separator(client, model, checks, chat_result, server_log=Non
             request = dict(model=model, temperature=0, extra_body={"seed": 439,
                            "presence_penalty": 0, "frequency_penalty": 0})
             if endpoint == "chat":
-                request.update(messages=[{"role": "user", "content": prompt}],
+                messages = [{"role": "user", "content": prompt}]
+                if context:
+                    messages.insert(0, {"role": "system", "content": context})
+                request.update(messages=messages,
                                reasoning_effort="low", max_completion_tokens=256)
                 if mode == "tools":
                     request.update(tools=[{"type": "function", "function": function}],
@@ -93,6 +108,8 @@ def check_reasoning_separator(client, model, checks, chat_result, server_log=Non
             else:
                 request.update(input=prompt, reasoning={"effort": "low"},
                                max_output_tokens=256, store=False)
+                if context:
+                    request["instructions"] = context
                 if mode == "tools":
                     request.update(tools=[{"type": "function", **function}], tool_choice="auto")
                 elif mode == "schema":
@@ -121,7 +138,8 @@ def check_reasoning_separator(client, model, checks, chat_result, server_log=Non
                     details = usage.get("prompt_tokens_details", usage.get("input_tokens_details"))
                     total = usage.get("prompt_tokens", usage.get("input_tokens"))
                     check_unchanged_retry(name, result, total - details["cached_tokens"],
-                                          server_log, replay_start, replay_end)
+                                          server_log, replay_start, replay_end,
+                                          checkpoint_tail=checkpoint_tail)
                 previous = result
             if endpoint == "chat" and mode == "tools":
                 # Feed the client-visible text back into the next turn. Removing
@@ -143,7 +161,9 @@ def check_reasoning_separator(client, model, checks, chat_result, server_log=Non
                 assert copied["text"] == "ALPHA\n\nBETA" and not copied["reasoning"], copied
 
 
-def check_disabled_tool_markers(client, model, checks, chat_result):
+def check_disabled_tool_markers(client, model, checks, chat_result, context=""):
+    """`context`: a neutral system prompt for runners that retain no short
+    prompt; the declared request must restore the undeclared one's."""
     literal = "Example: <tool_call> and <｜DSML｜tool_calls> are literal text."
     prompt = "Copy exactly this one line, without quotes or code fences:\n" + literal
     function = {"name": "echo", "parameters": {"type": "object", "properties": {
@@ -152,7 +172,10 @@ def check_disabled_tool_markers(client, model, checks, chat_result):
         for declared in (False, True):
             request = dict(model=model, temperature=0, extra_body={"seed": 41})
             if endpoint == "chat":
-                request.update(messages=[{"role": "user", "content": prompt}],
+                messages = [{"role": "user", "content": prompt}]
+                if context:
+                    messages.insert(0, {"role": "system", "content": context})
+                request.update(messages=messages,
                                reasoning_effort="none", max_completion_tokens=128)
                 if declared:
                     request.update(tools=[{"type": "function", "function": function}],
@@ -161,6 +184,8 @@ def check_disabled_tool_markers(client, model, checks, chat_result):
             else:
                 request.update(input=prompt, reasoning={"effort": "none"},
                                max_output_tokens=128, store=False)
+                if context:
+                    request["instructions"] = context
                 if declared:
                     request.update(tools=[{"type": "function", **function}], tool_choice="none")
                 result = response_result(client, request, True)
@@ -441,11 +466,17 @@ def tool_history(request, result, output):
         {"role": "tool", "tool_call_id": call["id"], "content": output}]
 
 
-def check_envelope_closer_framing(client, model, checks, chat_result, deepseek=False):
+def check_envelope_closer_framing(client, model, checks, chat_result, deepseek=False,
+                                  native_call_optional=False):
     """A closing tag of the client's envelope never reaches visible text.
 
     DeepSeek follows llama.cpp instead: only its native block is a call, and
     client envelope syntax it writes in place of one stays visible content.
+    `native_call_optional` (Ling-3.0-flash) records a shape that asks for a
+    call as not exercised when the model writes the system prompt's
+    `<invoke>` envelope instead of its native call: as in llama.cpp that is
+    never a call, and the envelope naming a declared tool is framing, so it
+    must still leave no markup in the visible text.
     """
     commands = {"closer_before_call": "pwd", "framing_between_calls": "pwd",
                 "closer_in_arguments": "printf '%s' '</invoke>'",
@@ -472,6 +503,12 @@ def check_envelope_closer_framing(client, model, checks, chat_result, deepseek=F
             # DeepSeek may answer with the handed markup instead of a native
             # call; as in llama.cpp, that is content and never an invented call.
             visible_markup = deepseek and not result["tools"]
+            unexercised = native_call_optional and name in commands and not result["tools"]
+            if unexercised:
+                assert result["finish"] == "stop", result
+                assert_no_envelope_framing(result)
+                checks[label + "_call_exercised"] = False
+                continue
             if name in commands and visible_markup:
                 assert commands[name] in text and result["finish"] == "stop", (
                     "markup the model wrote instead of a call stays visible", result)
@@ -712,8 +749,13 @@ def without_fenced_blocks(text):
     return "\n".join(kept)
 
 
-def check_quoted_then_real_call(client, model, checks, chat_result, deepseek=False):
+def check_quoted_then_real_call(client, model, checks, chat_result, deepseek=False,
+                                native_call_optional=False):
     """A documented envelope stays prose while the call after it is parsed.
+
+    With `native_call_optional` (Ling-3.0-flash), a reply that writes the
+    handed `<invoke>` envelope instead of a native call is recorded as not
+    exercised; its prose must still carry no framing.
 
     The prompt hands the markup over and asks for both acts; the case reads the
     result. Forcing the call instead makes the model lead with the raw markup, so
@@ -723,7 +765,7 @@ def check_quoted_then_real_call(client, model, checks, chat_result, deepseek=Fal
     function = {"name": "terminal", "parameters": {"type": "object", "properties": {
         "command": {"type": "string"}}, "required": ["command"]}}
     for name, (system, prompt, opener) in QUOTED_THEN_CALL_CASES.items():
-        documented = 0
+        documented = exercised = 0
         for streaming in streaming_modes():
             mode = "stream" if streaming else "buffered"
             label = f"quoted_then_call_{name}_{mode}"
@@ -738,6 +780,15 @@ def check_quoted_then_real_call(client, model, checks, chat_result, deepseek=Fal
             checks[label] = result
             print(f"CHECK {label}", file=sys.stderr, flush=True)
             names = [tool["function"]["name"] for tool in result["tools"]]
+            if native_call_optional and not names:
+                assert result["finish"] == "stop", result
+                prose = without_fenced_blocks(result["text"])
+                assert not any(marker in prose for marker in (
+                    "<invoke", "<parameter", "<tool_call>", "<arg_key>", "</parameter>",
+                    "</invoke>")), result
+                checks[label + "_call_exercised"] = False
+                continue
+            exercised += 1
             assert names == ["terminal"], (
                 "the only call parsed is the one the model made", result)
             arguments = json.loads(result["tools"][0]["function"]["arguments"])
@@ -759,15 +810,21 @@ def check_quoted_then_real_call(client, model, checks, chat_result, deepseek=Fal
                     f"{marker} reached the visible prose", result)
         # DeepSeek is not expected to document before calling; the call and the
         # absence of framing in its prose are checked above.
-        assert documented or deepseek, (
+        assert documented or deepseek or not exercised, (
             f"{name}: the model wrote no documentation in either transport, so "
             "this case never exercised the documented-call interaction. That is "
             "a prompt or oracle problem, not a framing failure; sharpen the "
             "prompt instead of reading it as a regression", checks)
 
 
-def check_unfinished_inline_then_call(client, model, checks, chat_result):
-    """A stray backtick followed by one newline must not swallow a real call."""
+def check_unfinished_inline_then_call(client, model, checks, chat_result,
+                                      shape_optional=False):
+    """A stray backtick followed by one newline must not swallow a real call.
+
+    With `shape_optional` (Ling-3.0-flash), a reply that separates the line
+    from its call differently (Ling writes none) is recorded as not exercising
+    the single-newline shape; the call must still be exact, the line intact and
+    no markup visible."""
     for name, prefix in (("filename", "I'll update `config.py"),
                          ("apostrophe", "Let`s write it.")):
         for streaming in streaming_modes():
@@ -789,8 +846,14 @@ def check_unfinished_inline_then_call(client, model, checks, chat_result):
             checks[label] = result
             print(f"CHECK {label}", file=sys.stderr, flush=True)
             assert_terminal_call(result, "pwd")
-            assert result["text"] == prefix + "\n", (
-                "the model must exercise the single-newline stray-backtick shape", result)
+            exercised = result["text"] == prefix + "\n"
+            if shape_optional and not exercised:
+                assert result["text"].rstrip() == prefix, (
+                    "the stray-backtick line must survive unchanged", result)
+                checks[label + "_shape_exercised"] = False
+            else:
+                assert exercised, (
+                    "the model must exercise the single-newline stray-backtick shape", result)
             assert_no_envelope_framing(result)
 
 
@@ -800,7 +863,7 @@ def check_unfinished_inline_then_call(client, model, checks, chat_result):
 # failure. The property it was meant to prove is pinned deterministically instead:
 # quote_tracker_test scans a 12000 byte bracket-dense line in one pass, and
 # openai_chat_test streams bracket-dense content through the parser.
-def check_tool_reasoning(client, model, checks, chat_result, sampling_preset=None):
+def check_tool_reasoning(client, model, checks, chat_result, sampling_preset=None, context=""):
     schema = {"type": "object", "properties": {
         "path": {"type": "string", "const": ARGUMENTS["path"]},
         "edits": {"type": "array", "minItems": 1, "maxItems": 1,
@@ -849,7 +912,8 @@ def check_tool_reasoning(client, model, checks, chat_result, sampling_preset=Non
             result = (chat_result(client, chat, streaming) if endpoint == "chat"
                       else response_result(client, responses, streaming))
             record(f"tool_reasoning_{endpoint}_{mode}_{label}", result)
-            assert_edit(result)
+            exercised = assert_edit(result, sampling_preset != "ling3")
+            checks[f"tool_reasoning_{endpoint}_{mode}_{label}_marker_exercised"] = exercised
             signature = (result["reasoning"].strip(), result["text"],
                          json.loads(result["tools"][0]["function"]["arguments"]))
             if reference is not None:
@@ -861,6 +925,10 @@ def check_tool_reasoning(client, model, checks, chat_result, sampling_preset=Non
         # Stop after the actual quoted opener, before reasoning ends. Deriving
         # the stop from greedy output avoids a model-specific token budget.
         # The stopped request uses the other streaming mode than its source.
+        if "<tool_call>" not in thought:
+            # Only a fixture that quoted the opener has this boundary (Ling).
+            checks[f"tool_reasoning_stopped_{label}"] = {"exercised": False}
+            continue
         cut = thought.index("<tool_call>") + len("<tool_call>")
         marker = thought[cut:cut + 16]
         assert len(marker) == 16 and thought.index(marker) == cut, thought
@@ -870,12 +938,15 @@ def check_tool_reasoning(client, model, checks, chat_result, sampling_preset=Non
         record(f"tool_reasoning_stopped_{mode}_{label}", result)
         assert result["reasoning"].strip() == thought[:cut].strip(), result
         assert not result["text"] and not result["tools"] and result["finish"] == "stop", result
-    check_disabled_tool_markers(client, model, checks, chat_result)
+    check_disabled_tool_markers(client, model, checks, chat_result, context)
     deepseek = sampling_preset == "deepseek4"
-    check_envelope_closer_framing(client, model, checks, chat_result, deepseek)
+    check_envelope_closer_framing(client, model, checks, chat_result, deepseek,
+                                  sampling_preset == "ling3")
     check_tail_lookalike_content(client, model, checks, chat_result)
     check_unfinished_lookalike(client, model, checks, chat_result)
     check_literal_protocol_data(client, model, checks, chat_result)
     check_html_content(client, model, checks, chat_result)
-    check_quoted_then_real_call(client, model, checks, chat_result, deepseek)
-    check_unfinished_inline_then_call(client, model, checks, chat_result)
+    check_quoted_then_real_call(client, model, checks, chat_result, deepseek,
+                                sampling_preset == "ling3")
+    check_unfinished_inline_then_call(client, model, checks, chat_result,
+                                      sampling_preset == "ling3")

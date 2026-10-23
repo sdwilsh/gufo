@@ -1,6 +1,7 @@
 #ifndef GUFO_SERVER_TEXT_MODEL_RUNNER_HPP_
 #define GUFO_SERVER_TEXT_MODEL_RUNNER_HPP_
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -13,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "src/cache/adapter.hpp"
@@ -76,19 +78,6 @@ struct TextRunnerDiskCacheOptions {
   std::size_t min_checkpoint_step_tokens{2048};
 };
 
-/// MemAvailable from /proc/meminfo text minus CmaFree, in bytes. Free CMA
-/// pages count as available but only hold movable pages, not GPU
-/// allocations; the kernel's KHO scratch area can make that several GiB.
-/// Nullopt when MemAvailable is missing.
-[[nodiscard]] std::optional<std::uint64_t> MeminfoAvailableBytes(
-    std::string_view meminfo);
-/// `host_available` bounded by every cgroup v2 memory limit from the process's
-/// cgroup (named in `membership_text`, the /proc/self/cgroup contents) up to
-/// `root`. Inactive file pages in memory.stat are reclaimable page cache and
-/// are not counted as used; without that line, memory.current is used as is.
-[[nodiscard]] std::uint64_t CgroupAvailableBytes(
-    const std::filesystem::path& root, std::string_view membership_text,
-    std::uint64_t host_available);
 /// Automatic snapshot budget: half the host RAM available after loading
 /// (excluding free CMA pages), after cgroup limits.
 [[nodiscard]] std::size_t HostSnapshotBudgetBytes();
@@ -129,6 +118,17 @@ struct TextRunnerCapabilities {
   /// Interrupted prefill rolls back to its entry frontier without consuming
   /// input, so cancellation need not wait for the whole pass.
   bool prefill_rollback{false};
+  /// Fewest prompt tokens that must follow a checkpoint the pool plans inside
+  /// one prompt (grid, shared-prefix and learned boundaries). A model whose
+  /// numerics depend on chunk size (Ling's small-batch family for 1..8-token
+  /// chunks) needs the tokens after a checkpoint to form a full-size chunk so
+  /// a restored run keeps the numerics of an uncached one. Zero places no
+  /// constraint beyond one remaining token.
+  std::size_t min_checkpoint_tail_tokens{0};
+  /// Prompts shorter than this are not retained as snapshots: for a runner
+  /// whose snapshot has a large fixed size (Ling: 75.5 MiB of recurrent state),
+  /// a handful of tokens costs more RAM than re-prefilling them saves.
+  std::size_t min_snapshot_tokens{0};
 };
 
 /// Model-owned compatibility identity for restart-safe snapshots.
@@ -213,6 +213,12 @@ struct TextDecodeStep {
   /// dispatch. A runner's advertised maximum is not evidence of batching.
   TextExecutionPlan execution_plan{};
   std::exception_ptr failure{};
+  /// Decode time of this request within a DecodeBatch call, set when the
+  /// runner times its lanes. It is the wall time of the steps the request took
+  /// part in: shared steps count in full, and steps of other requests that it
+  /// waited for do not. A serial DecodeStep reports its own cycle. When unset,
+  /// the whole call counts.
+  std::optional<double> decode_ms{};
 };
 
 /// Model-private state driven only through TextModelRunner work units.
@@ -306,6 +312,13 @@ public:
   [[nodiscard]] virtual sampling::JsonConstraint::ToolFormat ToolFormat()
       const {
     return sampling::JsonConstraint::ToolFormat::kJson;
+  }
+  /// How this model writes tool calls. kBailing calls are grammar-steered in
+  /// their native markup (JsonConstraint::ToolFormat::kBailing) and parsed by
+  /// ScanBailingToolCalls.
+  [[nodiscard]] virtual TextGenerationBackend::ToolCallSyntax ToolSyntax()
+      const {
+    return TextGenerationBackend::ToolCallSyntax::kDefault;
   }
   /// Reuse a compiled grammar bound to this runner's vocabulary.
   [[nodiscard]] std::shared_ptr<const sampling::TokenConstraint> BindConstraint(
@@ -671,6 +684,25 @@ private:
     const ChatRequest& request, const TextModelRunner& runner,
     sampling::SamplingConfig* sampling,
     std::optional<sampling::JsonConstraint::ToolFormat>* tool_format = nullptr);
+
+/// Calls `poll` (a PollDevice-like callable) until it is conclusive or
+/// `timeout` passes. kUsable and kLost are conclusive; kPending at the bound
+/// means the probe did not finish, which is inconclusive and must not be read
+/// as usable.
+template<class Poll>
+[[nodiscard]] TextModelRunner::DeviceProbeStatus BoundedDeviceProbe(
+    Poll&& poll, std::chrono::milliseconds timeout) {
+  using Status = TextModelRunner::DeviceProbeStatus;
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (;;) {
+    const Status status = poll();
+    if (status != Status::kPending)
+      return status;
+    if (std::chrono::steady_clock::now() >= deadline)
+      return Status::kPending;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
 
 }  // namespace gufo::server
 

@@ -2,11 +2,35 @@
 #define GUFO_SERVER_LOGGING_HPP_
 
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
 
 namespace gufo::server {
+
+/// MemAvailable from /proc/meminfo text minus CmaFree, in bytes. Free CMA
+/// pages count as available but only hold movable pages, not GPU
+/// allocations; the kernel's KHO scratch area can make that several GiB.
+/// Nullopt when MemAvailable is missing.
+[[nodiscard]] std::optional<std::uint64_t> MeminfoAvailableBytes(
+    std::string_view meminfo);
+
+/// `host_available` bounded by every cgroup v2 memory limit from the process's
+/// cgroup (named in `membership_text`, the /proc/self/cgroup contents) up to
+/// `root`. Inactive file pages in memory.stat are reclaimable page cache and
+/// are not counted as used; without that line, memory.current is used as is.
+[[nodiscard]] std::uint64_t CgroupAvailableBytes(
+    const std::filesystem::path& root, std::string_view membership_text,
+    std::uint64_t host_available);
+
+/// Host RAM still available to this process: the node's MemAvailable minus
+/// free CMA pages (MeminfoAvailableBytes), capped by the remaining room under
+/// the cgroup memory limit of the process and of every ancestor
+/// (CgroupAvailableBytes, which counts reclaimable page cache as free). Every
+/// host-memory-derived budget (RAM prompt cache) and the
+/// `effective_available_mib` log field use it.
+std::uint64_t EffectiveHostAvailableBytes();
 
 /// Log verbosity, ordered from chattiest to quietest so a threshold test is a
 /// single comparison. `kDebug` must stay below `kInfo`: the process-wide filter

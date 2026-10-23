@@ -1,0 +1,8 @@
+# Token-26 study: layer_check (router_ids per layer vs the F64 reference) and a
+# position-55 logit dump, for G (int2r5 = WS11 merged, /opt/gufo/tests) and G0
+# (int2r4 = pre-WS11, /opt/gufo/g0). Run by ling-token26 (ling-int-suite --part token26).
+# A layer_check teacher gate FAIL does not stop the study; the dumps are what matter.
+@label=token26_G_layer_check @timeout=1800 ling_3_flash_layer_check --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --reference-dir /opt/gufo/f64/R3_gpu_ref --tokens-file /opt/gufo/f64/story_teacher_ids.txt --dump-dir $TMPDIR/token26/G_lc
+@label=token26_G_logits @timeout=1200 ling_3_flash_logit_dump --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --tokens-file /opt/gufo/f64/story_teacher_ids.txt --positions 55 --dump-dir $TMPDIR/token26/G_logits
+@label=token26_G0_layer_check @timeout=1800 /opt/gufo/g0/ling_3_flash_layer_check --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --reference-dir /opt/gufo/f64/R3_gpu_ref --tokens-file /opt/gufo/f64/story_teacher_ids.txt --dump-dir $TMPDIR/token26/G0_lc
+@label=token26_G0_logits @timeout=1200 /opt/gufo/g0/ling_3_flash_logit_dump --model /models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf --tokens-file /opt/gufo/f64/story_teacher_ids.txt --positions 55 --dump-dir $TMPDIR/token26/G0_logits

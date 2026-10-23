@@ -19,6 +19,7 @@
 #include "src/core/json.hpp"
 #include "src/core/json_constraint.hpp"
 #include "src/models/deepseek_v4_flash/chat_template.hpp"
+#include "src/models/ling_3_flash/chat_template.hpp"
 #include "src/models/qwen/control_tokens.hpp"
 
 using gufo::tokenization::kImEnd;
@@ -101,11 +102,16 @@ public:
   [[nodiscard]] gufo::ReasoningOptions reasoning_defaults() const override {
     return reasoning_defaults_value;
   }
+  [[nodiscard]] ToolCallSyntax tool_call_syntax() const override {
+    return syntax;
+  }
+  ToolCallSyntax syntax{ToolCallSyntax::kDefault};
   [[nodiscard]] InitialOutputState initial_output_state(
       const gufo::server::ChatRequest& request) const override {
     if (initial_output_state_override)
       return *initial_output_state_override;
-    return request.reasoning.enabled.value_or(false)
+    return request.reasoning.enabled.value_or(syntax ==
+                                              ToolCallSyntax::kBailing)
                ? InitialOutputState::kReasoning
                : InitialOutputState::kContent;
   }
@@ -4948,6 +4954,967 @@ void TestResponsesPromptProgress() {
          "Responses rejects non-boolean progress settings");
 }
 
+struct BailingOutcome {
+  std::string content;
+  std::string reasoning;
+  std::vector<std::pair<std::string, std::string>> calls;  // name, arguments
+  std::vector<std::string> ids;
+  std::vector<std::int64_t> indices;
+  std::vector<std::string> fragments;  // streamed argument fragments
+  std::string finish;
+  bool usage{false};
+  bool errored{false};  // streamed error event
+};
+
+std::string BailingBody(bool stream, std::string_view thinking,
+                        std::string_view extra = {}) {
+  std::string body = R"({"model":"test-model","stream":)";
+  body += stream ? "true,\"stream_options\":{\"include_usage\":true}" : "false";
+  body += R"(,"messages":[{"role":"user","content":"go"}],)";
+  body += R"("tools":[
+    {"type":"function","function":{"name":"edit","parameters":{"type":"object",
+      "properties":{"path":{"type":"string"},"line":{"type":"integer"},
+      "dry_run":{"type":"boolean"},"new":{"type":"string"}}}}},
+    {"type":"function","function":{"name":"ping","parameters":{"type":"object"}}},
+    {"type":"function","function":{"name":"record","parameters":{"type":"object",
+      "properties":{"value":{"type":"string"}}}}}])";
+  if (!thinking.empty())
+    body += R"(,"chat_template_kwargs":{"enable_thinking":)" +
+            std::string(thinking) + "}";
+  body += std::string(extra);
+  return body + "}";
+}
+
+BailingOutcome RunBailing(
+    const std::vector<std::string>& pieces, bool stream,
+    std::string_view thinking = "true", std::string_view extra = {},
+    gufo::server::TextGenerationBackend::FinishReason finish =
+        gufo::server::TextGenerationBackend::FinishReason::kStop,
+    bool grammar = false) {
+  FakeBackend backend;
+  backend.syntax =
+      gufo::server::TextGenerationBackend::ToolCallSyntax::kBailing;
+  if (grammar)
+    backend.tool_format = gufo::sampling::JsonConstraint::ToolFormat::kBailing;
+  backend.pieces = pieces;
+  backend.finish_reason = finish;
+  const auto response = gufo::server::HandleOpenAiChat(
+      Request(BailingBody(stream, thinking, extra)), backend);
+  BailingOutcome out;
+  if (response.status != 200) {
+    std::cerr << "status " << response.status << " " << response.body << "\n";
+    Expect(false, "Bailing request succeeds");
+  }
+  const auto add_call = [&](const gufo::json::Value& call) {
+    const auto* function = call.find("function");
+    if (const auto* name = function ? function->find("name") : nullptr;
+        name && name->is_string())
+      out.calls.emplace_back(name->get_str(), "");
+    if (function && function->find("arguments")) {
+      out.calls.back().second += function->member_str("arguments");
+      if (!function->member_str("arguments").empty())
+        out.fragments.push_back(function->member_str("arguments"));
+    }
+  };
+  if (!stream) {
+    const auto body = gufo::json::parse(response.body);
+    const auto& choice = body.find("choices")->items()[0];
+    const auto& message = *choice.find("message");
+    out.content = message.member_str("content");
+    out.reasoning = message.member_str("reasoning_content");
+    out.finish = choice.member_str("finish_reason");
+    if (const auto* calls = message.find("tool_calls"))
+      for (const auto& call : calls->items()) {
+        add_call(call);
+        out.ids.push_back(call.member_str("id"));
+      }
+    out.usage = body.find("usage") != nullptr;
+    return out;
+  }
+  std::string raw;
+  response.streaming_body([&](std::string_view part) {
+    raw += part;
+    return true;
+  });
+  std::size_t cursor = 0;
+  while ((cursor = raw.find("data: ", cursor)) != std::string::npos) {
+    const auto begin = cursor + 6;
+    cursor = raw.find('\n', begin);
+    const auto payload = raw.substr(begin, cursor - begin);
+    if (payload == "[DONE]")
+      break;
+    const auto event = gufo::json::parse(payload);
+    if (event.find("error"))
+      out.errored = true;
+    if (event.find("usage"))
+      out.usage = true;
+    const auto* choices = event.find("choices");
+    if (!choices || choices->empty())
+      continue;
+    const auto& choice = choices->items()[0];
+    if (const auto* finish_reason = choice.find("finish_reason");
+        finish_reason && finish_reason->is_string())
+      out.finish = finish_reason->get_str();
+    const auto* delta = choice.find("delta");
+    if (!delta)
+      continue;
+    out.content += delta->member_str("content");
+    out.reasoning += delta->member_str("reasoning_content");
+    if (const auto* calls = delta->find("tool_calls"))
+      for (const auto& call : calls->items()) {
+        add_call(call);
+        // Argument fragments repeat the index and carry no id.
+        if (call.member_str("id").empty())
+          continue;
+        out.ids.push_back(call.member_str("id"));
+        out.indices.push_back(
+            static_cast<std::int64_t>(call.member_double("index", -1)));
+      }
+  }
+  return out;
+}
+
+std::vector<std::string> Chars(const std::string& text) {
+  std::vector<std::string> pieces;
+  for (char c : text)
+    pieces.emplace_back(1, c);
+  return pieces;
+}
+
+void ExpectBailing(
+    const std::string& text, std::string_view thinking,
+    std::string_view reasoning, std::string_view content,
+    const std::vector<std::pair<std::string, std::string>>& calls,
+    std::string_view finish,
+    gufo::server::TextGenerationBackend::FinishReason reason =
+        gufo::server::TextGenerationBackend::FinishReason::kStop) {
+  // Every split point, one byte at a time, and the whole text at once must
+  // agree, buffered or streamed.
+  std::vector<std::vector<std::string>> splits{{text}, Chars(text)};
+  for (std::size_t at = 1; at < text.size(); ++at)
+    splits.push_back({text.substr(0, at), text.substr(at)});
+  for (const bool stream : {false, true}) {
+    for (const auto& pieces : splits) {
+      const auto out = RunBailing(pieces, stream, thinking, {}, reason);
+      const auto trimmed = [](std::string value) {
+        const auto begin = value.find_first_not_of(" \t\r\n");
+        const auto end = value.find_last_not_of(" \t\r\n");
+        return begin == std::string::npos
+                   ? std::string()
+                   : value.substr(begin, end - begin + 1);
+      };
+      // A stream cut mid-call (length, stop string) has already published the
+      // arguments written so far, as for Qwen calls: one extra call whose
+      // arguments are not yet valid JSON.
+      const auto unfinished = [](const std::string& arguments) {
+        try {
+          (void)gufo::json::parse(arguments);
+          return false;
+        } catch (const std::exception&) {
+          return true;
+        }
+      };
+      const bool cut_call =
+          stream && out.calls.size() == calls.size() + 1 &&
+          std::equal(calls.begin(), calls.end(), out.calls.begin()) &&
+          unfinished(out.calls.back().second);
+      const bool ok = out.content == content &&
+                      trimmed(out.reasoning) == reasoning &&
+                      (out.calls == calls || cut_call) && out.finish == finish;
+      if (!ok) {
+        std::cerr << "Bailing text: " << text << "\nstream=" << stream
+                  << " pieces=" << pieces.size() << "\ncontent=[" << out.content
+                  << "] reasoning=[" << out.reasoning
+                  << "] finish=" << out.finish << " calls=" << out.calls.size()
+                  << "\n";
+        for (const auto& [name, args] : out.calls)
+          std::cerr << "  " << name << " " << args << "\n";
+      }
+      Expect(ok, "Bailing output parsed identically for every chunking");
+      Expect(out.usage, "usage is reported");
+      if (stream) {
+        for (std::size_t i = 0; i < out.indices.size(); ++i)
+          Expect(out.indices[i] == static_cast<std::int64_t>(i),
+                 "stream tool call indices are sequential");
+      }
+      for (std::size_t i = 0; i < out.ids.size(); ++i) {
+        Expect(out.ids[i].starts_with("call_"), "tool call has an id");
+        for (std::size_t j = 0; j < i; ++j)
+          Expect(out.ids[i] != out.ids[j], "tool call ids are distinct");
+      }
+    }
+  }
+}
+
+// Streamed Bailing arguments: fragments concatenate to the final arguments,
+// arrive while the value is written, and never carry bytes of a closing tag.
+void TestBailingArgumentStreaming() {
+  const auto call = [](std::string_view value) {
+    return "<tool_call>record\n<arg_key>value</arg_key>\n<arg_value>" +
+           std::string(value) + "</arg_value>\n</tool_call>";
+  };
+  const auto args = [](std::string_view value) {
+    auto object = gufo::json::Value::object();
+    object["value"] = std::string(value);
+    return object.dump();
+  };
+  // Long values stream in several fragments, byte by byte, and the literal
+  // spellings of other dialects' and tool markup stay value text.
+  for (const std::string& value : {
+           std::string("first line\nsecond \"line\" with \\ and tab\t"),
+           std::string("caf\xC3\xA9 \xE2\x82\xAC \xF0\x9F\x98\x80 snow"),
+           std::string(
+               "a <tool_call> b </parameter> c <|im_end|> d </think> e"),
+           std::string("x </arg_value> y </arg_key> z </tool_call> w"),
+           std::string("trail </arg_val"),
+           std::string("<arg_key>k</arg_key>"),
+           std::string("two </arg_value>\n more"),
+           std::string("a </arg_value>"),
+       }) {
+    const auto text = call(value);
+    for (const bool stream : {false, true}) {
+      const auto out = RunBailing(Chars(text), stream, "false");
+      Expect(out.calls.size() == 1 && out.calls[0].second == args(value) &&
+                 out.finish == "tool_calls" && out.content.empty(),
+             "streamed Bailing argument equals the final value");
+      if (!stream)
+        continue;
+      Expect(out.fragments.size() > 3, "Bailing arguments arrive in pieces");
+      std::string joined;
+      for (const auto& fragment : out.fragments) {
+        joined += fragment;
+        // A fragment never holds back-tracked bytes: the whole stream so far
+        // is a prefix of the final JSON.
+        Expect(args(value).starts_with(joined),
+               "Bailing fragments only extend the final arguments");
+      }
+    }
+    // Any single split of the stream agrees as well.
+    for (std::size_t at = 1; at < text.size(); ++at) {
+      const auto out =
+          RunBailing({text.substr(0, at), text.substr(at)}, true, "false");
+      Expect(out.calls.size() == 1 && out.calls[0].second == args(value),
+             "split Bailing stream equals the final value");
+    }
+  }
+  // A closing tag is not leaked while it may still be one.
+  {
+    const auto out = RunBailing(
+        Chars(
+            "<tool_call>record\n<arg_key>value</arg_key>\n<arg_value>abc</arg_"
+            "value"),
+        true, "false", {},
+        gufo::server::TextGenerationBackend::FinishReason::kLength);
+    std::string joined;
+    for (const auto& fragment : out.fragments)
+      joined += fragment;
+    Expect(joined == R"({"value":"abc)", "a possible closer is held back");
+  }
+  const auto joined = [](const BailingOutcome& out) {
+    std::string all;
+    for (const auto& fragment : out.fragments)
+      all += fragment;
+    return all;
+  };
+  using Finish = gufo::server::TextGenerationBackend::FinishReason;
+  const std::string open_value =
+      "<tool_call>record\n<arg_key>value</arg_key>\n<arg_value>abc";
+  // Cut by the token limit or a stop string: exactly the text written so far.
+  for (const auto reason : {Finish::kLength, Finish::kStopSequence}) {
+    const auto out = RunBailing(Chars(open_value), true, "false", {}, reason);
+    Expect(joined(out) == R"({"value":"abc)" && !out.errored,
+           "a cut stream publishes the text written so far, nothing more");
+  }
+  // The model stopping inside the value: the same text, then an error event.
+  {
+    const auto out = RunBailing(Chars(open_value), true, "false");
+    Expect(
+        joined(out) == R"({"value":"abc)" && out.errored && out.finish.empty(),
+        "a model stop inside a value is an error event");
+  }
+  // A literal </tool_call> inside a value the model never closed is no call.
+  {
+    const std::string text = open_value + "</tool_call>";
+    const auto buffered = RunBailing({text}, false, "false");
+    Expect(buffered.calls.empty(), "an early closer rejects the call");
+    const auto streamed = RunBailing(Chars(text), true, "false");
+    Expect(
+        streamed.errored && joined(streamed) == R"({"value":"abc</tool_call>)",
+        "an early closer is not a retraction to {}");
+  }
+  // Typed values wait for their closing tag.
+  for (const std::string_view typed : {"line", "dry_run"}) {
+    const auto out =
+        RunBailing(Chars("<tool_call>edit\n<arg_key>" + std::string(typed) +
+                         "</arg_key>\n<arg_value>1"),
+                   true, "false", {}, Finish::kLength);
+    Expect(joined(out) == "{", "typed values are not streamed before closing");
+  }
+  {
+    const auto out = RunBailing(
+        Chars("<tool_call>edit\n<arg_key>path</arg_key>\n<arg_value>a</"
+              "arg_value>\n<arg_key>line</arg_key>\n<arg_value>12"),
+        true, "false", {}, Finish::kLength);
+    Expect(joined(out) == R"({"path":"a")",
+           "finished arguments are published, a typed one still open is not");
+  }
+  // A key repeated with another value invalidates the call, as for Qwen;
+  // an identical repeat is dropped.
+  ExpectBailing(
+      "<tool_call>record<arg_key>value</arg_key><arg_value>a</arg_value>"
+      "<arg_key>value</arg_key><arg_value>a</arg_value></tool_call>",
+      "false", "", "", {{"record", R"({"value":"a"})"}}, "tool_calls");
+  {
+    const std::string text =
+        "<tool_call>record<arg_key>value</arg_key><arg_value>a</arg_value>"
+        "<arg_key>value</arg_key><arg_value>b</arg_value></tool_call>";
+    const auto buffered = RunBailing({text}, false, "false");
+    Expect(buffered.calls.empty() && buffered.finish == "stop",
+           "a conflicting repeated key is no call");
+    const auto streamed = RunBailing(Chars(text), true, "false");
+    Expect(streamed.errored && joined(streamed) == R"({"value":"a")",
+           "a stream never retracts what a conflicting repeat contradicts");
+  }
+  // An unmatched backtick in one call's value does not quote the next call.
+  {
+    const auto out =
+        RunBailing(Chars(call("a ` b") + call("second")), true, "false");
+    Expect(out.calls.size() == 2 && out.calls[1].second == args("second") &&
+               out.content.empty() && !out.errored,
+           "quote state does not run across accepted calls");
+    const auto buffered =
+        RunBailing({call("a ` b") + call("second")}, false, "false");
+    Expect(buffered.calls.size() == 2 && buffered.content.empty(),
+           "the buffered scan does not quote the next call either");
+  }
+  // With the Bailing tool grammar steering generation (tool_choice required),
+  // and beside a response_format, the arguments stream as well.
+  for (const std::string_view extra :
+       {R"(,"tool_choice":"required","parallel_tool_calls":false)",
+        R"(,"response_format":{"type":"json_object"})"}) {
+    const auto out = RunBailing(Chars(call("some longer value")), true, "false",
+                                extra, Finish::kStop, true);
+    Expect(out.fragments.size() > 3 && out.calls.size() == 1 &&
+               out.calls[0].second == args("some longer value"),
+           "grammar-constrained arguments arrive in pieces");
+  }
+  // Parallel calls, typed arguments and a text argument after them.
+  {
+    const std::string text =
+        "<tool_call>edit\n<arg_key>line</arg_key>\n<arg_value>12</arg_value>\n"
+        "<arg_key>path</arg_key>\n<arg_value>a\"b</arg_value>\n</tool_call>"
+        "<tool_call>ping</tool_call>"
+        "<tool_call>record\n<arg_key>value</arg_key>\n<arg_value>v</arg_value>"
+        "\n</tool_call>";
+    for (const auto& pieces : {Chars(text), std::vector<std::string>{text}}) {
+      const auto out = RunBailing(pieces, true, "false");
+      Expect(out.calls.size() == 3 &&
+                 out.calls[0].second == R"({"line":12,"path":"a\"b"})" &&
+                 out.calls[1].second == "{}" &&
+                 out.calls[2].second == R"({"value":"v"})",
+             "parallel Bailing calls stream their own arguments");
+    }
+  }
+}
+
+void TestBailingToolCalls() {
+  TestBailingArgumentStreaming();
+  constexpr auto kStop = "stop";
+  constexpr auto kCalls = "tool_calls";
+  const std::string clean =
+      "<tool_call>edit\n<arg_key>path</arg_key>\n<arg_value>a/b.py</"
+      "arg_value>\n"
+      "<arg_key>line</arg_key>\n<arg_value>12</arg_value>\n"
+      "<arg_key>dry_run</arg_key>\n<arg_value>false</arg_value>\n"
+      "<arg_key>new</arg_key>\n<arg_value>x = 1\n</arg_value>\n</tool_call>";
+  const std::string clean_args =
+      R"({"path":"a/b.py","line":12,"dry_run":false,"new":"x = 1\n"})";
+
+  // Reasoning closed by </think>, prose, a call.
+  ExpectBailing("Let me edit.</think>\n\nEditing now.\n" + clean, "true",
+                "Let me edit.", "Editing now.", {{"edit", clean_args}}, kCalls);
+  // A call that arrives before </think> closes reasoning implicitly.
+  ExpectBailing("Need a call.\n" + clean, "true", "Need a call.", "",
+                {{"edit", clean_args}}, kCalls);
+  // Thinking off: everything is content.
+  ExpectBailing("Sure.\n" + clean, "false", "", "Sure.", {{"edit", clean_args}},
+                kCalls);
+  // Parallel calls with prose between and after them.
+  ExpectBailing(
+      "Two steps.\n<tool_call>ping</tool_call>\nthen\n" + clean + "\nDone.",
+      "false", "", "Two steps.\n\nthen\n\nDone.",
+      {{"ping", "{}"}, {"edit", clean_args}}, kCalls);
+  // Plain answers and look-alike prose.
+  ExpectBailing("a <tool_x> b </think> c", "false", "",
+                "a <tool_x> b </think> c", {}, kStop);
+  ExpectBailing("why</think>The answer.", "true", "why", "The answer.", {},
+                kStop);
+  // After </think> only line breaks are framing, as the Bailing template's
+  // `split('</think>')[-1].lstrip('\n')` reads it (Qwen also drops spaces).
+  ExpectBailing("why</think>\n\n  The answer.", "true", "why", "  The answer.",
+                {}, kStop);
+  // The structured paths read the same boundary: line breaks after </think>
+  // are framing and spaces are not, with tool-only steering and with a
+  // response_format alike.
+  for (const bool stream : {false, true}) {
+    for (const auto& pieces :
+         {std::vector<std::string>{"why</think>\n\n  The answer."},
+          Chars("why</think>\n\n  The answer.")}) {
+      const auto tool_only = RunBailing(pieces, stream, "true");
+      Expect(tool_only.content == "  The answer." &&
+                 tool_only.reasoning.find("why") != std::string::npos,
+             "tool-steered Bailing content keeps spaces after </think>");
+      const auto formatted =
+          RunBailing(pieces, stream, "true",
+                     R"(,"response_format":{"type":"json_object"})");
+      Expect(formatted.content == "  The answer." &&
+                 formatted.reasoning.find("why") != std::string::npos,
+             "response_format Bailing content keeps spaces after </think>");
+    }
+  }
+  // Beside a response_format the grammar admits a call or the JSON answer:
+  // a leading opener is a Bailing call, JSON is content, and a call cut by
+  // the token limit is neither.
+  {
+    const std::string format = R"(,"response_format":{"type":"json_object"})";
+    const std::string call =
+        "<tool_call>record\n<arg_key>value</arg_key>\n<arg_value>a b"
+        "</arg_value>\n</tool_call>";
+    for (const bool stream : {false, true}) {
+      for (const auto& pieces : {std::vector<std::string>{call}, Chars(call)}) {
+        const auto called = RunBailing(pieces, stream, "false", format);
+        Expect(
+            called.calls.size() == 1 && called.calls[0].first == "record" &&
+                gufo::json::parse(called.calls[0].second).member_str("value") ==
+                    "a b" &&
+                called.content.empty() && called.finish == "tool_calls",
+            "a Bailing call beside a response_format is a call");
+      }
+      const auto answered =
+          RunBailing({R"({"a": 1})"}, stream, "false", format);
+      Expect(answered.calls.empty() && answered.content == R"({"a": 1})" &&
+                 answered.finish == "stop",
+             "the JSON answer beside tools is content");
+      const auto cut = RunBailing(
+          Chars("<tool_call>record\n<arg_key>value</arg_key>\n<arg_value>a"),
+          stream, "false", format,
+          gufo::server::TextGenerationBackend::FinishReason::kLength);
+      Expect((stream ? cut.calls.size() <= 1 : cut.calls.empty()) &&
+                 cut.content.empty() && cut.finish == "length",
+             "a cut Bailing call beside a response_format never completes");
+    }
+  }
+  // A stop string inside a value cuts the call even when the value quotes a
+  // closer: it is unfinished, never a call with lost arguments.
+  ExpectBailing(
+      "<tool_call>record\n<arg_key>value</arg_key>\n<arg_value>"
+      "<tool_call><function=record><parameter=content>AAAA</parameter>"
+      "</function></tool_call> ",
+      "false", "", "", {}, "stop",
+      gufo::server::TextGenerationBackend::FinishReason::kStopSequence);
+  // Undeclared tool under auto: emitted as generated so the client's
+  // unknown-tool path can answer it.
+  ExpectBailing(
+      "<tool_call>rm_rf\n<arg_key>p</arg_key>\n"
+      "<arg_value>/</arg_value>\n</tool_call>",
+      "false", "", "", {{"rm_rf", R"({"p":"/"})"}}, kCalls);
+  // A bare name at a clean stop is `name {}`.
+  ExpectBailing("<tool_call>ping", "false", "", "", {{"ping", "{}"}}, kCalls);
+  // A call inside reasoning, then a stray </think>: swallowed.
+  ExpectBailing("Need a tool.<tool_call>ping</tool_call></think>after", "true",
+                "Need a tool.", "after", {{"ping", "{}"}}, kCalls);
+  // Non-ASCII values split inside UTF-8 sequences by one-byte chunks.
+  {
+    auto expected = gufo::json::Value::object();
+    expected["path"] = "\xC3\xA9\xE4\xB8\xAD\xF0\x9F\x98\x80/x.py";
+    ExpectBailing(
+        "Go.\n<tool_call>edit\n<arg_key>path</arg_key>\n<arg_value>"
+        "\xC3\xA9\xE4\xB8\xAD\xF0\x9F\x98\x80/x.py</arg_value>\n</tool_call>",
+        "false", "", "Go.", {{"edit", expected.dump()}}, kCalls);
+  }
+  // Malformed arguments (no closing tags) after a clean stop surface as text.
+  // A call is not published before an argument value opens, so a stop right
+  // after the header is plain text, streamed or buffered.
+  const std::string cut = "<tool_call>edit\n<arg_key>path</arg_key>\n<arg_val";
+  for (const bool stream : {false, true})
+    for (const auto& pieces : {std::vector<std::string>{cut}, Chars(cut)}) {
+      const auto out = RunBailing(pieces, stream, "false");
+      Expect(out.calls.empty() && out.content == cut && out.finish == "stop" &&
+                 !out.errored,
+             "malformed arguments after a clean stop surface as text");
+    }
+  // Framing the model repeats after an accepted call is not content (#400),
+  // while a closed quoted opener in prose or reasoning is not a call.
+  ExpectBailing("Go.\n" + clean + "\n</tool_call>", "false", "", "Go.",
+                {{"edit", clean_args}}, kCalls);
+  ExpectBailing("Go.\n<tool_call>ping</tool_call>\n</tool_call>\nDone.",
+                "false", "", "Go.\nDone.", {{"ping", "{}"}}, kCalls);
+  ExpectBailing("Write `<tool_call>` to call.", "false", "",
+                "Write `<tool_call>` to call.", {}, kStop);
+  ExpectBailing("Use `<tool_call>` here.</think>Done.", "true",
+                "Use `<tool_call>` here.", "Done.", {}, kStop);
+  // As for Qwen and DeepSeek (TestNativeToolImplicitReasoningEnd), a fenced
+  // example call is reasoning, and only the unquoted call after it is invoked.
+  ExpectBailing(
+      "Example:\n```xml\n" + clean + "\n```\nEdit it.\n\n</think>" + clean,
+      "true", "Example:\n```xml\n" + clean + "\n```\nEdit it.", "",
+      {{"edit", clean_args}}, kCalls);
+  // An opener inside an unfinished inline quote (ended by a blank line) stays
+  // reasoning too, as the grammar's reasoning lexeme reads it.
+  ExpectBailing("Use `<tool_call>edit later.\n\nNow:\n" + clean, "true",
+                "Use `<tool_call>edit later.\n\nNow:", "",
+                {{"edit", clean_args}}, kCalls);
+  // Prose after an accepted call that names the opener is not a second call:
+  // quoted, or bare at a clean stop with auto tool choice.
+  ExpectBailing("<tool_call>ping</tool_call>\nUse `<tool_call>` next time.",
+                "false", "", "Use `<tool_call>` next time.", {{"ping", "{}"}},
+                kCalls);
+  ExpectBailing("<tool_call>ping</tool_call>\nI used <tool_call> above.",
+                "false", "", "I used <tool_call> above.", {{"ping", "{}"}},
+                kCalls);
+  // Closing tags echoed after a call are framing, not content.
+  ExpectBailing("<tool_call>ping</tool_call>\n</arg_value>\n</tool_call>",
+                "false", "", "", {{"ping", "{}"}}, kCalls);
+  ExpectBailing(clean + "\n</arg_value>\n</tool_call>\nDone.", "false", "",
+                "Done.", {{"edit", clean_args}}, kCalls);
+  // A closer spelled inside an argument value is argument text, with reasoning
+  // on or off, whether or not the value holds reasoning markup (strict-tools
+  // check in tests/functional/openai_sdk.py).
+  const std::string literal = "<think>literal</think></tool_call>";
+  const std::string record =
+      "<tool_call>record<arg_key>value</arg_key><arg_value>" + literal +
+      "</arg_value></tool_call>";
+  const std::string record_args =
+      R"({"value":"<think>literal</think></tool_call>"})";
+  ExpectBailing(record, "false", "", "", {{"record", record_args}}, kCalls);
+  ExpectBailing(record, "true", "", "", {{"record", record_args}}, kCalls);
+  ExpectBailing("Recording.\n" + record, "false", "", "Recording.",
+                {{"record", record_args}}, kCalls);
+  ExpectBailing("Need a call.\n" + record, "true", "Need a call.", "",
+                {{"record", record_args}}, kCalls);
+  ExpectBailing("Done.</think>\n" + record + "\nok", "true", "Done.", "ok",
+                {{"record", record_args}}, kCalls);
+  ExpectBailing(record + "\n" + clean, "false", "", "",
+                {{"record", record_args}, {"edit", clean_args}}, kCalls);
+  // The same value with a pretty-printed template spelling.
+  ExpectBailing("<tool_call>record\n<arg_key>value</arg_key>\n<arg_value>" +
+                    literal + "</arg_value>\n</tool_call>",
+                "false", "", "", {{"record", record_args}}, kCalls);
+}
+
+// Messages tools (#469) run through the Chat tool path. A Bailing model's
+// calls are parsed by its own call parser even when tool_choice "any" asks
+// for the constrained-JSON path, buffered and as Anthropic SSE events.
+void TestBailingMessagesTools() {
+  const std::string text =
+      "Plan it.</think>\nChecking.\n<tool_call>edit\n<arg_key>path</arg_key>\n"
+      "<arg_value>a/b.py</arg_value>\n<arg_key>line</arg_key>\n"
+      "<arg_value>12</arg_value>\n</tool_call>";
+  for (const std::string_view choice : {"any", "auto"}) {
+    for (const bool stream : {false, true}) {
+      for (const auto& pieces : {std::vector<std::string>{text}, Chars(text)}) {
+        const auto body = gufo::json::parse(
+            std::string(R"({"max_tokens":64,"tool_choice":{"type":")") +
+            std::string(choice) + R"("},"tools":[{"name":"edit",
+              "input_schema":{"type":"object","properties":{
+                "path":{"type":"string"},"line":{"type":"integer"}}}}]})");
+        gufo::server::ChatRequest chat;
+        chat.messages.emplace_back(gufo::tokenization::ChatRole::kUser, "go");
+        Expect(!gufo::server::ParseAnthropicToolControls(body, &chat),
+               "Messages tools are accepted");
+        FakeBackend backend;
+        backend.syntax =
+            gufo::server::TextGenerationBackend::ToolCallSyntax::kBailing;
+        backend.pieces = pieces;
+        auto response = gufo::server::CreateAnthropicMessage(
+            Request("{}"), backend, chat, 64, {}, stream);
+        Expect(response.status == 200, "Bailing Messages request succeeds");
+        Expect(!backend.last_request.constrained_tools,
+               "Bailing calls bypass the constrained-JSON tool path");
+        std::string thinking, answer, name, input, stop_reason, wire;
+        if (stream) {
+          response.streaming_body([&](std::string_view part) {
+            wire += part;
+            return true;
+          });
+          for (auto data = wire.find("data: "); data != std::string::npos;
+               data = wire.find("data: ", data + 6)) {
+            const auto end = wire.find("\n\n", data);
+            const auto event = gufo::json::parse(
+                std::string_view(wire).substr(data + 6, end - data - 6));
+            if (const auto* block = event.find("content_block");
+                block && block->member_str("type") == "tool_use")
+              name = block->member_str("name");
+            const auto* delta = event.find("delta");
+            if (delta == nullptr)
+              continue;
+            const auto type = delta->member_str("type");
+            if (type == "thinking_delta")
+              thinking += delta->member_str("thinking");
+            else if (type == "text_delta")
+              answer += delta->member_str("text");
+            else if (type == "input_json_delta")
+              input += delta->member_str("partial_json");
+            if (event.member_str("type") == "message_delta")
+              stop_reason = delta->member_str("stop_reason");
+          }
+        } else {
+          wire = response.body;
+          const auto message = gufo::json::parse(response.body);
+          stop_reason = message.member_str("stop_reason");
+          for (const auto& block : message.find("content")->items()) {
+            const auto type = block.member_str("type");
+            if (type == "thinking")
+              thinking += block.member_str("thinking");
+            else if (type == "text")
+              answer += block.member_str("text");
+            else if (type == "tool_use") {
+              name = block.member_str("name");
+              input = block.find("input")->dump();
+            }
+          }
+        }
+        const auto arguments = gufo::json::parse(input);
+        Expect(
+            Trimmed(thinking) == "Plan it." && Trimmed(answer) == "Checking.",
+            "Bailing reasoning and prose become thinking and text blocks");
+        Expect(name == "edit" && arguments.member_str("path") == "a/b.py" &&
+                   arguments.member_double("line", 0) == 12,
+               "a Bailing call becomes a typed tool_use block");
+        Expect(stop_reason == "tool_use", "a Bailing call ends in tool_use");
+        Expect(wire.find("<tool_call>") == std::string::npos &&
+                   wire.find("arg_key") == std::string::npos,
+               "Bailing call markup never reaches the client");
+      }
+    }
+  }
+}
+
+// Messages tool_choice with a Bailing model: a named tool is steered by name
+// and parsed by the Bailing parser, and "none" leaves call markup as text.
+void TestBailingMessagesToolChoice() {
+  const std::string call = "<tool_call>ping</tool_call>";
+  const std::string text = "Hm.</think>\n" + call;
+  const std::string tools = R"("tools":[
+    {"name":"edit","input_schema":{"type":"object","properties":{
+      "path":{"type":"string"}}}},
+    {"name":"ping","input_schema":{"type":"object"}}])";
+  for (const bool stream : {false, true}) {
+    for (const bool none : {false, true}) {
+      const auto body = gufo::json::parse(
+          std::string(R"({"max_tokens":64,"tool_choice":)") +
+          (none ? R"({"type":"none"})" : R"({"type":"tool","name":"ping"})") +
+          "," + tools + "}");
+      gufo::server::ChatRequest chat;
+      chat.messages.emplace_back(gufo::tokenization::ChatRole::kUser, "go");
+      Expect(!gufo::server::ParseAnthropicToolControls(body, &chat),
+             "Messages tool_choice is accepted");
+      FakeBackend backend;
+      backend.syntax =
+          gufo::server::TextGenerationBackend::ToolCallSyntax::kBailing;
+      backend.pieces = Chars(text);
+      auto response = gufo::server::CreateAnthropicMessage(
+          Request("{}"), backend, chat, 64, {}, stream);
+      Expect(response.status == 200, "Bailing Messages request succeeds");
+      std::string wire = response.body;
+      if (stream) {
+        wire.clear();
+        response.streaming_body([&](std::string_view part) {
+          wire += part;
+          return true;
+        });
+      }
+      Expect(!backend.last_request.constrained_tools,
+             "Bailing tool choice never uses the constrained-JSON path");
+      Expect(none ? backend.last_request.tool_choice ==
+                        gufo::server::ChatRequest::ToolChoice::kNone
+                  : backend.last_request.forced_tool_name == "ping",
+             "tool_choice reaches the backend");
+      std::string name, answer, stop_reason;
+      const auto read_block = [&](const gufo::json::Value& block) {
+        const auto type = block.member_str("type");
+        if (type == "tool_use")
+          name = block.member_str("name");
+        else if (type == "text")
+          answer += block.member_str("text");
+      };
+      if (stream) {
+        for (auto data = wire.find("data: "); data != std::string::npos;
+             data = wire.find("data: ", data + 6)) {
+          const auto end = wire.find("\n\n", data);
+          const auto event = gufo::json::parse(
+              std::string_view(wire).substr(data + 6, end - data - 6));
+          if (const auto* block = event.find("content_block"))
+            read_block(*block);
+          const auto* delta = event.find("delta");
+          if (delta == nullptr)
+            continue;
+          if (delta->member_str("type") == "text_delta")
+            answer += delta->member_str("text");
+          if (event.member_str("type") == "message_delta")
+            stop_reason = delta->member_str("stop_reason");
+        }
+      } else {
+        const auto message = gufo::json::parse(wire);
+        stop_reason = message.member_str("stop_reason");
+        for (const auto& block : message.find("content")->items())
+          read_block(block);
+      }
+      if (none) {
+        Expect(name.empty() && Trimmed(answer) == call &&
+                   stop_reason == "end_turn",
+               "tool_choice none leaves Bailing call text alone");
+      } else {
+        Expect(name == "ping" && answer.empty() && stop_reason == "tool_use",
+               "a named tool_choice yields that tool_use block");
+        Expect(wire.find("<tool_call>") == std::string::npos,
+               "Bailing call markup never reaches the client");
+      }
+    }
+  }
+}
+
+// A second call that never finishes: the first is kept and the unfinished
+// markup is withheld at a length stop, a client stop string or a cancel. Only
+// the model's own stop completes a call cut after its name or an argument.
+void TestBailingCutSecondCall() {
+  using Finish = gufo::server::TextGenerationBackend::FinishReason;
+  const std::string first = "Go.\n<tool_call>ping</tool_call>\n";
+  const std::string cut_value =
+      "<tool_call>edit\n<arg_key>path</arg_key>\n<arg_value>a</arg_value>"
+      "\n<arg_key>new</arg_key>\n<arg_value>unfin";
+  const std::string cut_name = "<tool_call>edit";
+  for (const auto reason :
+       {Finish::kLength, Finish::kStopSequence, Finish::kCancelled}) {
+    const auto* finish = reason == Finish::kLength         ? "length"
+                         : reason == Finish::kStopSequence ? "stop"
+                                                           : "tool_calls";
+    for (const auto& tail : {cut_value, cut_name})
+      ExpectBailing(first + tail, "false", "", "Go.", {{"ping", "{}"}}, finish,
+                    reason);
+  }
+  // The model's own stop completes a bare name; the first call stays too.
+  ExpectBailing(first + cut_name, "false", "", "Go.",
+                {{"ping", "{}"}, {"edit", "{}"}}, "tool_calls");
+  // ...but the same cut at a stop string is withheld, as without a first call.
+  ExpectBailing(cut_name, "false", "", "", {}, "stop", Finish::kStopSequence);
+}
+
+// TestToolCallRenderParseRoundTrip for the Bailing dialect: render a
+// historical call through the compiled Bailing V3 template, hand exactly
+// those bytes back as generated text, and require every argument to return
+// unchanged, buffered and streamed one byte at a time.
+void TestBailingRenderParseRoundTrip() {
+  namespace ling = gufo::models::ling_3_flash;
+  const std::vector<std::string> values = {
+      "plain",
+      "ends with a newline\n",
+      "  indented first line\n    and a second\n",
+      "",
+      "\nstarts with a newline",
+      "blank\n\nlines\n\n",
+      "tab\tand trailing space ",
+      "quoted <b>markup</b> and \"quotes\"",
+  };
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    const auto& value = values[index];
+    ling::ChatMessage call{.role = "assistant"};
+    call.tool_calls.push_back(
+        {.name = "edit",
+         .arguments = {{.name = "path", .value = value},
+                       {.name = "line", .value = "3", .is_string = false},
+                       {.name = "dry_run", .value = "true", .is_string = false},
+                       {.name = "new", .value = "x"}}});
+    const std::vector<ling::ChatMessage> history = {
+        {.role = "user", .content = "go"}, call};
+    ling::ChatTemplateOptions options;
+    options.enable_thinking = false;
+    options.add_generation_prompt = false;
+    const auto rendered = ling::RenderChat(history, {}, options);
+    const auto begin = rendered.find("<tool_call>");
+    const auto end_tag = std::string_view("</tool_call>");
+    const auto end = rendered.rfind(end_tag);
+    const std::string label = "Bailing case " + std::to_string(index);
+    Expect(begin != std::string::npos && end != std::string::npos,
+           label + ": Ling renders a historical call");
+    const auto text = rendered.substr(begin, end + end_tag.size() - begin);
+    for (const bool thinking : {false, true}) {
+      const auto generated = thinking ? "Plan.</think>\n" + text : text;
+      for (const bool stream : {false, true}) {
+        for (const auto& pieces :
+             {std::vector<std::string>{generated}, Chars(generated)}) {
+          const auto out =
+              RunBailing(pieces, stream, thinking ? "true" : "false");
+          Expect(out.calls.size() == 1 && out.calls[0].first == "edit",
+                 label + ": the rendered call parses back as one call");
+          const auto arguments = gufo::json::parse(out.calls[0].second);
+          const auto* path = arguments.find("path");
+          const auto* line = arguments.find("line");
+          const auto* dry_run = arguments.find("dry_run");
+          if (!(path != nullptr && path->is_string() &&
+                path->get_str() == value))
+            std::cerr << label << " arguments: " << out.calls[0].second << "\n";
+          Expect(path != nullptr && path->is_string() &&
+                     path->get_str() == value &&
+                     arguments.member_str("new") == "x",
+                 label + ": string arguments survive byte for byte");
+          Expect(line != nullptr && line->is_number() &&
+                     line->as_double() == 3 && dry_run != nullptr &&
+                     dry_run->is_bool() && dry_run->as_bool(),
+                 label + ": typed arguments survive as JSON values");
+          Expect(out.content.empty() && out.finish == "tool_calls",
+                 label + ": call markup never reaches the content");
+        }
+      }
+    }
+  }
+}
+
+void TestBailingResponses() {
+  auto body = gufo::json::parse(BailingBody(false, "false"));
+  const std::string text =
+      "Go.\n<tool_call>edit\n<arg_key>path</arg_key>\n<arg_value>a.py"
+      "</arg_value>\n<arg_key>line</arg_key>\n<arg_value>12</arg_value>\n"
+      "</tool_call>";
+  for (const bool stream : {false, true}) {
+    gufo::server::ChatRequest chat;
+    Expect(!gufo::server::ParseOpenAiResponseControls(body, &chat),
+           "Responses controls parse");
+    FakeBackend backend;
+    backend.syntax =
+        gufo::server::TextGenerationBackend::ToolCallSyntax::kBailing;
+    backend.pieces = Chars(text);
+    const auto response = gufo::server::CreateOpenAiResponse(
+        Request(body.dump()), backend, chat, 256, {}, stream);
+    std::string output = response.body;
+    if (response.streaming_body)
+      response.streaming_body([&](std::string_view part) {
+        output += part;
+        return true;
+      });
+    Expect(output.find("\"name\":\"edit\"") != std::string::npos &&
+               output.find("\\\"line\\\":12") != std::string::npos &&
+               output.find("<tool_call>") == std::string::npos &&
+               output.find("Go.") != std::string::npos,
+           "Responses parses Bailing calls and keeps prose");
+    Expect(!backend.last_request.constrained_tools,
+           "Responses does not constrain Bailing tools");
+  }
+  // A call cut by the token limit right after its header (the functional
+  // suite's responses_tool_limit_1) is no function_call output item, with
+  // tool_choice required, streamed or buffered.
+  {
+    auto limited = gufo::json::parse(
+        BailingBody(false, "false", R"(,"tool_choice":"required")"));
+    limited["max_output_tokens"] = 1;
+    for (const bool stream : {false, true}) {
+      gufo::server::ChatRequest chat;
+      Expect(!gufo::server::ParseOpenAiResponseControls(limited, &chat),
+             "limited Responses controls parse");
+      FakeBackend backend;
+      backend.syntax =
+          gufo::server::TextGenerationBackend::ToolCallSyntax::kBailing;
+      backend.finish_reason =
+          gufo::server::TextGenerationBackend::FinishReason::kLength;
+      backend.pieces =
+          Chars("<tool_call>record\n<arg_key>value</arg_key>\n<arg_");
+      const auto response = gufo::server::CreateOpenAiResponse(
+          Request(limited.dump()), backend, chat, 1, {}, stream);
+      std::string output = response.body;
+      if (response.streaming_body)
+        response.streaming_body([&](std::string_view part) {
+          output += part;
+          return true;
+        });
+      Expect(output.find("function_call") == std::string::npos &&
+                 output.find("max_output_tokens") != std::string::npos,
+             "a Bailing call cut after its header is not an output item");
+    }
+  }
+  // required without a call after headers are sent: an error event.
+  FakeBackend backend;
+  backend.syntax =
+      gufo::server::TextGenerationBackend::ToolCallSyntax::kBailing;
+  backend.pieces = {"just prose"};
+  const auto response = gufo::server::HandleOpenAiChat(
+      Request(BailingBody(true, "false", R"(,"tool_choice":"required")")),
+      backend);
+  Expect(response.status == 200 && response.streaming_body,
+         "streaming starts before the failure is known");
+  std::string output;
+  response.streaming_body([&](std::string_view part) {
+    output += part;
+    return true;
+  });
+  Expect(output.find("tool_choice_unsatisfied") != std::string::npos &&
+             output.find("[DONE]") != std::string::npos,
+         "streaming required failure is reported in-band");
+}
+
+void TestBailingModes() {
+  using Finish = gufo::server::TextGenerationBackend::FinishReason;
+  // Length stop: unfinished markup is withheld, not shown or executed.
+  const std::string partial =
+      "ok\n<tool_call>edit\n<arg_key>path</arg_key>\n<arg_value>a</arg_value>"
+      "\n<arg_key>new</arg_key>\n<arg_value>unfin";
+  for (const bool stream : {false, true}) {
+    const auto out =
+        RunBailing(Chars(partial), stream, "false", {}, Finish::kLength);
+    // A stream has already published the arguments written so far.
+    Expect((stream ? out.calls.size() <= 1 : out.calls.empty()) &&
+               out.finish == "length",
+           "length stop yields no complete call");
+    Expect(out.content.find("<arg_key>") == std::string::npos,
+           "unfinished call markup is hidden after a length stop");
+  }
+  // tool_choice none: the call text stays content.
+  const std::string text = "<tool_call>ping</tool_call>";
+  for (const bool stream : {false, true}) {
+    const auto none =
+        RunBailing({text}, stream, "false", R"(,"tool_choice":"none")");
+    Expect(none.calls.empty() && none.content == text,
+           "tool_choice none leaves the text alone");
+    const auto named = RunBailing(
+        {text}, stream, "false",
+        R"(,"tool_choice":{"type":"function","function":{"name":"ping"}})");
+    Expect(named.calls.size() == 1 && named.calls[0].first == "ping",
+           "named tool choice");
+  }
+  // required without any call after a clean stop is an error, not silence.
+  FakeBackend backend;
+  backend.syntax =
+      gufo::server::TextGenerationBackend::ToolCallSyntax::kBailing;
+  backend.pieces = {"just prose"};
+  const auto response = gufo::server::HandleOpenAiChat(
+      Request(BailingBody(false, "false", R"(,"tool_choice":"required")")),
+      backend);
+  Expect(response.status != 200, "required tool choice is enforced");
+  // reasoning_effort maps onto the thinking switch; defaults to thinking on.
+  for (const auto* effort : {"low", "medium", "high"}) {
+    backend.pieces = {"x</think>y"};
+    const auto ok = gufo::server::HandleOpenAiChat(
+        Request(BailingBody(
+            false, "",
+            std::string(R"(,"reasoning_effort":")") + effort + "\"")),
+        backend);
+    Expect(ok.status == 200 && backend.last_request.reasoning.enabled == true,
+           "reasoning_effort levels keep thinking on");
+  }
+  const auto off = gufo::server::HandleOpenAiChat(
+      Request(BailingBody(false, "", R"(,"reasoning_effort":"none")")),
+      backend);
+  Expect(off.status == 200 && backend.last_request.reasoning.enabled == false,
+         "reasoning_effort none turns thinking off");
+  // Hermes-style temperature 0 is greedy.
+  backend.pieces = {"ok"};
+  gufo::server::HandleOpenAiChat(
+      Request(BailingBody(false, "false", R"(,"temperature":0)")), backend);
+  Expect(backend.last_temperature == 0.0F, "temperature 0 is greedy");
+  // The model's tools are not grammar-constrained.
+  Expect(!backend.last_request.constrained_tools,
+         "Bailing tools are parsed, not constrained");
+}
+
 // Issue #383: the model repeats the closing framing of a call it just made, and
 // a client that stores assistant content replays that markup as history on
 // every later turn. Issue #266: the same framing folded into an argument value
@@ -5495,6 +6462,133 @@ void TestBracketDenseContent() {
     });
     Expect(content == dense + tail,
            "the streaming path retains bracket-dense prose and its tail");
+  }
+}
+
+// Text the Bailing tool grammar admits must parse into the call it encodes,
+// including the openai_sdk check_strict_tools const value that holds the
+// call closer and reasoning tags, and calls that end reasoning implicitly.
+void TestBailingGrammarOutputParses() {
+  using Constraint = gufo::sampling::JsonConstraint;
+  using Format = Constraint::ToolFormat;
+  constexpr std::string_view kLiteral = "<think>literal</think></tool_call>";
+  auto parameters = gufo::json::parse(R"({"type":"object","properties":{
+    "value":{"type":"string"},"n":{"type":"integer","minimum":1,"maximum":5},
+    "note":{"type":["string","null"]}},
+    "required":["value","n","note"],"additionalProperties":false})");
+  parameters["properties"]["value"]["const"] = std::string(kLiteral);
+  auto tool = gufo::json::parse(R"({"type":"function","function":{
+    "name":"record","strict":true}})");
+  tool["function"]["parameters"] = parameters;
+  const auto grammar_with_reasoning =
+      Constraint::WithReasoning(Constraint::WithTools(
+          nullptr,
+          {{"record",
+            Constraint::ToolParameters(parameters, true, Format::kBailing)}},
+          true, false, Format::kBailing));
+  const std::string value = "<arg_key>value</arg_key>\n<arg_value>" +
+                            std::string(kLiteral) + "</arg_value>";
+  const std::string n = "<arg_key>n</arg_key>\n<arg_value>3</arg_value>";
+  const std::string note =
+      "<arg_key>note</arg_key>\n<arg_value>null</arg_value>";
+  const std::string call =
+      "<tool_call>record\n" + value + "\n" + n + "\n" + note + "\n</tool_call>";
+  const std::string tidy =
+      "<tool_call>record" + note + n + value + "</tool_call>";
+  const auto content_grammar = Constraint::WithTools(
+      nullptr,
+      {{"record",
+        Constraint::ToolParameters(parameters, true, Format::kBailing)}},
+      true, false, Format::kBailing);
+  const std::vector<std::pair<std::string, bool>> outputs{
+      {"Plan.</think>\n" + call, true},
+      {"Plan.\n" + call, true},
+      {"Plan.\n" + call + "</think>", true},
+      {"Plan.</think>" + tidy, true},
+      {call, false},
+      {"\n" + tidy, false}};
+  for (const auto& [text, thinking] : outputs) {
+    const auto& grammar = thinking ? grammar_with_reasoning : content_grammar;
+    auto state = grammar->Start();
+    for (const unsigned char byte : text)
+      state = grammar->Advance(state, byte);
+    Expect(grammar->Complete(state), "the Bailing grammar admits the call");
+    for (const bool stream : {false, true}) {
+      FakeBackend backend;
+      backend.syntax =
+          gufo::server::TextGenerationBackend::ToolCallSyntax::kBailing;
+      backend.pieces = Chars(text);
+      backend.tool_format = Format::kBailing;
+      auto body = gufo::json::parse(
+          R"({"model":"test-model","messages":[{"role":"user",
+          "content":"Call record once with the required value."}],
+          "tool_choice":"required","parallel_tool_calls":false})");
+      body["stream"] = stream;
+      body["chat_template_kwargs"] = gufo::json::Value::object();
+      body["chat_template_kwargs"]["enable_thinking"] = thinking;
+      body["tools"] = gufo::json::Value::array();
+      body["tools"].push_back(tool);
+      const auto response =
+          gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+      Expect(response.status == 200, "the grammar's call is a valid answer");
+      std::string output = response.body;
+      if (response.streaming_body)
+        response.streaming_body([&](std::string_view part) {
+          output += part;
+          return true;
+        });
+      std::string argument_text;
+      std::size_t calls = 0;
+      std::string content;
+      const auto read = [&](const gufo::json::Value& message) {
+        content += message.member_str("content");
+        if (const auto* list = message.find("tool_calls"))
+          for (const auto& item : list->items()) {
+            const auto* function = item.find("function");
+            if (!function)
+              continue;
+            if (function->find("name")) {
+              ++calls;
+              Expect(function->member_str("name") == "record",
+                     "the call keeps its declared name");
+            }
+            if (const auto* text = function->find("arguments"))
+              argument_text += text->get_str();
+          }
+      };
+      if (!stream) {
+        read(*gufo::json::parse(output).find("choices")->items()[0].find(
+            "message"));
+      } else {
+        for (std::size_t at = 0;
+             (at = output.find("data: ", at)) != std::string::npos;) {
+          const auto end = output.find('\n', at);
+          const auto payload = output.substr(at + 6, end - at - 6);
+          at = end;
+          if (payload == "[DONE]")
+            break;
+          const auto event = gufo::json::parse(payload);
+          if (const auto* choices = event.find("choices");
+              choices && !choices->empty())
+            if (const auto* delta = choices->items()[0].find("delta"))
+              read(*delta);
+        }
+      }
+      Expect(calls == 1, "exactly one Bailing call is reported");
+      // Streamed arguments arrive in fragments.
+      const auto arguments = gufo::json::parse(argument_text);
+      Expect(arguments.member_str("value") == kLiteral,
+             "the const value survives the parser unchanged");
+      Expect(arguments.find("n") && arguments.find("n")->is_number() &&
+                 arguments.find("n")->as_double() == 3,
+             "integer arguments are JSON numbers");
+      Expect(arguments.find("note") && arguments.find("note")->is_null(),
+             "a nullable string reads null as null");
+      if (!content.empty())
+        std::cerr << "content: " << content << "\n";
+      Expect(content.empty(),
+             "reasoning and call markup stay out of the content");
+    }
   }
 }
 
@@ -6271,6 +7365,14 @@ void TestParallelCallSeparatorIsNotContent() {
 }
 
 int main() {
+  TestBailingToolCalls();
+  TestBailingMessagesTools();
+  TestBailingMessagesToolChoice();
+  TestBailingGrammarOutputParses();
+  TestBailingModes();
+  TestBailingCutSecondCall();
+  TestBailingResponses();
+  TestBailingRenderParseRoundTrip();
   TestToolCallRenderParseRoundTrip();
   TestToolTagBoundaries();
   TestStreamingQuotedAndMalformedTools();

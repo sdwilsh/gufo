@@ -31,6 +31,7 @@
 #include "src/core/utf8.hpp"
 #include "src/models/deepseek_v4_flash/chat_template.hpp"
 #include "src/models/deepseek_v4_flash/tool_calls.hpp"
+#include "src/models/ling_3_flash/tool_calls.hpp"
 #include "src/models/qwen/chat_template.hpp"
 
 namespace gufo::server {
@@ -62,6 +63,8 @@ namespace {
 
 struct ParsedChatRequest {
   ChatRequest chat;
+  // HTTP request id, for the debug generation log.
+  std::string request_id;
   std::string model;
   std::size_t max_tokens{0};
   sampling::SamplingConfig sampling;
@@ -79,10 +82,15 @@ struct ParsedToolCall {
 
 struct ParsedGeneration {
   std::string text;
+  /// Prose outside the calls, after the first one. The text before it is
+  /// `text`, which streaming has already emitted by the time calls are known.
+  std::string trailing_text;
   std::string reasoning_content;
   std::vector<ParsedToolCall> tool_calls;
   bool hide_tool_markup{false};
 };
+
+using ToolSyntax = TextGenerationBackend::ToolCallSyntax;
 
 constexpr std::array<std::string_view, 7> kToolMarkers{
     tokenization::QwenToolSyntax::kCallOpen,
@@ -95,11 +103,25 @@ constexpr std::array<std::string_view, 7> kToolMarkers{
 };
 using ToolMarkerSet = std::span<const std::string_view>;
 
+// Qwen and Bailing share the opener but not the dialect. Code identifies a
+// marker set by these arrays, not by its spelling.
+constexpr std::array<std::string_view, 1> kQwenMarkers{
+    tokenization::QwenToolSyntax::kCallOpen};
+constexpr std::array<std::string_view, 1> kBailingMarkers{
+    models::ling_3_flash::BailingToolSyntax::kCallOpen};
+
+bool IsQwenMarkers(ToolMarkerSet markers) {
+  return markers.data() == kQwenMarkers.data();
+}
+
 ToolMarkerSet ToolMarkers(
-    std::optional<sampling::JsonConstraint::ToolFormat> format) {
+    std::optional<sampling::JsonConstraint::ToolFormat> format,
+    ToolSyntax syntax = ToolSyntax::kDefault) {
   using Format = sampling::JsonConstraint::ToolFormat;
-  static constexpr std::array<std::string_view, 1> qwen{
-      tokenization::QwenToolSyntax::kCallOpen};
+  static constexpr const auto& qwen = kQwenMarkers;
+  // Bailing output admits only its own opener, constrained or not.
+  if (syntax == ToolSyntax::kBailing)
+    return kBailingMarkers;
   // The template writes "\n\n" before the call block. As in llama.cpp
   // common/parsers/deepseek.cpp (TC_SEPARATOR + FC_START), that separator is
   // framing: returning it as content would double it when history is replayed.
@@ -126,8 +148,9 @@ ToolMarkerSet ReasoningToolMarkers(ToolMarkerSet markers) {
       models::deepseek_v4_flash::DeepSeekToolSyntax::
           kNativeCallOpenWithSeparator,
       models::deepseek_v4_flash::DeepSeekToolSyntax::kNativeCallOpen};
-  if (markers.size() == 1 &&
-      markers.front() == tokenization::QwenToolSyntax::kCallOpen)
+  // Bailing's implicit boundary (an unquoted opener before a declared name) is
+  // read by its own parser, which the structured path does not use.
+  if (IsQwenMarkers(markers))
     return qwen;
   if (markers.size() == 2 &&
       markers.back() ==
@@ -143,6 +166,13 @@ constexpr std::array<std::string_view, 4> kQwenClosers{
     tokenization::QwenToolSyntax::kFunctionClose,
     tokenization::QwenToolSyntax::kCallClose,
     // The client's envelope, whose block rules already strip it whole.
+    "</invoke>",
+};
+constexpr std::array<std::string_view, 4> kBailingClosers{
+    models::ling_3_flash::BailingToolSyntax::kKeyClose,
+    models::ling_3_flash::BailingToolSyntax::kValueClose,
+    models::ling_3_flash::BailingToolSyntax::kCallClose,
+    // The client's envelope, as for the Qwen closers.
     "</invoke>",
 };
 constexpr std::array<std::string_view, 9> kToolClosers{
@@ -163,8 +193,12 @@ constexpr std::array<std::string_view, 9> kToolClosers{
 using ToolCloserSet = std::span<const std::string_view>;
 
 ToolCloserSet ToolClosers(
-    std::optional<sampling::JsonConstraint::ToolFormat> format) {
+    std::optional<sampling::JsonConstraint::ToolFormat> format,
+    ToolSyntax syntax = ToolSyntax::kDefault) {
   using Format = sampling::JsonConstraint::ToolFormat;
+  // Bailing writes Qwen-style call blocks and no other dialect.
+  if (syntax == ToolSyntax::kBailing)
+    return kBailingClosers;
   if (!format)
     return kToolClosers;
   // As in llama.cpp, DeepSeek content is everything outside its native call
@@ -1020,10 +1054,11 @@ std::string_view Trim(std::string_view value) {
 std::string_view AfterReasoningSeparator(std::string_view value,
                                          ToolMarkerSet markers) {
   // Qwen's llama.cpp PEG uses `reasoning << content`: `<<` consumes space().
-  // Keep other dialects' existing line-break rule. Only the boundary after an
-  // explicit </think> is framing; answer and argument interiors are untouched.
-  const bool qwen = markers.size() == 1 &&
-                    markers.front() == tokenization::QwenToolSyntax::kCallOpen;
+  // Keep other dialects' existing line-break rule (Bailing's template reads
+  // content as `split('</think>')[-1].lstrip('\n')`). Only the boundary after
+  // an explicit </think> is framing; answer and argument interiors are
+  // untouched.
+  const bool qwen = IsQwenMarkers(markers);
   const auto first = value.find_first_not_of(qwen ? " \t\r\n\f\v" : "\r\n");
   return first == std::string_view::npos ? std::string_view{}
                                          : value.substr(first);
@@ -1748,12 +1783,117 @@ void ParseDsmlCalls(
     break;
   }
 }
+
+// Converts scanned Bailing arguments to the shared API form.
+std::vector<tokenization::ChatMessage::ToolArgument> BailingArguments(
+    std::span<const models::ling_3_flash::ChatMessage::ToolArgument>
+        arguments) {
+  std::vector<tokenization::ChatMessage::ToolArgument> converted;
+  converted.reserve(arguments.size());
+  for (const auto& argument : arguments)
+    converted.push_back({.name = argument.name,
+                         .value = argument.value,
+                         .is_string = argument.is_string});
+  return converted;
+}
+
+std::string BailingProse(std::string_view text,
+                         const models::ling_3_flash::BailingScan& scan,
+                         bool include_rejected) {
+  std::vector<std::pair<std::size_t, std::size_t>> spans;
+  for (const auto& call : scan.calls)
+    spans.emplace_back(call.begin, call.end);
+  if (!include_rejected)
+    spans.insert(spans.end(), scan.rejected.begin(), scan.rejected.end());
+  std::ranges::sort(spans);
+  std::string prose;
+  std::size_t cursor = 0;
+  for (const auto& [begin, end] : spans) {
+    if (begin > cursor)
+      prose += text.substr(cursor, begin - cursor);
+    cursor = std::max(cursor, end);
+  }
+  prose += text.substr(cursor);
+  return prose;
+}
+
+/// How generation ended, as far as Bailing call recovery cares.
+struct GenerationEnd {
+  /// The model itself stopped (EOS); a call cut after a complete argument or
+  /// right after its name was finished by the model.
+  bool model_stopped{false};
+  /// The token limit cut the output; unfinished markup stays hidden.
+  bool truncated{false};
+};
+
+GenerationEnd EndOf(TextGenerationBackend::FinishReason reason) {
+  return {.model_stopped = reason == TextGenerationBackend::FinishReason::kStop,
+          // A client stop string or cancellation cuts the output like the
+          // token limit does: unfinished markup is withheld.
+          .truncated = reason != TextGenerationBackend::FinishReason::kStop};
+}
+
+// Adds the Bailing calls of `text_from_tools` (parsed.text from `marker`) to
+// `parsed`, with the prose around them as its trailing text.
+void ParseBailingCalls(
+    ParsedGeneration& parsed, std::string_view text_from_tools,
+    std::size_t marker, std::span<const tokenization::ChatTool> tools,
+    ChatRequest::ToolChoice choice,
+    TextGenerationBackend::InitialOutputState initial_output_state,
+    GenerationEnd end, bool partial) {
+  // Declared tools are the contract only for tool_choice required/named;
+  // under auto an unknown name still becomes a call so the client's
+  // unknown-tool error path can answer it (vLLM would drop it).
+  QuoteTracker call_quotes;
+  call_quotes.Reset(parsed.text);
+  const auto scan = models::ling_3_flash::ScanBailingToolCalls(
+      text_from_tools, models::ling_3_flash::BailingTools(tools),
+      end.model_stopped, choice == ChatRequest::ToolChoice::kAuto,
+      [&](std::size_t at) {
+        return call_quotes.QuotedAt(marker + at) ||
+               (partial && call_quotes.UnclosedAt(marker + at));
+      },
+      partial,
+      // Argument bytes belong to the call, not to prose quotation: an
+      // unmatched backtick in a value must not quote the next call.
+      [&](std::size_t end) { call_quotes.Reset(parsed.text, marker + end); });
+  for (const auto& call : scan.calls) {
+    ParsedToolCall converted;
+    converted.id = RandomId("call_");
+    converted.name = call.name;
+    converted.arguments = BailingArguments(call.arguments);
+    if (call.partial) {
+      converted.partial_arguments = ArgumentsPrefix(converted);
+      if (call.pending)
+        PartialStringArgument(converted, call.pending->first,
+                              call.pending->second);
+    }
+    parsed.tool_calls.push_back(std::move(converted));
+  }
+  // Prose between and after calls stays content. After a clean stop a
+  // malformed call is reported there too instead of silently vanishing;
+  // after a length stop unfinished markup is withheld.
+  if (!parsed.tool_calls.empty()) {
+    parsed.trailing_text = BailingProse(text_from_tools, scan, !end.truncated);
+    if (initial_output_state ==
+        TextGenerationBackend::InitialOutputState::kReasoning) {
+      // After the reasoning phase a stray </think> is swallowed, as in
+      // vLLM's CONTENT/THINK_END transition (e.g. `<tool_call>..` closed
+      // reasoning implicitly and the model still writes </think>).
+      for (std::size_t at;
+           (at = parsed.trailing_text.find("</think>")) != std::string::npos;)
+        parsed.trailing_text.erase(at, 8);
+    }
+  }
+}
+
 ParsedGeneration ParseGeneration(
     std::string_view raw,
     TextGenerationBackend::InitialOutputState initial_output_state,
     std::span<const tokenization::ChatTool> tools,
     ChatRequest::ToolChoice choice, bool enforce_required,
     ToolMarkerSet markers, ToolCloserSet closers, QuoteTracker& quotes,
+    ToolSyntax syntax = ToolSyntax::kDefault, GenerationEnd end = {},
     bool partial = false) {
   quotes.Reset(raw);
   ParsedGeneration parsed;
@@ -1762,11 +1902,18 @@ ParsedGeneration ParseGeneration(
   bool unfinished_reasoning_quote = false;
   const bool recognize_tools =
       !tools.empty() && choice != ChatRequest::ToolChoice::kNone;
-  const auto tool_marker = [recognize_tools, markers,
+  // Where a call may end the reasoning phase. Bailing follows its grammar's
+  // reasoning lexeme (JsonConstraint::WithReasoning): an opener inside quoted
+  // reasoning, including an unfinished inline or fenced quote, stays
+  // reasoning, as ReasoningToolMarker reads it for the structured path.
+  const auto tool_marker = [recognize_tools, markers, syntax,
                             &quotes](std::string_view text) {
     quotes.Reset(text);
-    return recognize_tools ? EarliestMarker(text, markers, quotes)
-                           : std::string_view::npos;
+    if (!recognize_tools)
+      return std::string_view::npos;
+    return syntax == ToolSyntax::kBailing
+               ? ReasoningToolMarker(text, markers, quotes)
+               : EarliestMarker(text, markers, quotes);
   };
 
   if (initial_output_state ==
@@ -1855,32 +2002,38 @@ ParsedGeneration ParseGeneration(
     // The outer envelope selects the format, as in llama.cpp's model parsers.
     // Scanning both dialects would turn a literal call inside an argument into
     // an additional API invocation.
-    if (text_from_tools.starts_with(tokenization::QwenToolSyntax::kCallOpen))
+    if (syntax == ToolSyntax::kBailing) {
+      ParseBailingCalls(parsed, text_from_tools, marker, tools, choice,
+                        initial_output_state, end, partial);
+    } else if (text_from_tools.starts_with(
+                   tokenization::QwenToolSyntax::kCallOpen)) {
       ParseQwenCalls(parsed.text, tools, &parsed.tool_calls, nullptr,
                      unfinished_reasoning_quote, partial);
-    else
+    } else {
       ParseDsmlCalls(
           text_from_tools, markers, tools, &parsed.tool_calls, &spans,
           partial && !unfinished_reasoning_quote && !quotes.UnclosedAt(marker));
-    std::erase_if(parsed.tool_calls, [&](const auto& call) {
-      return std::ranges::none_of(
-          tools, [&](const auto& tool) { return tool.name == call.name; });
-    });
+    }
+    if (syntax != ToolSyntax::kBailing)
+      std::erase_if(parsed.tool_calls, [&](const auto& call) {
+        return std::ranges::none_of(
+            tools, [&](const auto& tool) { return tool.name == call.name; });
+      });
     if (parsed.tool_calls.empty() && unfinished_reasoning_quote &&
         choice != ChatRequest::ToolChoice::kRequired) {
       // The tentative implicit end of reasoning was an invalid quoted example.
       // Preserve it in its original phase, including a later explicit boundary.
-      const auto end = reasoning_call_context.find(kThinkEnd);
-      if (end != std::string_view::npos) {
+      const auto think_end = reasoning_call_context.find(kThinkEnd);
+      if (think_end != std::string_view::npos) {
         parsed = ParseGeneration(
-            reasoning_call_context.substr(end + kThinkEnd.size()),
+            reasoning_call_context.substr(think_end + kThinkEnd.size()),
             TextGenerationBackend::InitialOutputState::kContent, tools, choice,
-            enforce_required, markers, closers, quotes, partial);
+            enforce_required, markers, closers, quotes, syntax, end, partial);
       } else {
         parsed.text.clear();
       }
       parsed.reasoning_content =
-          std::string(reasoning_call_context.substr(0, end));
+          std::string(reasoning_call_context.substr(0, think_end));
       return parsed;
     }
     if (parsed.tool_calls.empty() && quotes.UnclosedAt(marker) &&
@@ -1895,10 +2048,10 @@ ParsedGeneration ParseGeneration(
       const std::string full = std::move(parsed.text);
       std::string text(ContentBefore(full, 0, marker, closers, quotes, tools));
       std::size_t cursor = marker;
-      for (const auto& [begin, end] : spans) {
-        text += ContentBefore(full, cursor, marker + begin, closers, quotes,
-                              tools, cursor > marker);
-        cursor = marker + end;
+      for (const auto& [span_begin, span_end] : spans) {
+        text += ContentBefore(full, cursor, marker + span_begin, closers,
+                              quotes, tools, cursor > marker);
+        cursor = marker + span_end;
       }
       if (!spans.empty()) {
         auto unfinished = EarliestMarker(full, markers, quotes, cursor);
@@ -1912,6 +2065,13 @@ ParsedGeneration ParseGeneration(
       }
       parsed.text = std::move(text);
       parsed.hide_tool_markup = true;
+      if (syntax == ToolSyntax::kBailing && !parsed.trailing_text.empty()) {
+        // Framing echoed after a Bailing call is dropped like any other.
+        quotes.Reset(parsed.trailing_text);
+        parsed.trailing_text = std::string(
+            ContentBefore(parsed.trailing_text, 0, parsed.trailing_text.size(),
+                          closers, quotes, tools, true));
+      }
     }
   } else if (recognize_tools) {
     // No marker: the text is content, but the framing it carries still goes.
@@ -1932,6 +2092,7 @@ ParsedGeneration ParseStructuredGeneration(
     std::span<const tokenization::ChatTool> tools,
     ChatRequest::ToolChoice choice, bool enforce_required, bool tool_only,
     ToolMarkerSet markers, ToolCloserSet closers, QuoteTracker& quotes,
+    ToolSyntax syntax = ToolSyntax::kDefault, GenerationEnd end = {},
     bool partial = false) {
   ParsedGeneration parsed;
   if (initial == TextGenerationBackend::InitialOutputState::kAuto) {
@@ -1966,6 +2127,19 @@ ParsedGeneration ParseStructuredGeneration(
   }
   const auto content = tool_only ? raw : Trim(raw);
   quotes.Reset(content);
+  // Bailing calls beside a response schema: the grammar admits one call or
+  // the JSON answer, which cannot begin with the opener, so a leading opener
+  // is a call in the model's own syntax.
+  if (syntax == ToolSyntax::kBailing && !tools.empty() &&
+      choice != ChatRequest::ToolChoice::kNone &&
+      EarliestMarker(content, markers, quotes) == 0) {
+    auto native = ParseGeneration(
+        content, TextGenerationBackend::InitialOutputState::kContent, tools,
+        choice, enforce_required, markers, closers, quotes, syntax, end,
+        partial);
+    native.reasoning_content = std::move(parsed.reasoning_content);
+    return native;
+  }
   if (const auto marker = EarliestMarker(content, markers, quotes);
       !tools.empty() && choice != ChatRequest::ToolChoice::kNone &&
       (tool_only || marker == 0) && marker != std::string_view::npos &&
@@ -1973,7 +2147,8 @@ ParsedGeneration ParseStructuredGeneration(
           tokenization::QwenToolSyntax::kCallOpen)) {
     auto native = ParseGeneration(
         content, TextGenerationBackend::InitialOutputState::kContent, tools,
-        choice, enforce_required, markers, closers, quotes, partial);
+        choice, enforce_required, markers, closers, quotes, syntax, end,
+        partial);
     native.reasoning_content = std::move(parsed.reasoning_content);
     return native;
   }
@@ -2095,6 +2270,14 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
     metrics["cache_common_prefix_tokens"] = result.cache_common_prefix_tokens;
     metrics["cache_checkpoint_tokens"] = result.cache_checkpoint_tokens;
   }
+  metrics["request_seq"] = result.request_seq;
+  metrics["previous_prompt_tokens"] = result.previous_prompt_tokens;
+  metrics["previous_common_prefix_tokens"] =
+      result.previous_common_prefix_tokens;
+  json::Value overlaps = json::Value::object();
+  for (const auto& [seq, common] : result.recent_prefix_overlaps)
+    overlaps[std::to_string(seq)] = common;
+  metrics["recent_prefix_overlaps"] = std::move(overlaps);
   metrics["cache_restore_bytes"] = result.cache_restore_bytes;
   metrics["cache_snapshot_bytes"] = result.cache_snapshot_bytes;
   metrics["cache_disk_queued_bytes"] = result.cache_disk_queued_bytes;
@@ -2146,6 +2329,48 @@ json::Value ToolCallsJson(std::span<const ParsedToolCall> calls) {
   return output;
 }
 
+// Debug only: what the model wrote, then what the parser made of it, so a
+// failed client check can be traced from the server log. The raw line comes
+// first because a parse that rejects the output (tool_choice unsatisfied)
+// still has it.
+constexpr std::size_t kLoggedGenerationBytes = 32768;
+
+std::string LoggedText(std::string_view text) {
+  if (text.size() <= kLoggedGenerationBytes)
+    return json::Value(std::string(text)).dump();
+  return json::Value(std::string(text.substr(0, kLoggedGenerationBytes)))
+             .dump() +
+         "...[+" + std::to_string(text.size() - kLoggedGenerationBytes) +
+         " bytes]";
+}
+
+void LogRawGeneration(std::string_view request_id, std::string_view raw,
+                      TextGenerationBackend::FinishReason finish) {
+  if (!Logger::Enabled(LogLevel::kDebug))
+    return;
+  using Finish = TextGenerationBackend::FinishReason;
+  const char* reason = finish == Finish::kStop           ? "stop"
+                       : finish == Finish::kStopSequence ? "stop_sequence"
+                       : finish == Finish::kLength       ? "length"
+                                                         : "cancelled";
+  Logger::Debug("chat", "request=" + std::string(request_id) +
+                            " event=generation finish=" + reason +
+                            " raw=" + LoggedText(raw));
+}
+
+void LogParsedGeneration(std::string_view request_id,
+                         const ParsedGeneration& parsed) {
+  if (!Logger::Enabled(LogLevel::kDebug))
+    return;
+  Logger::Debug("chat",
+                "request=" + std::string(request_id) +
+                    " event=parsed content=" + LoggedText(parsed.text) +
+                    " trailing=" + LoggedText(parsed.trailing_text) +
+                    " reasoning_bytes=" +
+                    std::to_string(parsed.reasoning_content.size()) +
+                    " tool_calls=" + ToolCallsJson(parsed.tool_calls).dump());
+}
+
 std::string Sse(const json::Value& value) {
   return "data: " + value.dump() + "\n\n";
 }
@@ -2187,8 +2412,10 @@ public:
       TextGenerationBackend::InitialOutputState initial_output_state,
       EmitCallback emit_piece, bool structured, bool tool_only,
       bool recognize_tools, ToolMarkerSet markers, ToolCloserSet closers,
-      std::span<const tokenization::ChatTool> tools)
+      std::span<const tokenization::ChatTool> tools,
+      bool hold_trailing_space = false)
       : emit_piece_(std::move(emit_piece)),
+        hold_trailing_space_(hold_trailing_space),
         raw_content_(structured || tool_only),
         tool_only_(tool_only),
         recognize_tools_(recognize_tools),
@@ -2263,9 +2490,12 @@ public:
                                       : think_found - offset;
       const auto thinking_markers =
           raw_content_ ? ReasoningToolMarkers(markers_) : markers_;
+      // Structured output and Bailing calls (hold_trailing_space_) end the
+      // reasoning only outside quoted reasoning text, as their grammars and
+      // final parses do.
       const auto found =
           !recognize_tools_ ? std::string::npos
-          : raw_content_
+          : raw_content_ || hold_trailing_space_
               ? ReasoningToolMarker(raw_, thinking_markers, quotes_, offset)
               : EarliestMarker(raw_, thinking_markers, quotes_, offset);
       const std::size_t marker =
@@ -2330,20 +2560,27 @@ public:
       const std::size_t marker =
           found == std::string::npos ? std::string::npos : found - offset;
       if (marker != std::string::npos) {
-        const auto prose =
-            recognize_tools_
-                ? ContentBefore(raw_, offset, found, closers_, quotes_, tools_)
-                : std::string_view(pending_).substr(0, marker);
+        // The space before a Bailing call belongs to the content/call
+        // boundary; it is settled with the prose after the calls (see Finish).
+        std::size_t cut = marker;
+        while (hold_trailing_space_ && cut > 0 &&
+               std::isspace(static_cast<unsigned char>(pending_[cut - 1])) != 0)
+          --cut;
+        const auto prose = recognize_tools_
+                               ? ContentBefore(raw_, offset, offset + cut,
+                                               closers_, quotes_, tools_)
+                               : std::string_view(pending_).substr(0, cut);
         if (!prose.empty() && !Emit(prose, false)) {
           return false;
         }
-        hidden_ = pending_.substr(marker);
+        content_emitted_ = content_emitted_ || !prose.empty();
+        hidden_ = pending_.substr(cut);
         pending_.clear();
         tool_mode_ = true;
         return true;
       }
 
-      const std::size_t held =
+      std::size_t held =
           recognize_tools_
               ? std::min(std::max(HeldMarkerPrefix(raw_, raw_.size(), markers_,
                                                    quotes_),
@@ -2351,7 +2588,13 @@ public:
                                               closers_, quotes_, tools_)),
                          pending_.size())
               : 0;
+      while (hold_trailing_space_ && recognize_tools_ &&
+             held < pending_.size() &&
+             std::isspace(static_cast<unsigned char>(
+                 pending_[pending_.size() - held - 1])) != 0)
+        ++held;
       const std::size_t ready = pending_.size() - held;
+      content_emitted_ = content_emitted_ || ready > 0;
       if (ready > 0 && !Emit(pending_.substr(0, ready), false)) {
         return false;
       }
@@ -2363,12 +2606,19 @@ public:
   }
 
   bool Finish(bool hide_tool_markup, std::string_view content = {},
-              std::string_view reasoning = {}) {
+              std::string_view reasoning = {}, std::string_view trailing = {}) {
     if (tool_mode_ && state_ == State::kThinking) {
       const auto tail = reasoning.substr(
           std::min(emitted_reasoning_bytes_, reasoning.size()));
-      return (tail.empty() || Emit(tail, true)) &&
-             (content.empty() || Emit(content, false));
+      if (!tail.empty() && !Emit(tail, true))
+        return false;
+      // Bailing: prose after the calls follows the content; the model's own
+      // surrounding whitespace is not part of either.
+      const std::string text =
+          trailing.empty()
+              ? std::string(content)
+              : std::string(Trim(std::string(content) + std::string(trailing)));
+      return text.empty() || Emit(text, false);
     }
     if (tool_only_ && tool_mode_ && hide_tool_markup) {
       // The prefix was streamed before the first call. Preserve prose between
@@ -2401,6 +2651,21 @@ public:
     }
     if (!hide_tool_markup && !hidden_.empty()) {
       return Emit(hidden_, false);
+    }
+    if (hide_tool_markup && !trailing.empty()) {
+      // Whitespace held before the first call joins the prose after the calls.
+      std::string_view held = hidden_;
+      held = held.substr(0, held.find_first_not_of(" \t\r\n"));
+      std::string text(held);
+      text += trailing;
+      std::string_view view = text;
+      if (!content_emitted_)
+        view = Trim(view);
+      else
+        while (!view.empty() &&
+               std::isspace(static_cast<unsigned char>(view.back())) != 0)
+          view.remove_suffix(1);
+      return view.empty() || emit_piece_(view, false);
     }
     return true;
   }
@@ -2487,6 +2752,8 @@ private:
   std::string hidden_;
   State state_{State::kInitial};
   bool tool_mode_{false};
+  bool hold_trailing_space_{false};
+  bool content_emitted_{false};
   bool raw_content_{false};
   bool tool_only_{false};
   bool recognize_tools_{false};
@@ -2576,7 +2843,7 @@ ParsedGeneration StreamingGeneration(
     const StreamingTextFilter& filter, const ChatRequest& chat,
     TextGenerationBackend::InitialOutputState initial, ToolMarkerSet markers,
     ToolCloserSet closers, QuoteTracker& quotes, bool enforce_required,
-    bool partial = false) {
+    ToolSyntax syntax, GenerationEnd end, bool partial = false) {
   // Native grammars establish argument framing before the value completes.
   // Recovery from unconstrained/JSON fallback text still requires a full call.
   partial = partial && markers.size() <= 2;
@@ -2585,10 +2852,10 @@ ParsedGeneration StreamingGeneration(
                    filter.raw(), initial, chat.tools, chat.tool_choice,
                    enforce_required,
                    chat.constrained_tools && !chat.response_format, markers,
-                   closers, quotes, partial)
+                   closers, quotes, syntax, end, partial)
              : ParseGeneration(filter.raw(), initial, chat.tools,
                                chat.tool_choice, enforce_required, markers,
-                               closers, quotes, partial);
+                               closers, quotes, syntax, end, partial);
 }
 
 // Responses uses semantic SSE events, rather than Chat Completions chunks.
@@ -2856,13 +3123,15 @@ HttpResponse NonStreamingResponse(
     const std::shared_ptr<TextGenerationBackend::GenerationRequest>& generation,
     TextGenerationBackend::InitialOutputState initial_output_state) {
   const auto result = generation->Wait();
+  const auto syntax = backend.tool_call_syntax();
   const auto format = generation->ToolFormat();
-  const auto markers = ToolMarkers(format);
-  const auto closers = ToolClosers(format);
+  const auto markers = ToolMarkers(format, syntax);
+  const auto closers = ToolClosers(format, syntax);
   core::Utf8Decoder decoder;
   const auto decoded = decoder.Push(result.text, true);
+  LogRawGeneration(request.request_id, decoded, result.finish_reason);
   QuoteTracker quotes;
-  const ParsedGeneration generated =
+  ParsedGeneration generated =
       request.chat.response_format || request.chat.constrained_tools
           ? ParseStructuredGeneration(
                 decoded, initial_output_state, request.chat.tools,
@@ -2870,12 +3139,18 @@ HttpResponse NonStreamingResponse(
                 result.finish_reason ==
                     TextGenerationBackend::FinishReason::kStop,
                 request.chat.constrained_tools && !request.chat.response_format,
-                markers, closers, quotes)
+                markers, closers, quotes, syntax, EndOf(result.finish_reason))
           : ParseGeneration(decoded, initial_output_state, request.chat.tools,
                             request.chat.tool_choice,
                             result.finish_reason ==
                                 TextGenerationBackend::FinishReason::kStop,
-                            markers, closers, quotes);
+                            markers, closers, quotes, syntax,
+                            EndOf(result.finish_reason));
+  if (syntax == ToolSyntax::kBailing && !generated.tool_calls.empty()) {
+    generated.text =
+        std::string(Trim(generated.text + generated.trailing_text));
+  }
+  LogParsedGeneration(request.request_id, generated);
 
   json::Value response = json::Value::object();
   response["id"] = RandomId("chatcmpl-");
@@ -2928,9 +3203,10 @@ HttpResponse StreamingResponse(
   const std::string id = RandomId("chatcmpl-");
   const long long created = Now();
   const std::string model = backend.model_id();
+  const auto syntax = backend.tool_call_syntax();
   const auto format = generation->ToolFormat();
-  const auto markers = ToolMarkers(format);
-  const auto closers = ToolClosers(format);
+  const auto markers = ToolMarkers(format, syntax);
+  const auto closers = ToolClosers(format, syntax);
   auto stream_log = std::make_shared<HttpResponse::StreamLog>();
   return {
       .status = 200,
@@ -2944,7 +3220,7 @@ HttpResponse StreamingResponse(
           },
       .streaming_body =
           [request, generation = std::move(generation), id, created, model,
-           initial_output_state, markers, closers,
+           initial_output_state, markers, closers, syntax,
            stream_log](const HttpResponse::BodyWriter& writer) {
             bool connected = true;
             bool started = false;
@@ -2983,7 +3259,8 @@ HttpResponse StreamingResponse(
                 request.chat.constrained_tools && !request.chat.response_format,
                 !request.chat.tools.empty() &&
                     request.chat.tool_choice != ChatRequest::ToolChoice::kNone,
-                markers, closers, request.chat.tools);
+                markers, closers, request.chat.tools,
+                syntax == ToolSyntax::kBailing);
             StreamingToolCalls tools([&](const ToolDelta& call) {
               // Completion without additional arguments needs no Chat delta.
               if (call.id.empty() && call.arguments.empty())
@@ -3022,11 +3299,12 @@ HttpResponse StreamingResponse(
                     if (!begin() || !filter.Push(piece))
                       return false;
                     return !filter.in_tools() || markers.size() > 2 ||
-                           tools.Update(StreamingGeneration(
-                                            filter, request.chat,
-                                            initial_output_state, markers,
-                                            closers, quotes, false, true)
-                                            .tool_calls);
+                           tools.Update(
+                               StreamingGeneration(filter, request.chat,
+                                                   initial_output_state,
+                                                   markers, closers, quotes,
+                                                   false, syntax, {}, true)
+                                   .tool_calls);
                   },
                   on_progress, begin);
               stream_log->details = GenerationLogDetails(result);
@@ -3039,16 +3317,20 @@ HttpResponse StreamingResponse(
               if (!filter.Push({}, true))
                 return;
 
+              LogRawGeneration(request.request_id, filter.raw(),
+                               result.finish_reason);
               const bool interrupted =
                   result.finish_reason !=
                   TextGenerationBackend::FinishReason::kStop;
               const auto generated = StreamingGeneration(
                   filter, request.chat, initial_output_state, markers, closers,
-                  quotes, !interrupted);
+                  quotes, !interrupted, syntax, EndOf(result.finish_reason));
+              LogParsedGeneration(request.request_id, generated);
               if (!tools.Finish(generated.tool_calls, interrupted))
                 return;
               if (!filter.Finish(generated.hide_tool_markup, generated.text,
-                                 generated.reasoning_content)) {
+                                 generated.reasoning_content,
+                                 generated.trailing_text)) {
                 return;
               }
               json::Value terminal_delta = json::Value::object();
@@ -3726,17 +4008,23 @@ private:
 template<typename Output>
 HttpResponse CreateCompatibilityResponse(
     const HttpRequest& request, TextGenerationBackend& backend,
-    const ChatRequest& chat, std::size_t max_tokens,
+    const ChatRequest& requested_chat, std::size_t max_tokens,
     const sampling::SamplingConfig& sampling, bool stream) {
+  ChatRequest chat = requested_chat;
+  // Native-syntax models are parsed by their own call parser, not the
+  // constrained-JSON path, whether or not a grammar steered the calls.
+  if (backend.tool_call_syntax() != ToolSyntax::kDefault)
+    chat.constrained_tools = false;
   const auto initial = backend.initial_output_state(chat);
   auto generation = backend.start_chat(chat, max_tokens, sampling,
                                        request.is_cancelled, stream);
+  const auto syntax = backend.tool_call_syntax();
   const auto format = generation->ToolFormat();
-  const auto markers = ToolMarkers(format);
-  const auto closers = ToolClosers(format);
+  const auto markers = ToolMarkers(format, syntax);
+  const auto closers = ToolClosers(format, syntax);
   auto stream_log = std::make_shared<HttpResponse::StreamLog>();
   auto timing = std::make_shared<std::string>();
-  const auto run = [generation, initial, chat, markers, closers,
+  const auto run = [generation, initial, chat, markers, closers, syntax,
                     model = backend.model_id(), stream_log,
                     timing](const HttpResponse::BodyWriter& writer) {
     Output output(model, writer, chat);
@@ -3765,7 +4053,7 @@ HttpResponse CreateCompatibilityResponse(
         chat.constrained_tools && !chat.response_format,
         !chat.tools.empty() &&
             chat.tool_choice != ChatRequest::ToolChoice::kNone,
-        markers, closers, chat.tools);
+        markers, closers, chat.tools, syntax == ToolSyntax::kBailing);
     StreamingToolCalls tools([&](const ToolDelta& call) {
       if (output.Tool(call))
         return true;
@@ -3788,7 +4076,8 @@ HttpResponse CreateCompatibilityResponse(
                          return !filter.in_tools() || markers.size() > 2 ||
                                 tools.Update(StreamingGeneration(
                                                  filter, chat, initial, markers,
-                                                 closers, quotes, false, true)
+                                                 closers, quotes, false, syntax,
+                                                 {}, true)
                                                  .tool_calls);
                        },
                        on_progress, begin)
@@ -3815,14 +4104,16 @@ HttpResponse CreateCompatibilityResponse(
       }
       const bool interrupted =
           result.finish_reason != TextGenerationBackend::FinishReason::kStop;
-      const auto generated = StreamingGeneration(filter, chat, initial, markers,
-                                                 closers, quotes, !interrupted);
+      const auto generated = StreamingGeneration(
+          filter, chat, initial, markers, closers, quotes, !interrupted, syntax,
+          EndOf(result.finish_reason));
       if (!tools.Finish(generated.tool_calls, interrupted)) {
         generation->Cancel();
         return json::Value();
       }
       if (!filter.Finish(generated.hide_tool_markup, generated.text,
-                         generated.reasoning_content)) {
+                         generated.reasoning_content,
+                         generated.trailing_text)) {
         generation->Cancel();
         return json::Value();
       }
@@ -3898,6 +4189,9 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
   if (auto error = ParseRequest(request, backend, &parsed); error.has_value()) {
     return std::move(*error);
   }
+  parsed.request_id = request.request_id;
+  if (backend.tool_call_syntax() != ToolSyntax::kDefault)
+    parsed.chat.constrained_tools = false;
   try {
     const auto initial_output_state = backend.initial_output_state(parsed.chat);
     auto generation =

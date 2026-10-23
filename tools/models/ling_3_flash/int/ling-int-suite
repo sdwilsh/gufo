@@ -1,0 +1,320 @@
+#!/usr/bin/python3
+"""Ling-3.0-Flash integration run (WS10 graphs, WS12 non-absorbed MLA, WS13 GEMMs,
+WS14 tool calls, and WS15 prompt caching). Prints JSON lines on stdout, nothing else.
+
+usage: ling-int-suite [--part all|token26,tests,bench,serve] [--suite FILE]
+                      [--bench-stages LIST] [--serve-args ...]
+
+Output rules: this process is the only writer of stdout. Children write their
+reports to files under /work/reports and their progress to stderr. This process
+prints each report line by line, only after the child has exited, and writes
+nothing to stderr while it prints a report or for a few seconds afterwards. A
+pod log merges both streams and splits long lines, so a concurrent stderr line
+could land in the middle of a report. Every report line is followed by
+{"stage": "report-file", "path", "bytes", "sha256"}, which names the copy in
+/work/reports so a reader can detect a damaged line.
+
+Phases, in this order (--part selects; "all" runs tests, bench, and serve):
+  token26 (not in the default image run) ling-token26: G (this image's binaries)
+         against G0 (pre-WS11 binaries in /opt/gufo/g0). It compares router
+         experts and the position-55 logits against the F64 reference (see
+         ling-token26). One JSON line per step and run, plus the final
+         {"stage": "token26", ...} line. ~15 min.
+  tests  run-suite --suite /opt/gufo/suites/int-tests.txt: op tests (dense, kda,
+         mla, and moe, including invariance and the golden parent digests), b2
+         (greedy and KL against the memorised oracle), layer_check --invariance,
+         decode_digest graph-vs-eager (short and 24.5k-context), session_test,
+         snapshot_test (also across a 2048-key block edge), then the novel-text
+         KL oracle. It prints these lines:
+           one {"stage": "test-step", ...} per step (the full run-suite result,
+             including the tool's JSON)
+           one {"stage": "failed-check"} per failed check or non-PASS step
+           {"stage": "calibration"} lines with the session_test
+             prefill_then_decode logits_kl, ref_top1_margin, max-abs, and
+             rel-L2 of every case (pass or fail)
+           the summary line {"stage": "tests", ...}
+  bench  ling-int-bench: env, peak, pp2048+tg128 at d0/4k/16k/64k r3 with the
+         in-binary op_profile, small chunks pp16/64/128/512 at 16k/64k, and
+         --max-batch 2048 at d0/16k. One JSON line per stage.
+  serve  ling-serve-suite: gufo serve plus ling_agent (vendor preset), and the
+         Hermes replay (real tool calls required) with restart and disk
+         restore. One row per agent-loop request. One JSON line
+         {"stage": "serve", ...}.
+After every phase and every child has exited, the full serve logs are printed as
+lines "serve-log[NAME] <line>" between {"stage": "serve-log-begin"} and
+{"stage": "serve-log-end"} records. The last line is {"stage": "int-done"} with
+one status per phase and per bench stage. The exit code is 0 only when all are ok.
+Estimates on a gfx1151 pod:
+  token26: ~15 min
+  tests: ~75 min, plus ~10 min for the report-only base session_test run from
+    /opt/gufo/base (calibration lines "basis":"base")
+  bench: ~35 min
+  serve: ~80 min before stream_start (~10 min), device_loss (ten server restarts,
+    ~30-40 min), and tool_reasoning (informational, ~10 min)
+Run separate pods: `--part tests`, `--part serve` (~2.2 h), `--part bench`. The
+/work emptyDir needs 4Gi for `--part tests` and 12Gi for `--part serve` (the
+Hermes disk cache is capped at 8Gi plus 1Gi staging). Each failed check prints
+one stderr line `check=NAME expected=... actual=...`.
+"""
+import argparse, hashlib, json, os, subprocess, sys, time
+
+from check_line import check_line
+
+REPORTS = os.path.join(os.environ.get("HOME", "/work"), "reports")
+SETTLE_SECONDS = 3.0
+
+
+def log(msg):
+    print("[ling-int] " + msg, file=sys.stderr, flush=True)
+
+
+def emit_report(name, text):
+    """Print one JSON line plus its trailer; stdout is idle before and after."""
+    data = text.rstrip("\n").encode()
+    path = os.path.join(REPORTS, name + ".json")
+    with open(path, "wb") as f:
+        f.write(data + b"\n")
+    out = sys.stdout.buffer
+    out.write(data + b"\n")
+    out.write(json.dumps({"stage": "report-file", "name": name, "path": path, "bytes": len(data),
+                          "sha256": hashlib.sha256(data).hexdigest()}, separators=(",", ":")).encode() + b"\n")
+    out.flush()
+    time.sleep(SETTLE_SECONDS)  # nothing else may reach the log while it drains
+
+
+def emit_lines(name, lines):
+    """Several report lines, one trailer for the lot (the agent-request rows)."""
+    data = ("\n".join(lines)).encode()
+    path = os.path.join(REPORTS, name + ".jsonl")
+    with open(path, "wb") as f:
+        f.write(data + b"\n")
+    out = sys.stdout.buffer
+    out.write(data + b"\n")
+    out.write(json.dumps({"stage": "report-file", "name": name, "path": path, "bytes": len(data),
+                          "lines": len(lines), "sha256": hashlib.sha256(data).hexdigest()},
+                         separators=(",", ":")).encode() + b"\n")
+    out.flush()
+    time.sleep(SETTLE_SECONDS)
+
+
+def run_child(cmd, outfile):
+    with open(outfile, "wb") as f:
+        return subprocess.run(cmd, stdout=f).returncode  # stderr: inherited progress
+
+
+def failed_lines(results):
+    """One compact JSON line per non-PASS step and per failed check/stage inside a
+    tool's JSON (session_test checks[], b2/logit_dump gates, layer_check rows)."""
+    lines = []
+
+    def walk(step, node, path):
+        if isinstance(node, dict):
+            bad = node.get("pass") is False or node.get("status") in ("fail", "error")
+            if bad and path:
+                keep = {k: v for k, v in node.items() if not isinstance(v, (dict, list))}
+                limit = node.get("limit_logits_kl")
+                if "logits_kl" in node and limit is not None:
+                    check_line(step + path, "logits_kl <= %s and top-1 equal (or near-tie)" % limit,
+                               "logits_kl=%s top1_same=%s" % (node.get("logits_kl"), node.get("top1_same")))
+                else:
+                    check_line(step + path, "pass=true", json.dumps(keep, separators=(",", ":")))
+                lines.append(json.dumps({"stage": "failed-check", "step": step, "path": path,
+                                         **keep}, separators=(",", ":")))
+            for k, v in node.items():
+                walk(step, v, path + "/" + str(k))
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                name = v.get("name") if isinstance(v, dict) else None
+                walk(step, v, path + "/" + (str(name) if name else str(i)))
+
+    for r in results:
+        if r.get("status") != "PASS":
+            check_line(r.get("name"), "status=PASS", "status=%s exit_code=%s" % (r.get("status"), r.get("exit_code")))
+            lines.append(json.dumps({"stage": "failed-check", "step": r.get("name"), "path": "",
+                                     "status": r.get("status"), "exit_code": r.get("exit_code"),
+                                     "tail": (r.get("tail") or "")[-1200:]}, separators=(",", ":")))
+        walk(r.get("name"), r.get("json"), "")
+    for line in lines:
+        print("[ling-int] " + line[:400], file=sys.stderr, flush=True)
+    return lines
+
+
+def calibration_lines(results, basis="candidate"):
+    """session_test prefill_then_decode and chunks_of_5_vs_prefill metrics of every
+    case, pass or fail. basis "base" marks the pre-merge binary's measurement."""
+    lines = []
+    for r in results:
+        j = r.get("json")
+        if not isinstance(j, dict):
+            continue
+        for c in j.get("checks", []):
+            if c.get("name") in ("prefill_then_decode", "chunks_of_5_vs_prefill"):
+                lines.append(json.dumps({
+                    "stage": "calibration", "basis": basis, "check": c.get("name"),
+                    "step": r.get("name"), "pass": c.get("pass"),
+                    "prompt_tokens": c.get("prompt_tokens"),
+                    "logits_kl": c.get("logits_kl_raw", c.get("logits_kl")),
+                    "limit_logits_kl": c.get("limit_logits_kl"),
+                    "ref_top1_margin": c.get("ref_top1_margin"),
+                    "logits_max_abs": c.get("logits_max_abs_raw", c.get("logits_max_abs")),
+                    "logits_rel_l2": c.get("logits_rel_l2_raw", c.get("logits_rel_l2")),
+                    "top1_same": c.get("top1_same"),
+                    "kda_state_rel_l2": c.get("kda_state_rel_l2"),
+                    "kda_conv_rel_l2": c.get("kda_conv_rel_l2"),
+                    "mla_cache_rel_l2": c.get("mla_cache_rel_l2")}, separators=(",", ":")))
+    return lines
+
+
+def run_base_session(suite):
+    """Report-only: the pre-merge (int2r4) session_test on the same prompts, so the
+    merged build's cross-family KL has a baseline. Its pass/fail never reaches the
+    run status; its calibration lines carry "basis":"base"."""
+    if not os.path.exists(suite):
+        return
+    raw = os.path.join(REPORTS, "base-session.raw")
+    env = {**os.environ, "GUFO_TEST_DIR": "/opt/gufo/base"}
+    with open(raw, "wb") as f:
+        subprocess.run(["run-suite", "--suite", suite], stdout=f, env=env)
+    try:
+        report = json.loads(open(raw, errors="replace").read())
+    except ValueError:
+        report = {}
+    results = report.get("results", []) if isinstance(report, dict) else []
+    for i, r in enumerate(results):
+        emit_report("base-%02d-%s" % (i, r.get("name")),
+                    json.dumps({"stage": "base-test-step", "report_only": True, **r}, separators=(",", ":")))
+    cal = calibration_lines(results, "base")
+    if cal:
+        emit_lines("calibration-base", cal)
+    emit_report("base-session", json.dumps({
+        "stage": "base-session", "report_only": True,
+        "steps": {r.get("name"): r.get("status") for r in results}}, separators=(",", ":")))
+
+
+def read_lines(path):
+    with open(path, errors="replace") as f:
+        return [l.strip() for l in f if l.strip()]
+
+
+def print_serve_logs(work, max_bytes):
+    names = sorted(n for n in os.listdir(work) if n.startswith("serve-") and n.endswith(".log")) \
+        if os.path.isdir(work) else []
+    out = sys.stdout.buffer
+    out.write(json.dumps({"stage": "serve-log-begin", "logs": names}, separators=(",", ":")).encode() + b"\n")
+    for name in names:
+        path = os.path.join(work, name)
+        size = os.path.getsize(path)
+        skipped = max(0, size - max_bytes)
+        out.write(json.dumps({"stage": "serve-log-file", "name": name, "bytes": size,
+                              "truncated_leading_bytes": skipped}, separators=(",", ":")).encode() + b"\n")
+        with open(path, "rb") as f:
+            f.seek(skipped)
+            for line in f:
+                out.write(b"serve-log[" + name[:-4].encode() + b"] " + line.rstrip(b"\n") + b"\n")
+    out.write(json.dumps({"stage": "serve-log-end"}, separators=(",", ":")).encode() + b"\n")
+    out.flush()
+    time.sleep(SETTLE_SECONDS)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--part", default=os.environ.get("LING_INT_PART", "all"),
+                    help="all (= tests,bench,serve), or a comma list of token26,tests,bench,serve (run in the order given)")
+    ap.add_argument("--suite", default="/opt/gufo/suites/int-tests.txt")
+    ap.add_argument("--base-suite", default="/opt/gufo/suites/base-session.txt",
+                    help="report-only session_test run of the pre-merge binary in /opt/gufo/base (tests part)")
+    ap.add_argument("--bench-stages", default=os.environ.get("LING_BENCH_STAGES", "env,peak,bench,small,maxbatch"))
+    ap.add_argument("--serve-arg", action="append", default=[],
+                    help="extra ling-serve-suite argument (use --serve-arg=--flag)")
+    ap.add_argument("--serve-log-max-bytes", type=int, default=64 << 20)
+    a = ap.parse_args()
+    for v in ("XDG_CACHE_HOME", "TMPDIR"):  # a missing TMPDIR crashes HIP init
+        os.makedirs(os.environ.get(v, os.path.join(os.environ.get("HOME", "/work"), v.lower())), exist_ok=True)
+    os.makedirs(REPORTS, exist_ok=True)
+    phases = ["tests", "bench", "serve"] if a.part == "all" else [p for p in a.part.split(",") if p]
+    if not phases or any(p not in ("token26", "tests", "bench", "serve") for p in phases):
+        raise SystemExit("--part: all or a comma list of token26,tests,bench,serve")
+    status = {}
+    for phase in phases:
+        t0 = time.monotonic()
+        log("phase " + phase)
+        raw = os.path.join(REPORTS, phase + ".raw")
+        if phase == "tests":
+            rc = run_child(["run-suite", "--suite", a.suite], raw)
+            text = open(raw, errors="replace").read()
+            try:
+                report = json.loads(text)
+            except ValueError:
+                report = {"unparsed": text[-20000:]}
+            results = report.get("results", []) if isinstance(report, dict) else []
+            failed = [r.get("name") for r in results if r.get("status") not in ("PASS",)]
+            for i, r in enumerate(results):
+                emit_report("test-%02d-%s" % (i, r.get("name")),
+                            json.dumps({"stage": "test-step", **r}, separators=(",", ":")))
+            fl = failed_lines(results)
+            if fl:
+                emit_lines("failed-checks", fl)
+            cal = calibration_lines(results)
+            if cal:
+                emit_lines("calibration", cal)
+            # A skipped test (exit 77: model or oracle missing) is not a pass.
+            emit_report("tests", json.dumps({"stage": "tests", "exit": rc, "failed_or_skipped": failed,
+                                             "steps": {r.get("name"): r.get("status") for r in results},
+                                             "seconds": round(time.monotonic() - t0, 1),
+                                             "image": report.get("image") if isinstance(report, dict) else None,
+                                             "gpu": report.get("gpu") if isinstance(report, dict) else None},
+                                            separators=(",", ":")))
+            status["tests"] = "ok" if rc == 0 and not failed and results else "failed"
+            run_base_session(a.base_suite)
+        elif phase == "token26":
+            rc = run_child(["ling-token26"], raw)
+            ok = False
+            for i, line in enumerate(read_lines(raw)):
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    d = {}
+                emit_report("token26-%02d-%s" % (i, d.get("stage", "line")), line)
+                if d.get("stage") == "token26-done":
+                    ok = bool(d.get("ok"))
+            status["token26"] = "ok" if rc == 0 and ok else "failed"
+        elif phase == "bench":
+            rc = run_child(["ling-int-bench", "--stages", a.bench_stages], raw)
+            seen = False
+            for i, line in enumerate(read_lines(raw)):
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    d = {}
+                emit_report("bench-%02d-%s" % (i, d.get("stage", "line")), line)
+                if d.get("stage") == "done":
+                    seen = True
+                    for k, v in (d.get("status") or {}).items():
+                        status["bench:" + k] = v
+            if not seen:
+                status["bench"] = "failed"
+        elif phase == "serve":
+            rc = run_child(["ling-serve-suite", *a.serve_arg], raw)
+            text = open(raw, errors="replace").read().strip()
+            try:
+                doc = json.loads(text)
+                ok = rc == 0 and doc.get("status") == "passed"
+            except ValueError:
+                doc, ok = {"unparsed": text[-20000:]}, False
+            # Rows first (one compact line each) so a reader can grep them.
+            rows = doc.pop("agent_requests", []) if isinstance(doc, dict) else []
+            emit_report("serve", json.dumps({"stage": "serve", "exit": rc,
+                                             "seconds": round(time.monotonic() - t0, 1),
+                                             "report": doc}, separators=(",", ":")))
+            if rows:
+                emit_lines("agent-requests", [json.dumps({"stage": "agent-request", **row},
+                                                         separators=(",", ":")) for row in rows])
+            status["serve"] = "ok" if ok else "failed"
+    if "serve" in phases:
+        print_serve_logs(os.path.join(os.environ.get("HOME", "/work"), "serve"), a.serve_log_max_bytes)
+    emit_report("done", json.dumps({"stage": "int-done", "image": os.environ.get("GUFO_IMAGE"),
+                                    "status": status}, separators=(",", ":")))
+    return 0 if status and all(v == "ok" for v in status.values()) else 1
+
+
+sys.exit(main())

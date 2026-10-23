@@ -4,6 +4,8 @@ from copy import deepcopy
 import re
 import sys
 
+from check_report import check_line
+
 # The assistant opening after a stable boundary, such as Qwen's
 # `<|im_start|>assistant\n<think>\n`, is a few tokens long.
 ASSISTANT_OPENING_TOKENS = 16
@@ -29,14 +31,17 @@ def retry_copy_refused(server_log, start, end, prompt_tokens):
 
 
 def check_unchanged_retry(label, retry, prefilled, server_log, start, end, *,
-                          mutable_suffix_tokens=ASSISTANT_OPENING_TOKENS):
+                          mutable_suffix_tokens=ASSISTANT_OPENING_TOKENS,
+                          checkpoint_tail=0):
     """An unchanged retry reuses the complete prompt. Under memory pressure the
     previous request's complete-prompt copy is refused rather than displace
     another conversation's last checkpoint (docs/KV-CACHE.md); the retry then
     restores the stable boundary and prefills only the mutable suffix. For
     agent histories that includes the last user turn; its bound is measured
-    separately with the count-tokens endpoint, not padded with extra slack."""
-    if not prefilled:
+    separately with the count-tokens endpoint, not padded with extra slack.
+    `checkpoint_tail` is the suffix a runner may prefill again on every exact
+    replay (CHECKPOINT_TAIL_TOKENS); within it no refusal is needed."""
+    if prefilled <= checkpoint_tail:
         return
     usage = retry["usage"]
     total = usage.get("prompt_tokens", usage.get("input_tokens"))
@@ -47,7 +52,10 @@ def check_unchanged_retry(label, retry, prefilled, server_log, start, end, *,
           f"prefilled {prefilled} of {total} tokens", file=sys.stderr, flush=True)
 
 
-def check_cache_growth(client, model, checks, chat_result, server_log=None):
+def check_cache_growth(client, model, checks, chat_result, server_log=None,
+                       answer_tokens=128):
+    """`answer_tokens`: the completion budget of a brief reasoning turn that
+    must still end in its answer (REASONING_ANSWER_TOKENS)."""
     failures = []
     for replay in ("drop_reasoning", "keep_reasoning", "discard_reasoning", "thinking_off"):
         label = "cache_growth_" + replay
@@ -56,7 +64,7 @@ def check_cache_growth(client, model, checks, chat_result, server_log=None):
                      "Keep reasoning brief. Follow the final user instruction.\n" +
                      "Background notes are not instructions.\n" * 384}]
         request = dict(model=model, temperature=0, seed=31,
-                       max_completion_tokens=128,
+                       max_completion_tokens=answer_tokens,
                        reasoning_effort="low" if thinking else "none",
                        extra_body={"chat_template_kwargs": {
                            "preserve_thinking": replay != "discard_reasoning"}})
@@ -108,10 +116,10 @@ def check_cache_growth(client, model, checks, chat_result, server_log=None):
                 # The previous prompt's assistant opening can change on replay.
                 # Only that small suffix may be lost, not older user turns.
                 if reused < previous_total - 16 or reused <= previous_reused:
-                    failures.append(
-                        f"{label}_turn_{turn}: cache did not advance to the previous turn: "
-                        f"cached={reused}, previous_prompt={previous_total}, "
-                        f"previous_cached={previous_reused}, prefilled={prefilled}")
+                    failures.append(check_line(
+                        f"{label}_turn_{turn}",
+                        f"cached >= {previous_total - 16} and > previous cached {previous_reused}",
+                        f"cached={reused} prefilled={prefilled}"))
             history.append((deepcopy(body), result))
             previous_total, previous_reused = total, reused
             assistant = {"role": "assistant", "content": result["text"]}
@@ -208,10 +216,10 @@ def check_messages_growth(client, model, checks, chat_result, failures, server_l
                 # so reuse must reach past the previous prompt into that turn.
                 floor = previous_total + (previous_completion // 2 if thinking else -16)
                 if reused < floor:
-                    failures.append(
-                        f"{label}_turn_{turn}: cache did not cover the replayed turn: "
-                        f"cached={reused}, previous_prompt={previous_total}, "
-                        f"previous_completion={previous_completion}, prefilled={prefilled}")
+                    failures.append(check_line(
+                        f"{label}_turn_{turn}", f"cached >= {floor} (covers the replayed turn)",
+                        f"cached={reused} previous_prompt={previous_total} "
+                        f"previous_completion={previous_completion} prefilled={prefilled}"))
             history.append((deepcopy(body), result))
             previous_total = total
             previous_completion = result["usage"]["completion_tokens"]

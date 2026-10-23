@@ -1,0 +1,396 @@
+#!/usr/bin/python3
+"""Ling-3.0-Flash prompt-cache validation (WS15). Prints one compact JSON object on stdout.
+
+usage: ling-cache-suite [--model PATH] [--suites a,b,...] [--skip-hermes] [--speculative off|mtp]
+                        [--skip-functional] [--context N] [--sessions N]
+                        [--cache-ram-bytes N] [--hermes-steps N] [--timeout SEC]
+                        [--work DIR]
+Environment equivalents: MODEL, LING_SUITES, LING_CONTEXT, LING_SESSIONS,
+LING_CACHE_RAM_BYTES, LING_HERMES_STEPS.
+
+Phases (progress on stderr with the prefix [ling-cache]):
+  hermes      Starts `gufo serve` (explicit RAM cache limit, disk cache under
+              /work), restarts it and checks a disk restore, and replays a
+              Hermes-Agent tool loop (strip and echo variants, review fork,
+              compaction) with cache_hermes.py. It runs strict reuse checks
+              plus uncached controls. The controls are report-only once a strip
+              step's cached state includes decoded tokens.
+  functional  tests/functional/run.py --record-baseline with the cache suites
+              (cache = continuation, disk restart, and disk spacing;
+              cache-shared-prefix, cache-edits, cache-growth, cache-rotation,
+              cache-concurrency) and long-context. It owns its server.
+Summary: per phase status, per-suite request, cached, and prefill token totals,
+the server's own per-request cache outcomes (memory, disk, or miss, with miss
+reasons parsed from the terminal log lines), and the Hermes per-step prefill
+tokens. Exit 0 only when every selected phase passed. A child that exits
+non-zero fails its phase whatever its report says. The suite writes only under
+/work. Each invocation uses its own directory WORK/run-<time>-<pid> (WORK
+defaults to /work/ling-cache), so the suite can run again in the same pod. The
+suite removes the disk caches once their phase is done and keeps logs and
+reports.
+"""
+import argparse, glob, json, os, re, shutil, signal, socket, subprocess, sys, time, http.client
+
+HOME = os.environ.get("HOME", "/work")
+# GGUF digest cache: point LING_DIGEST_CACHE (or XDG_CACHE_HOME) at a persistent
+# volume to avoid re-reading the whole model on every pod start.
+if os.environ.get("LING_DIGEST_CACHE"):
+    os.environ["XDG_CACHE_HOME"] = os.environ["LING_DIGEST_CACHE"]
+TESTS = "/opt/gufo/tests/functional"
+DEFAULT_SUITES = ("cache,cache-shared-prefix,cache-edits,cache-growth,cache-rotation,"
+                  "cache-concurrency,long-context")
+
+
+def log(msg):
+    print("[ling-cache] " + msg, file=sys.stderr, flush=True)
+
+
+def read(path):
+    try:
+        return open(path).read().strip()
+    except OSError:
+        return None
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def wait_health(port, proc, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError("server exited %s" % proc.returncode)
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        try:
+            c.request("GET", "/health")
+            if c.getresponse().status == 200:
+                return
+        except (OSError, http.client.HTTPException):
+            pass
+        finally:
+            c.close()
+        time.sleep(0.5)
+    raise TimeoutError("server startup timed out")
+
+
+def cache_lines(*logs):
+    """Terminal request lines of the server logs -> per-request cache outcomes."""
+    rows = []
+    for path in logs:
+        for line in (read(path) or "").splitlines():
+            if "prompt_tokens=" not in line or " cache=" not in line:
+                continue
+            kv = dict(re.findall(r"(\w+)=(\S+)", line))
+            rows.append(kv)
+    outcome = {"requests": len(rows), "memory_hits": 0, "disk_hits": 0, "misses": 0,
+               "miss_reasons": {}, "prompt_tokens": 0, "cached_tokens": 0, "prefill_tokens": 0,
+               "restore_ms_total": 0.0}
+    for kv in rows:
+        outcome["prompt_tokens"] += int(kv.get("prompt_tokens", 0))
+        outcome["cached_tokens"] += int(kv.get("cached_tokens", 0))
+        outcome["prefill_tokens"] += int(kv.get("prefill_tokens", 0))
+        outcome["restore_ms_total"] += float(kv.get("cache_restore_ms", 0))
+        c = kv.get("cache")
+        if c == "memory":
+            outcome["memory_hits"] += 1
+        elif c == "disk":
+            outcome["disk_hits"] += 1
+        else:
+            outcome["misses"] += 1
+            reason = kv.get("cache_miss_reason", "unknown")
+            outcome["miss_reasons"][reason] = outcome["miss_reasons"].get(reason, 0) + 1
+    outcome["restore_ms_total"] = round(outcome["restore_ms_total"], 1)
+    outcome["prefill_tokens_saved"] = outcome["cached_tokens"]
+    return outcome
+
+
+def snapshot_events(*logs):
+    counts = {}
+    for path in logs:
+        for line in (read(path) or "").splitlines():
+            m = re.search(r"event=(snapshot|disk_cache|snapshot_cache_configured|disk_cache_configured|"
+                          r"live_checkpoint|shared_prefix_learned)\b(?: action=(\w+))?(?: reason=(\w+))?", line)
+            if m:
+                key = "_".join(x for x in m.groups() if x)
+                counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def gpu_and_memory():
+    info = {"memory_max": read("/sys/fs/cgroup/memory.max"),
+            "memory_peak": read("/sys/fs/cgroup/memory.peak")}
+    for p in sorted(glob.glob("/sys/class/kfd/kfd/topology/nodes/*/properties")):
+        props = dict(l.split(None, 1) for l in (read(p) or "").splitlines() if len(l.split(None, 1)) == 2)
+        v = int(props.get("gfx_target_version", "0"))
+        if v:
+            info["gfx"] = "gfx%d%x%x" % (v // 10000, (v // 100) % 100, v % 100)
+            break
+    return info
+
+
+def tail_lines(path, count=60):
+    return "\n".join((read(path) or "(no log)").splitlines()[-count:])
+
+
+def report_failed(phase_name, conditions, *server_logs):
+    """Failed conditions (one `check=` line each) and the server log tails."""
+    print("==== %s: failed conditions ====" % phase_name, file=sys.stderr)
+    for line in conditions or ["check=%s expected=phase passes actual=failed" % phase_name]:
+        print(line, file=sys.stderr)
+    for path in server_logs:
+        print("==== %s tail ====" % path, file=sys.stderr)
+        print(tail_lines(path), file=sys.stderr, flush=True)
+
+
+def stop(proc):
+    if proc.poll() is None:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default=os.environ.get(
+        "MODEL", "/models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf"))
+    ap.add_argument("--suites", default=os.environ.get("LING_SUITES", DEFAULT_SUITES))
+    ap.add_argument("--skip-hermes", action="store_true")
+    ap.add_argument("--skip-functional", action="store_true")
+    ap.add_argument("--context", type=int, default=int(os.environ.get("LING_CONTEXT", 32768)))
+    ap.add_argument("--sessions", type=int, default=int(os.environ.get("LING_SESSIONS", 4)))
+    ap.add_argument("--cache-ram-bytes", type=int,
+                    default=int(os.environ.get("LING_CACHE_RAM_BYTES", 6 << 30)))
+    ap.add_argument("--hermes-steps", type=int, default=int(os.environ.get("LING_HERMES_STEPS", 5)))
+    ap.add_argument("--startup-timeout", type=int, default=1800)
+    ap.add_argument("--timeout", type=int, default=14400)
+    ap.add_argument("--speculative", choices=("off", "mtp"), default="mtp",
+                    help="speculative mode of every server this suite starts, passed explicitly "
+                         "(Ling's default is mtp)")
+    ap.add_argument("--work", default=os.path.join(HOME, "ling-cache"),
+                    help="parent of this invocation's fresh run directory")
+    args = ap.parse_args()
+    t0 = time.monotonic()
+    summary = {"tool": "ling-cache-suite", "image": os.environ.get("GUFO_IMAGE"),
+               "model": args.model, "settings": {k: getattr(args, k.replace("-", "_")) for k in
+                                                 ("context", "sessions", "cache-ram-bytes", "speculative")},
+               "env": gpu_and_memory(), "phases": {}}
+    if not os.path.exists(args.model):
+        summary["status"] = "skipped"
+        summary["reason"] = "model missing"
+        print(json.dumps(summary, separators=(",", ":")), flush=True)
+        return 77
+    os.makedirs(HOME + "/tmp", exist_ok=True)
+    # Use a fresh directory per invocation. run.py refuses an existing output
+    # directory, and a stale report or disk cache must not stand in for this
+    # run's results.
+    os.makedirs(args.work, exist_ok=True)
+    run_dir = os.path.join(args.work, "run-%s-%d" % (time.strftime("%Y%m%dT%H%M%S"), os.getpid()))
+    os.makedirs(run_dir)
+    summary["run_dir"] = run_dir
+    log("run directory " + run_dir)
+    server_args = ["serve", "llm", "--model", args.model, "--sessions", str(args.sessions),
+                   "--context", str(args.context), "--speculative", args.speculative,
+                   "--cache-ram-bytes", str(args.cache_ram_bytes)]
+    ok = True
+
+    if not args.skip_hermes:
+        phase = summary["phases"]["hermes"] = {}
+        out = run_dir + "/hermes"
+        os.makedirs(out)
+        disk = run_dir + "/disk-hermes"
+        port = free_port()
+        logp = out + "/server.log"
+        cmd = ["gufo", *server_args, "--host", "127.0.0.1", "--port", str(port),
+               "--served-model-name", "functional-test", "--max-pending-per-client", "8",
+               "--cache-disk", disk, "--cache-disk-bytes", str(8 << 30),
+               # Staging must hold at least one snapshot of the longest context
+               # (0.5 GiB at 60k tokens) with room to spare.
+               "--cache-disk-staging-bytes", str(1 << 30)]
+        log("hermes: " + " ".join(cmd))
+        started = time.monotonic()
+        with open(logp, "w") as lf:
+            proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
+            try:
+                wait_health(port, proc, args.startup_timeout)
+                phase["startup_s"] = round(time.monotonic() - started, 1)
+                r = subprocess.run(
+                    [sys.executable, TESTS + "/cache_hermes.py", "--base-url",
+                     "http://127.0.0.1:%d/v1" % port, "--model", "functional-test", "--output",
+                     out + "/hermes.json", "--steps", str(args.hermes_steps),
+                     "--context", str(args.context)]
+                    + ([] if os.environ.get("LING_REQUIRE_REAL_TOOL_CALLS") == "1"
+                       else ["--allow-synthetic"]),
+                    stdout=subprocess.PIPE, stderr=sys.stderr, text=True, timeout=args.timeout)
+                phase["exit_code"] = r.returncode
+                try:
+                    report = json.load(open(out + "/hermes.json"))
+                    phase["status"] = report["status"]
+                    phase["failures"] = report["failures"]
+                    if r.returncode != 0:
+                        phase["status"] = "failed"
+                        phase["failures"] = phase["failures"] + [
+                            "cache_hermes.py exited %d" % r.returncode]
+                    phase["variants"] = {
+                        v: {"prefill_tokens_per_step": d["tokens_prefilled_per_step"],
+                            "reused_tokens_per_step": d["tokens_reused_per_step"],
+                            "steps": [{k: s.get(k) for k in (
+                                "name", "prompt_tokens", "cached_tokens", "prefill_tokens", "cache_hit",
+                                "cache_miss_reason", "cache_restore_ms", "answer_equals_control")}
+                                for s in d["steps"]]}
+                        for v, d in report["variants"].items()}
+                except (OSError, ValueError, KeyError) as e:
+                    phase["status"] = "failed"
+                    phase["error"] = str(e)
+            except Exception as e:  # noqa
+                phase["status"] = "failed"
+                phase["error"] = "%s: %s" % (type(e).__name__, e)
+            finally:
+                stop(proc)
+        # Restart with the same disk cache: the last Hermes request must be
+        # restored from disk (all but at most one 2048-token checkpoint step).
+        if os.path.exists(out + "/hermes.json"):
+            logr = out + "/server-restarted.log"
+            port = free_port()
+            cmd[cmd.index("--port") + 1] = str(port)
+            with open(logr, "w") as lf:
+                proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
+                try:
+                    wait_health(port, proc, args.startup_timeout)
+                    probe = json.load(open(out + "/hermes.json"))["probe_request"]
+                    c = http.client.HTTPConnection("127.0.0.1", port, timeout=3600)
+                    c.request("POST", "/v1/chat/completions", json.dumps(probe),
+                              {"Content-Type": "application/json"})
+                    resp = json.loads(c.getresponse().read())
+                    usage = resp["usage"]
+                    g = usage["gufo"]
+                    phase["restart"] = {"restored_tokens": usage["cached_tokens"], "prompt_tokens": usage["prompt_tokens"],
+                                        "cached_tokens": usage["cached_tokens"],
+                                        "prefill_tokens": g["prefill_tokens"],
+                                        "disk_hit": g["cache_disk_hit"],
+                                        "restore_ms": g["cache_restore_ms"]}
+                    log("restart: restored %d of %d tokens from disk (disk_hit=%s)" % (
+                        usage["cached_tokens"], usage["prompt_tokens"], g["cache_disk_hit"]))
+                    if not (g["cache_disk_hit"] and usage["cached_tokens"] > 0
+                            and g["prefill_tokens"] < 2048 + 64):
+                        phase["status"] = "failed"
+                        phase["failures"] = phase.get("failures", []) + [
+                            "restart: expected a disk restore leaving under one checkpoint "
+                            "step to prefill, got %s" % phase["restart"]]
+                except Exception as e:  # noqa
+                    phase["status"] = "failed"
+                    phase["error"] = "restart: %s: %s" % (type(e).__name__, e)
+                finally:
+                    stop(proc)
+            logp = [logp, logr]
+        if phase.get("status") != "passed":
+            report_failed("hermes", phase.get("failures") or
+                          ["check=hermes expected=replay and restart pass actual=%s" %
+                           (phase.get("error") or phase.get("status"))],
+                          *(logp if isinstance(logp, list) else [logp]))
+        phase["server_cache"] = cache_lines(*(logp if isinstance(logp, list) else [logp]))
+        phase["server_events"] = snapshot_events(*(logp if isinstance(logp, list) else [logp]))
+        phase["seconds"] = round(time.monotonic() - started, 1)
+        shutil.rmtree(disk, ignore_errors=True)
+        ok &= phase.get("status") == "passed"
+
+    if not args.skip_functional:
+        phase = summary["phases"]["functional"] = {}
+        out = run_dir + "/functional"
+        started = time.monotonic()
+        cmd = [sys.executable, TESTS + "/run.py", "--output", out, "--sampling-preset", "ling3",
+               "--record-baseline", "--suite-timeout", "3000"]
+        for s in args.suites.split(","):
+            cmd += ["--suite", s]
+        cmd += ["--", "gufo", *server_args]
+        log("functional: " + " ".join(cmd))
+        r = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr, timeout=args.timeout)
+        phase["exit_code"] = r.returncode
+        report = {}
+        try:
+            report = json.load(open(out + "/report.json"))
+            phase["status"] = report["status"]
+            phase["suites"] = {}
+            for name, row in report["suites"].items():
+                entry = {"status": row["status"], "seconds": row.get("seconds")}
+                if row.get("error"):
+                    entry["error"] = row["error"][:300]
+                try:
+                    rows = json.load(open("%s/%s.requests.json" % (out, name)))["requests"]
+                    entry["requests"] = len(rows)
+                    entry["prompt_tokens"] = sum(r.get("metrics", {}).get("prompt_tokens", 0) for r in rows)
+                    entry["cached_tokens"] = sum(r.get("metrics", {}).get("cached_tokens", 0) for r in rows)
+                    entry["prefill_tokens"] = sum(r.get("metrics", {}).get("prefill_tokens", 0) for r in rows)
+                except (OSError, ValueError, KeyError):
+                    pass
+                phase["suites"][name] = entry
+            # run.py expands the "cache" suite into continuation cases (text-cancel,
+            # *-cancel, their *-disk restores, disk-spacing[-disk]). None is named
+            # "cache", so add one aggregate row for it.
+            if "cache" in args.suites.split(","):
+                named = set(args.suites.split(","))
+                cases = {n: e for n, e in phase["suites"].items() if n not in named}
+                bad = sorted(n for n, e in cases.items() if e["status"] != "passed")
+                phase["suites"]["cache"] = {
+                    "status": "passed" if cases and not bad else "failed",
+                    "cases": {n: e["status"] for n, e in cases.items()},
+                    "seconds": round(sum(e.get("seconds") or 0 for e in cases.values()), 1)}
+                if not cases:
+                    phase["suites"]["cache"]["error"] = "no cache cases ran"
+                if bad:
+                    phase["suites"]["cache"]["error"] = "failed cases: " + ",".join(bad)
+                    phase["status"] = "failed"
+            if report.get("error"):
+                phase["error"] = report["error"][:500]
+            if "disk_spacing" in report:
+                phase["disk_spacing"] = report["disk_spacing"]
+        except (OSError, ValueError, KeyError) as e:
+            phase["status"] = "failed"
+            phase["error"] = str(e)
+        if r.returncode != 0:
+            # The report can be partial or absent after a non-zero exit.
+            phase["status"] = "failed"
+            phase["error"] = ("run.py exited %d" % r.returncode
+                              + ("; " + phase["error"] if phase.get("error") else ""))[:500]
+        failed_conditions, failed_logs = [], []
+        for name, row in report.get("suites", {}).items():
+            if row["status"] != "passed":
+                # The child has exited and the pod's /work is lost with the
+                # pod, so print the log now.
+                text = read("%s/%s.log" % (out, name)) or ""
+                lines = [l for l in text.splitlines() if l.startswith("check=")]
+                failed_conditions += lines or ["check=%s expected=suite passes actual=%s" % (
+                    name, row.get("error", "failed")[:300])]
+                print("==== failed suite log: %s (%s) ====" % (name, row.get("error", "")[:300]),
+                      file=sys.stderr)
+                print(text[:2000] + "\n[...]\n" + text[-6000:]
+                      if len(text) > 8000 else text, file=sys.stderr, flush=True)
+        if failed_conditions or phase.get("status") != "passed":
+            report_failed("functional", failed_conditions or [
+                "check=functional expected=every suite passes actual=%s" % (
+                    phase.get("error") or phase.get("status"))],
+                out + "/server.log", out + "/server-restarted.log")
+        logs = [out + "/server.log", out + "/server-restarted.log"]
+        phase["server_cache"] = cache_lines(*logs)
+        phase["server_events"] = snapshot_events(*logs)
+        phase["seconds"] = round(time.monotonic() - started, 1)
+        shutil.rmtree(out + "/disk", ignore_errors=True)
+        ok &= phase.get("status") == "passed" and r.returncode == 0
+
+    summary["env_after"] = gpu_and_memory()
+    summary["status"] = "passed" if ok else "failed"
+    summary["seconds"] = round(time.monotonic() - t0, 1)
+    print(json.dumps(summary, separators=(",", ":")), flush=True)
+    hold = int(os.environ.get("LING_HOLD", "0"))
+    if hold:
+        time.sleep(hold)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

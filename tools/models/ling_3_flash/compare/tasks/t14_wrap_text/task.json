@@ -1,0 +1,5 @@
+{
+ "category": "bugfix",
+ "expected_tests": 10,
+ "prompt": "textwrap2.wrap(text, width) is a greedy word wrapper returning a list of lines. Rules: lines are at most `width` characters (a line of exactly width characters is fine); words are separated by single spaces within a line (runs of spaces/tabs collapse); a word longer than width is split into width-sized chunks; paragraphs separated by one or more blank lines are wrapped independently and a single empty string '' is placed between paragraphs; empty or whitespace-only input returns []; width < 1 raises ValueError. The current code fails a test and violates several of these rules. Fix textwrap2.py (not the tests)."
+}

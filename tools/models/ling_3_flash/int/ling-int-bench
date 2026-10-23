@@ -1,0 +1,945 @@
+#!/usr/bin/python3
+"""Ling-3.0-Flash integration measurement suite. Prints one JSON object per line on stdout.
+
+usage: ling-int-bench [--stages env,peak,bench,small,maxbatch,mtp_head_ab] [--model PATH]
+                      [--depths 0,4096,16384,65536] [--repetitions 3]
+                      [--hold SECONDS] [--bench-timeout SEC]
+                      [--fit-stores B,B,...] [--fit-repetitions N]
+
+Every bench stage except `fit` pins `--speculative off`, because Ling's default is MTP
+and these stages measure the autoregressive kernels. `fit` states the mode explicitly.
+
+Stages (each prints one JSON line {"stage": NAME, ...} when it finishes):
+  env       image, node, GPU and GTT, memory limits, model files, gufo diagnose text
+  peak      gfx1151_peak: measured compute and DRAM read/write/copy rates
+  bench     gufo bench -p 2048 -n 128 -d 0,4096,16384,65536 -r 3 -o jsonl
+            --op-profile (header, per-repetition samples and the in-binary
+            op_profile records of one eager decode run and one serialised
+            prefill chunk per depth, same fields as llama-bench jsonl);
+            prefill chunk 512
+  small     gufo bench -p 16,64,128,512 -d 16384,65536 -r 3 (small chunks at
+            depth, the persistent expanded-K/V and block-fold stress)
+  maxbatch  gufo bench --max-batch 2048 -p 2048 -n 128 -d 0,16384 -r 3
+            (WS13's 2048-token prefill chunk; the server keeps 512)
+  small_ab  the `small` workload (--op-profile) with the parent build
+            (/opt/gufo/base/gufo-parent) and this build alternately, two passes
+            each (parent, candidate, parent, candidate). It prints one {"stage":
+            "small_ab-run"} line per run in the `small` layout, then the
+            per-(n_prompt, depth) mean t/s of each binary, the candidate/parent
+            ratio, and the MLA stage ms/rep. ~22 min.
+  kernels_ab  gfx1151 kernel microbenchmarks, parent against candidate:
+            ling-mla-prefill-bench-{parent,candidate} (non-absorbed MLA prefill
+            of one layer, n 9/16/64/128/512 at depth 0/16384/65536, ms and
+            output digests, which must match) alternately, two passes each,
+            and `ling_3_flash_dense_ops_test --bench` (every GEMM tile shape and
+            the dispatch's choice, n 16..2048), and the routed-expert decode
+            GEMVs: ling-moe-decode-bench-{parent,candidate} (gate/up and down
+            of one MoE layer over full 512-expert tensors, IQ4_XS/Q4_K and
+            Q5_K/Q6_K, 1..8 tokens with the measured expert unions, graph
+            replay, GB/s and output digests, which must match), alternately,
+            two passes each, plus any ling-moe-decode-bench-var-* variants
+            (experiment builds; digests must match too). ~10 min.
+  decode_ab  decode throughput, parent (/opt/gufo/base/gufo-parent) against this build:
+            gufo bench -n 128 -d 0,16384,65536 -r 3 --text-file CORPUS with
+            --speculative off and with --speculative mtp, alternating parent,
+            candidate, parent, candidate per mode (one {"stage": "decode_ab-run"}
+            line per run), then one --op-profile MTP run of each binary at depth 0
+            and 65,536 (the mtp_profile records: AR graph/eager, draft, verify
+            widths 2..8 with per-op device ms). Summary: per (mode, depth) t/s
+            means, candidate/parent ratio, each binary's MTP acceptance (equal
+            when the decode bits are equal), and the per-op ms of both binaries
+            side by side for AR, draft and verify widths 2..4. ~75 min.
+  digest_ab  bit identity of the decode family, parent against this build:
+            ling_3_flash_decode_digest (prefill, token-by-token decode, chunks
+            2..8, rollback, reset, profiled steps) on the full model with and
+            without --mtp; the candidate also runs --graph-compare (graph replay
+            == eager). Every digest line must be equal. ~30 min.
+  mtp_profile  MTP decode-cycle profile on the full model at depth 0 and 65,536:
+            gufo bench -n 64 -d 0,65536 -r 2 --speculative mtp --op-profile
+            --text-file CORPUS -o jsonl. Its "mtp_profile" records: AR one-token
+            steps replayed as graphs vs eager (host issue / wall, device span)
+            with per-op device times; one draft step (block 42 + head) and the
+            verify forward at widths 2..8 (launch timing, per-op device times,
+            Rollback cost); fixed-width greedy cycles split into sample / draft
+            / verify / accept / rollback with the draft and verify device spans.
+            The stage adds the expert-GEMV and MLA-decode bandwidth of the AR
+            and draft steps against the measured DRAM read peak (gfx1151_peak),
+            and, when rocprofv3 is installed (/opt/rocm-7.1.1), a prof.py kernel
+            trace of a 32-token MTP generation at each depth. ~25 min.
+  mtp_head_ab  the MTP draft head, F16 (the trunk's output head) against the Q8_0 copy
+            the draft step owns, in one candidate build. (1) ling_3_flash_mtp_head_ab on
+            the prose and code corpora (4 evenly spaced 1024-token windows each, 192
+            greedy tokens, 3 drafts per cycle, both heads on the same windows): draft
+            acceptance, tokens per cycle, draft device/wall ms per head, and a check
+            that the emitted tokens are identical; (2) the mtp_profile measurement
+            (gufo bench --speculative mtp --op-profile -d 0,65536) with the parent
+            build (/opt/gufo/base/gufo-parent, F16 draft head) and this build: draft
+            step launch timing, the draft.head_logits_gemv op (ms, MB, GB/s) and the
+            fixed-width cycle tokens/s. ~25 min.
+  long      (separate image) gufo bench -p 2048 -n 128 -d 131072,194432,259968 -r 1
+            --max-batch 512 with the default 12 GiB expanded-K/V budget; the device
+            memory peak (GTT/VRAM sampled every 2 s) is in "device_memory"
+  long24    the same with --expanded-kv-bytes 25769803776 (24 GiB)
+  fit       production fit. For each expanded-K/V budget in --fit-stores (default
+            0, 4 GiB, 12 GiB; 0 disables the store) with MTP off, then the same with
+            --speculative mtp: gufo bench -p 2048 -n 128 -d 0,65536,131072,194432
+            -r --fit-repetitions (default 2) --max-batch 512 --text-file CORPUS -o
+            jsonl. The bench allocates the deepest depth + 2048 + 1 = 196,481 context
+            tokens, the same 96 expanded-K/V blocks and within 127 latent rows of
+            `gufo serve --context 196608 --sessions 1`. CORPUS is the real-text corpus
+            (project docs, then sources) so MTP acceptance is realistic; MTP-off runs
+            read the same tokens. One JSON line per (store, mtp) run, printed as each
+            run ends, carries every bench record, the mtp acceptance records, the
+            "[ling] ready" line, hipMemGetInfo and sysfs GTT use right after the model
+            load, the GTT/VRAM peak with its time, and UTC start/end timestamps (to
+            match Prometheus GTT peaks). Six runs, about 1.5-2 h in total.
+A last {"stage": "done"} line carries the stage status table. Progress and raw
+child stderr go to stderr with the prefix [ling-bench]. Only /work is written.
+Every stage is bit-for-bit the same code path as the server's, but timings are
+only meaningful on the real gfx1151 node.
+"""
+import argparse, ctypes, glob, json, os, platform, re, shutil, subprocess, sys, threading, time
+
+GUFO = "gufo"
+PROF = "/usr/local/lib/gufo/prof.py"
+WORK = os.environ.get("HOME", "/work")
+
+
+def log(msg):
+    print("[ling-bench] " + msg, file=sys.stderr, flush=True)
+
+
+def emit(obj):
+    line = json.dumps(obj, separators=(",", ":"))
+    if len(line) > 900_000:
+        obj = {k: (v if not isinstance(v, str) else v[-20000:]) for k, v in obj.items()}
+        obj["truncated"] = True
+        line = json.dumps(obj, separators=(",", ":"))
+    print(line, flush=True)
+
+
+def read(path):
+    try:
+        return open(path).read().strip()
+    except OSError:
+        return None
+
+
+def gpu_info():
+    info = {"name": None, "gfx": None}
+    for p in sorted(glob.glob("/sys/class/kfd/kfd/topology/nodes/*/properties")):
+        props = dict(l.split(None, 1) for l in (read(p) or "").splitlines() if len(l.split(None, 1)) == 2)
+        v = int(props.get("gfx_target_version", "0"))
+        if v:
+            info["gfx"] = "gfx%d%x%x" % (v // 10000, (v // 100) % 100, v % 100)
+            break
+    try:
+        hip = ctypes.CDLL("libamdhip64.so.7")
+        buf = ctypes.create_string_buffer(256)
+        if hip.hipDeviceGetName(buf, 256, 0) == 0:
+            info["name"] = buf.value.decode()
+    except Exception as e:  # noqa
+        info["name_error"] = str(e)
+    for d in sorted(glob.glob("/sys/class/drm/card*/device")):
+        t, u = read(d + "/mem_info_gtt_total"), read(d + "/mem_info_gtt_used")
+        vt = read(d + "/mem_info_vram_total")
+        if t is not None:
+            info.update(gtt_total=int(t), gtt_used=int(u or 0), vram_total=int(vt or 0))
+            break
+    return info
+
+
+def run(cmd, timeout, env=None, **kw):
+    """Run a child; return (returncode, stdout, stderr_tail, seconds)."""
+    log("run: " + " ".join(cmd))
+    t0 = time.monotonic()
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         errors="replace", start_new_session=True, env=env, **kw)
+    err_lines = []
+
+    def pump():
+        for line in p.stderr:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+            err_lines.append(line)
+            if len(err_lines) > 400:
+                del err_lines[:100]
+
+    th = threading.Thread(target=pump, daemon=True)
+    th.start()
+    out, code = read_stdout(p, timeout)
+    th.join(5)
+    return code, out, "".join(err_lines)[-6000:], round(time.monotonic() - t0, 1)
+
+
+def read_stdout(p, timeout):
+    """Reads the child's stdout to EOF (stderr belongs to the caller's pump
+    thread: communicate() would read it too and split its lines) and returns
+    (stdout, exit code or "timeout")."""
+    expired = threading.Event()
+
+    def kill():
+        expired.set()
+        os.killpg(p.pid, 9)
+
+    timer = threading.Timer(timeout, kill)
+    timer.start()
+    try:
+        out = p.stdout.read()
+        p.wait()
+    finally:
+        timer.cancel()
+    return out, "timeout" if expired.is_set() else p.returncode
+
+
+def stage_env(a):
+    meminfo = {}
+    for line in (read("/proc/meminfo") or "").splitlines()[:3]:
+        k, _, v = line.partition(":")
+        meminfo[k] = v.strip()
+    model_files = []
+    m = re.match(r"(.*)-(\d+)-of-(\d+)\.gguf$", a.model)
+    paths = ([f"{m.group(1)}-{i:05d}-of-{m.group(3)}.gguf" for i in range(1, int(m.group(3)) + 1)]
+             if m else [a.model])
+    for p in paths:
+        model_files.append({"path": p, "bytes": os.path.getsize(p) if os.path.exists(p) else None})
+    code, out, err, _ = run([GUFO, "diagnose"], 120)
+    return {"image": os.environ.get("GUFO_IMAGE"), "host": platform.node(), "uid": os.getuid(),
+            "gpu": gpu_info(), "meminfo": meminfo,
+            "cgroup_memory_max": read("/sys/fs/cgroup/memory.max"),
+            "model_files": model_files, "diagnose_exit": code, "diagnose": out[-6000:],
+            "env": {k: os.environ[k] for k in ("HSA_OVERRIDE_GFX_VERSION", "HIP_VISIBLE_DEVICES",
+                                               "ROCR_VISIBLE_DEVICES") if k in os.environ}}
+
+
+PEAK_LINE = re.compile(r"^\s*(?P<name>.+?)\s{2,}(?P<value>[\d.]+)\s+(?P<unit>TOPS|TFLOPS|GB/s|us)\b")
+
+
+def stage_peak(a):
+    code, out, err, secs = run(["gfx1151_peak"], 600)
+    rows, section = [], ""
+    for line in out.splitlines():
+        if line.startswith("--"):
+            section = line.strip("- ").strip()
+            continue
+        mt = PEAK_LINE.match(line)
+        if mt:
+            rows.append({"section": section, "name": mt["name"].strip(), "value": float(mt["value"]),
+                         "unit": mt["unit"], "verified": "checksums verified" in line
+                         or mt["unit"] == "us"})
+    return {"exit": code, "seconds": secs, "rows": rows, "raw": out[-6000:], "stderr_tail": err[-1500:]}
+
+
+def bench_body(cmd, code, out, err, secs):
+    records = bench_records(out)
+    depth_fill = [l for l in err.splitlines() if l.startswith("[depth ")]
+    return {"command": cmd, "exit": code, "seconds": secs, "records": records,
+            "depth_fill_log": depth_fill, "stderr_tail": err[-2500:]}
+
+
+def stage_bench(a):
+    cmd = [GUFO, "bench", "-m", a.model, "-p", "2048", "-n", "128", "-d", a.depths,
+           "-r", str(a.repetitions), "-o", "jsonl", "--op-profile",
+           "--speculative", "off"]
+    code, out, err, secs = run(cmd, a.bench_timeout)
+    return bench_body(cmd, code, out, err, secs)
+
+
+def bench_stage(a, args, repetitions=None):
+    cmd = [GUFO, "bench", "-m", a.model, *args, "-r", str(repetitions or a.repetitions), "-o", "jsonl",
+           "--speculative", "off"]
+    code, out, err, secs = run(cmd, a.bench_timeout)
+    return bench_body(cmd, code, out, err, secs)
+
+
+def stage_small(a):
+    return bench_stage(a, ["-p", "16,64,128,512", "-d", "16384,65536", "--op-profile"])
+
+
+PARENT_GUFO = "/opt/gufo/base/gufo-parent"
+SMALL_ARGS = ["-p", "16,64,128,512", "-d", "16384,65536", "--op-profile"]
+
+
+def stage_small_ab(a):
+    """The small-chunk workload with the parent and this build, alternating."""
+    global GUFO
+    if not os.path.exists(PARENT_GUFO):
+        return {"error": "no parent build at " + PARENT_GUFO, "exit": 1}
+    binaries = {"parent": PARENT_GUFO, "candidate": GUFO}
+    tps, mla, runs = {}, {}, []
+    saved = GUFO
+    try:
+        for pass_no in (1, 2):
+            for label in ("parent", "candidate"):
+                GUFO = binaries[label]
+                body = bench_stage(a, SMALL_ARGS)
+                emit({"stage": "small_ab-run", "binary": label, "pass": pass_no, **body})
+                runs.append({"binary": label, "pass": pass_no, "exit": body["exit"],
+                             "seconds": body["seconds"]})
+                for r in body["records"]:
+                    if r.get("record") != "result" or not r.get("n_prompt"):
+                        continue
+                    key = "pp%d@d%d" % (r["n_prompt"], r["n_depth"])
+                    tps.setdefault(key, {}).setdefault(label, []).extend(r.get("samples_ts", []))
+                    st = r.get("stage_ms_per_rep") or {}
+                    if "mla_blocks_5_11_17_23_29_35_41" in st:
+                        mla.setdefault(key, {}).setdefault(label, []).append(
+                            st["mla_blocks_5_11_17_23_29_35_41"])
+    finally:
+        GUFO = saved
+    mean = lambda v: round(sum(v) / len(v), 3) if v else None
+    summary = {}
+    for key, by in tps.items():
+        p, c = mean(by.get("parent", [])), mean(by.get("candidate", []))
+        summary[key] = {"parent_ts": p, "candidate_ts": c,
+                        "ratio": round(c / p, 4) if p and c else None,
+                        "parent_samples_ts": by.get("parent", []),
+                        "candidate_samples_ts": by.get("candidate", []),
+                        "mla_ms_per_rep": {k: mean(v) for k, v in mla.get(key, {}).items()}}
+    codes = [r["exit"] for r in runs]
+    return {"exit": 0 if all(c == 0 for c in codes) else 1, "runs": runs, "summary": summary,
+            "note": "ratio = candidate / parent mean t/s over both passes (3 timed repetitions "
+                    "each); timings are per request, never compare across depths"}
+
+
+MLA_BENCH = "/usr/local/bin/ling-mla-prefill-bench-"
+DENSE_TEST = "/opt/gufo/tests/ling_3_flash_dense_ops_test"
+BENCH_LINE = re.compile(r"^BENCH (\S+) rows=(\d+) k=(\d+) n=(\d+) shape=(\S+) ms=([\d.]+) tflops=([\d.]+)")
+
+
+def stage_kernels_ab(a):
+    out = {"mla": [], "mla_summary": {}, "gemm": []}
+    digests, ms = {}, {}
+    codes = []
+    for pass_no in (1, 2):
+        for label in ("parent", "candidate"):
+            path = MLA_BENCH + label
+            if not os.path.exists(path):
+                out["mla"].append({"binary": label, "error": "missing " + path})
+                codes.append(1)
+                continue
+            code, stdout, err, secs = run([path, "--depths", "0,16384,65536",
+                                           "--ns", "9,16,64,128,512", "--reps", "10"], 1800)
+            codes.append(code)
+            rows = []
+            for line in stdout.splitlines():
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    pass
+            out["mla"].append({"binary": label, "pass": pass_no, "exit": code, "seconds": secs,
+                               "rows": rows, "stderr_tail": err[-1500:]})
+            for r in rows:
+                if "n" in r:
+                    key = "n%d@d%d" % (r["n"], r["depth"])
+                    digests.setdefault(key, {}).setdefault(label, set()).add(r["digest"])
+                    ms.setdefault(key, {}).setdefault(label, []).append(r["ms_min"])
+    for key in ms:
+        p, c = ms[key].get("parent", []), ms[key].get("candidate", [])
+        d = digests.get(key, {})
+        same = len(d.get("parent", set()) | d.get("candidate", set())) == 1
+        out["mla_summary"][key] = {"parent_ms": min(p) if p else None,
+                                   "candidate_ms": min(c) if c else None,
+                                   "speedup": round(min(p) / min(c), 3) if p and c else None,
+                                   "digests_identical": same}
+        if not same:
+            codes.append(1)
+    moe = moe_decode_ab()
+    out.update(moe)
+    codes.append(moe["moe_exit"])
+    if os.path.exists(DENSE_TEST):
+        code, stdout, err, secs = run([DENSE_TEST, "--bench"], 1800)
+        codes.append(code)
+        for line in stdout.splitlines():
+            m = BENCH_LINE.match(line.strip())
+            if m:
+                out["gemm"].append({"op": m[1], "rows": int(m[2]), "k": int(m[3]), "n": int(m[4]),
+                                    "shape": m[5], "ms": float(m[6]), "tflops": float(m[7])})
+        out["gemm_seconds"] = secs
+    out["exit"] = 0 if all(c == 0 for c in codes) else 1
+    return out
+
+
+MOE_BENCH = "/usr/local/bin/ling-moe-decode-bench-"
+
+
+def moe_decode_ab():
+    """Routed-expert decode GEMV microbenchmark: parent, candidate and any
+    experiment variants, alternating, two passes each; digests must agree."""
+    labels = ["parent", "candidate"] + sorted(
+        os.path.basename(p)[len("ling-moe-decode-bench-"):]
+        for p in glob.glob(MOE_BENCH + "var-*"))
+    runs, gbps, digests, codes = [], {}, {}, []
+    for pass_no in (1, 2):
+        for label in labels:
+            path = MOE_BENCH + label
+            if not os.path.exists(path):
+                runs.append({"binary": label, "error": "missing " + path})
+                codes.append(1)
+                continue
+            code, stdout, err, secs = run([path, "--reps", "15", "--calls", "64"], 1800)
+            codes.append(code)
+            rows = []
+            for line in stdout.splitlines():
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    pass
+            runs.append({"binary": label, "pass": pass_no, "exit": code, "seconds": secs,
+                         "rows": rows, "stderr_tail": err[-1500:]})
+            for r in rows:
+                if "types" not in r:
+                    continue
+                key = "%s n=%d" % (r["types"], r["n"])
+                digests.setdefault(key, set()).add((r["digest_act"], r["digest_out"]))
+                g = gbps.setdefault(key, {}).setdefault(label, {"gate_up": [], "down": [], "pair": []})
+                g["gate_up"].append(r["gate_up_gbps"])
+                g["down"].append(r["down_gbps"])
+                g["pair"].append(r["pair_gbps"])
+    summary = {}
+    for key, by in gbps.items():
+        row = {"digests_identical": len(digests[key]) == 1}
+        if not row["digests_identical"]:
+            codes.append(1)
+        for label, g in by.items():
+            row[label] = {k: round(max(v), 1) for k, v in g.items() if v}
+        p, c = by.get("parent"), by.get("candidate")
+        if p and c:
+            row["candidate_over_parent"] = {k: round(max(c[k]) / max(p[k]), 3)
+                                            for k in ("gate_up", "down", "pair")}
+        summary[key] = row
+    return {"moe_decode": runs, "moe_decode_summary": summary,
+            "moe_exit": 0 if all(c == 0 for c in codes) else 1,
+            "moe_note": "GB/s = distinct experts' weight bytes / median device ms per call "
+                        "(best of two passes); bit identity: one digest pair per key"}
+
+
+def bench_records(out):
+    records = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                records.append(json.loads(line))
+            except ValueError:
+                records.append({"record": "unparsed", "text": line[:300]})
+    return records
+
+
+DECODE_AB_DEPTHS = "0,16384,65536"
+
+
+def stage_decode_ab(a):
+    """Decode t/s of the parent and this build (MTP off and on), alternating,
+    then one op-profiled MTP run of each."""
+    if not os.path.exists(PARENT_GUFO):
+        return {"error": "no parent build at " + PARENT_GUFO, "exit": 1}
+    corpus = fit_corpus()
+    binaries = {"parent": PARENT_GUFO, "candidate": GUFO}
+    runs, tps, accept = [], {}, {}
+    for mode in ("off", "mtp"):
+        for pass_no in (1, 2):
+            for label in ("parent", "candidate"):
+                cmd = [binaries[label], "bench", "-m", a.model, "-n", "128",
+                       "-d", DECODE_AB_DEPTHS, "-r", str(a.repetitions), "--speculative", mode,
+                       "--text-file", corpus, "-o", "jsonl"]
+                code, out, err, secs = run(cmd, a.bench_timeout)
+                records = bench_records(out)
+                emit({"stage": "decode_ab-run", "binary": label, "mode": mode, "pass": pass_no,
+                      "command": cmd, "exit": code, "seconds": secs, "records": records,
+                      "stderr_tail": err[-2000:]})
+                runs.append({"binary": label, "mode": mode, "pass": pass_no, "exit": code,
+                             "seconds": secs})
+                for r in records:
+                    if r.get("record") == "result" and r.get("n_gen"):
+                        key = "%s tg128@d%d" % (mode, r["n_depth"])
+                        tps.setdefault(key, {}).setdefault(label, []).extend(r.get("samples_ts", []))
+                    elif r.get("record") == "mtp":
+                        key = "mtp@d%d" % r["n_depth"]
+                        accept.setdefault(key, {}).setdefault(label, []).append(
+                            {k: r.get(k) for k in ("acceptance", "tokens_per_verified_cycle",
+                                                   "drafted", "accepted")})
+    mean = lambda v: round(sum(v) / len(v), 3) if v else None
+    summary = {}
+    for key, by in tps.items():
+        p, c = mean(by.get("parent", [])), mean(by.get("candidate", []))
+        summary[key] = {"parent_ts": p, "candidate_ts": c,
+                        "ratio": round(c / p, 4) if p and c else None,
+                        "parent_samples_ts": by.get("parent", []),
+                        "candidate_samples_ts": by.get("candidate", [])}
+    # Per-op device times of both binaries (eager, event-bracketed).
+    ops = {}
+    for label in ("parent", "candidate"):
+        cmd = [binaries[label], "bench", "-m", a.model, "-n", "64", "-d", "0,65536", "-r", "2",
+               "--speculative", "mtp", "--op-profile", "--text-file", corpus, "-o", "jsonl"]
+        code, out, err, secs = run(cmd, a.bench_timeout)
+        records = bench_records(out)
+        emit({"stage": "decode_ab-profile", "binary": label, "command": cmd, "exit": code,
+              "seconds": secs, "records": records, "stderr_tail": err[-2000:]})
+        runs.append({"binary": label, "mode": "mtp --op-profile", "pass": 1, "exit": code,
+                     "seconds": secs})
+        for r in records:
+            if r.get("record") != "mtp_profile" or "ops" not in r:
+                continue
+            if r["part"] == "verify" and r.get("width", 0) > 4:
+                continue
+            step = "%s%s@d%d" % (r["part"], "" if r.get("width") is None else "_w%d" % r["width"],
+                                 r["n_depth"])
+            ent = ops.setdefault(step, {})
+            ent.setdefault("ms_per_step", {})[label] = r.get("ms_per_step")
+            if r["part"] == "ar":
+                ent.setdefault("graph_device_ms", {})[label] = r["graph"]["device_ms"]
+            elif "launch" in r:
+                ent.setdefault("device_ms", {})[label] = r["launch"]["device_ms"]
+            for op in r["ops"]:
+                ent.setdefault("ops", {}).setdefault(op["name"], {})[label] = op["ms"]
+    codes = [r["exit"] for r in runs]
+    return {"exit": 0 if all(c == 0 for c in codes) else 1, "runs": runs, "summary": summary,
+            "mtp_acceptance": accept, "op_ms": ops, "corpus": corpus,
+            "note": "ratio = candidate / parent mean t/s over both passes; per request and "
+                    "depth, never averaged across depths; op_ms from one eager "
+                    "--op-profile run per binary (verify shared-expert ops are serial "
+                    "when profiled)"}
+
+
+DIGEST_TEST = "/opt/gufo/tests/ling_3_flash_decode_digest"
+PARENT_DIGEST_TEST = "/opt/gufo/base/ling_3_flash_decode_digest"
+
+
+def digest_report(out):
+    """The decode_digest JSON line: {"test", "pass", "digests": [...], ...}."""
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                pass
+    return {}
+
+
+def stage_digest_ab(a):
+    """decode_digest of the parent and this build must print the same lines."""
+    if not os.path.exists(PARENT_DIGEST_TEST):
+        return {"error": "no parent decode_digest at " + PARENT_DIGEST_TEST, "exit": 1}
+    cases = {"standard": ["--max-context", "1200", "--prompt-tokens", "700",
+                          "--decode-tokens", "6"],
+             "mtp": ["--mtp", "--max-context", "1200", "--prompt-tokens", "700",
+                     "--decode-tokens", "6"]}
+    results, codes = {}, []
+    for name, args in cases.items():
+        lines = {}
+        entry = {}
+        for label, path, extra in (("parent", PARENT_DIGEST_TEST, []),
+                                   ("candidate", DIGEST_TEST, ["--graph-compare"])):
+            cmd = [path, "--model", a.model, *args, *extra]
+            code, out, err, secs = run(cmd, 3000)
+            codes.append(code)
+            rep = digest_report(out)
+            lines[label] = rep.get("digests") or []
+            if rep.get("pass") is not True:
+                codes.append(1)
+            entry[label] = {"command": cmd, "exit": code, "seconds": secs,
+                            "pass": rep.get("pass"), "digest_lines": len(lines[label]),
+                            "graph_vs_eager_differ": rep.get("graph_vs_eager_differ"),
+                            "graph_replays": rep.get("graph_replays"),
+                            "stdout_tail": out[-3000:], "stderr_tail": err[-1500:]}
+        diff = [{"parent": p, "candidate": c}
+                for p, c in zip(lines["parent"], lines["candidate"]) if p != c]
+        same = (bool(lines["parent"]) and len(lines["parent"]) == len(lines["candidate"])
+                and not diff)
+        entry["identical"] = same
+        entry["first_differences"] = diff[:8]
+        if not same:
+            codes.append(1)
+        results[name] = entry
+    return {"exit": 0 if all(c == 0 for c in codes) else 1, "cases": results,
+            "note": "identical = every digest line (logits FNV-1a and device argmax per step) "
+                    "of the parent equals the candidate's"}
+
+
+def peak_dram_read():
+    code, out, err, secs = run(["gfx1151_peak"], 600)
+    for line in out.splitlines():
+        m = PEAK_LINE.match(line)
+        if m and m["name"].strip() == "DRAM read":
+            return float(m["value"])
+    return None
+
+
+BW_OPS = ("moe.expert_gate_up", "moe.expert_down", "mla.attention", "shexp.gate_up_gemv",
+          "shexp.down_gemv", "head.logits_gemv", "draft.head_logits_gemv", "kda.proj_gemv")
+
+
+def stage_mtp_profile(a):
+    corpus = fit_corpus()
+    peak = peak_dram_read() if shutil.which("gfx1151_peak") else None
+    cmd = [GUFO, "bench", "-m", a.model, "-n", "64", "-d", "0,65536", "-r", "2",
+           "--speculative", "mtp", "--op-profile", "--text-file", corpus, "-o", "jsonl"]
+    code, out, err, secs = run(cmd, a.bench_timeout)
+    records = bench_records(out)
+    prof = [r for r in records if r.get("record") == "mtp_profile"]
+    bandwidth, launch, cycles = [], [], []
+    for r in prof:
+        d, part = r["n_depth"], r["part"]
+        if part in ("ar", "draft"):
+            for op in r.get("ops", []):
+                if op["name"] in BW_OPS and op["ms"] > 0:
+                    bandwidth.append({"n_depth": d, "step": part, "op": op["name"],
+                                      "ms": op["ms"], "mbytes": op["mbytes"], "gbps": op["gbps"],
+                                      "of_peak": round(op["gbps"] / peak, 3) if peak else None})
+        if part == "ar":
+            g, e = r["graph"], r["eager"]
+            launch.append({"n_depth": d, "step": "ar", "graph_call_ms": g["call_ms"],
+                           "graph_device_ms": g["device_ms"], "eager_call_ms": e["call_ms"],
+                           "eager_issue_ms": e["issue_ms"], "eager_device_ms": e["device_ms"],
+                           "eager_minus_graph_ms": round(e["call_ms"] - g["call_ms"], 4)})
+        elif part in ("draft", "verify"):
+            l = r["launch"]
+            launch.append({"n_depth": d, "step": part, "width": r.get("width", 1),
+                           "call_ms": l["call_ms"], "issue_ms": l["issue_ms"],
+                           "device_ms": l["device_ms"], "rollback_ms": r.get("rollback_ms")})
+        elif part == "cycle":
+            cycles.append({k: r[k] for k in ("n_depth", "width", "cycles", "tokens_per_cycle",
+                                             "cycle_ms", "tokens_per_s", "phase_ms",
+                                             "draft_device_ms", "verify_device_ms",
+                                             "host_overhead_ms")})
+    body = {"command": cmd, "exit": code, "seconds": secs, "dram_read_peak_gbps": peak,
+            "bandwidth": bandwidth, "launch": launch, "cycles": cycles, "records": records,
+            "stderr_tail": err[-2500:],
+            "note": ("bandwidth: bytes each op must read (exact for one-token steps) over its "
+                     "event-bracketed device time in eager steps (includes launch gaps); "
+                     "issue_ms = host time until every launch was issued, device_ms = device "
+                     "span, call_ms = caller's clock around the step")}
+    rocprof = "/opt/rocm-7.1.1/bin/rocprofv3"
+    if os.path.exists(rocprof) and os.path.exists(PROF):
+        traces = []
+        for depth in ("0", "65536"):
+            name = "mtp_d" + depth
+            out_dir = os.path.join(WORK, "prof", name)
+            os.makedirs(out_dir, exist_ok=True)
+            pcmd = ["python3", PROF, "run", "-o", out_dir, "--tag", name, "--stages", "ling",
+                    "--top", "40", "--json", "--passes", "200", "--",
+                    GUFO, "bench", "-m", a.model, "-n", "32", "-d", depth, "-r", "1",
+                    "--speculative", "mtp", "--text-file", corpus, "-o", "jsonl"]
+            env = {**os.environ, "LD_LIBRARY_PATH": "/opt/rocm-7.1.1/lib",
+                   "PATH": "/opt/rocm-7.1.1/bin:" + os.environ.get("PATH", "")}
+            pcode, pout, perr, psecs = run(pcmd, a.bench_timeout, env=env)
+            entry = {"name": name, "command": pcmd, "exit": pcode, "seconds": psecs,
+                     "stderr_tail": perr[-1500:]}
+            start = pout.find("{")
+            try:
+                entry["summary"] = json.loads(pout[start:]) if start >= 0 else None
+            except ValueError:
+                entry["summary_text"] = pout[-8000:]
+            traces.append(entry)
+            if os.path.isdir(out_dir):
+                # Keep /work bounded: the summary is in the record.
+                for f in glob.glob(os.path.join(out_dir, "**", "*"), recursive=True):
+                    if os.path.isfile(f) and os.path.getsize(f) > (256 << 20):
+                        os.remove(f)
+        body["rocprof"] = traces
+    else:
+        body["rocprof"] = "rocprofv3 or prof.py not installed in this image"
+    return body
+
+
+HEAD_AB_TOOL = "/opt/gufo/tests/ling_3_flash_mtp_head_ab"
+
+
+def stage_mtp_head_ab(a):
+    for v in ("XDG_CACHE_HOME", "TMPDIR"):
+        os.makedirs(os.environ.get(v, os.path.join(WORK, v.lower())), exist_ok=True)
+    corpus_dir = "/opt/gufo/corpus"
+    body = {}
+    cmd = [HEAD_AB_TOOL, "--model", a.model, "--windows", "4", "--prompt-tokens", "1024",
+           "--generate", "192", "--drafts", "3"]
+    for label in ("prose", "code"):
+        cmd += ["--corpus", "%s=%s/%s.txt" % (label, corpus_dir, label)]
+    code, out, err, secs = run(cmd, a.bench_timeout)
+    body["acceptance"] = {"command": cmd, "exit": code, "seconds": secs, "records": bench_records(out),
+                          "stderr_tail": err[-2500:]}
+    corpus = fit_corpus()
+    profiles = {}
+    saved = globals()["GUFO"]
+    try:
+        for label, binary in (("parent_f16_head", PARENT_GUFO), ("candidate_q8_head", saved)):
+            if not os.path.exists(binary) and binary != "gufo":
+                profiles[label] = {"error": "missing " + binary}
+                continue
+            pcmd = [binary, "bench", "-m", a.model, "-n", "64", "-d", "0,65536", "-r", "2",
+                    "--speculative", "mtp", "--op-profile", "--text-file", corpus, "-o", "jsonl"]
+            pcode, pout, perr, psecs = run(pcmd, a.bench_timeout)
+            records = bench_records(pout)
+            entry = {"command": pcmd, "exit": pcode, "seconds": psecs, "draft": [], "cycles": []}
+            for r in records:
+                if r.get("record") != "mtp_profile":
+                    continue
+                if r["part"] == "draft":
+                    head_op = [o for o in r.get("ops", []) if o["name"] == "draft.head_logits_gemv"]
+                    entry["draft"].append({"n_depth": r["n_depth"], "launch": r["launch"],
+                                           "ms_per_step": r["ms_per_step"],
+                                           "head_op": head_op[0] if head_op else None})
+                elif r["part"] == "cycle":
+                    entry["cycles"].append({k: r.get(k) for k in (
+                        "n_depth", "width", "tokens_per_cycle", "cycle_ms", "tokens_per_s",
+                        "draft_device_ms")})
+            entry["acceptance"] = [r for r in records if r.get("record") == "mtp"]
+            entry["stderr_tail"] = perr[-1500:]
+            profiles[label] = entry
+    finally:
+        globals()["GUFO"] = saved
+    body["profile"] = profiles
+    summary = [r for r in body["acceptance"]["records"] if r.get("record") == "summary"]
+    body["exit"] = 0 if code == 0 and summary and summary[-1].get("pass") else 1
+    return body
+
+
+def stage_maxbatch(a):
+    return bench_stage(a, ["--max-batch", "2048", "-p", "2048", "-n", "128", "-d", "0,16384"])
+
+
+def gtt_used():
+    for d in sorted(glob.glob("/sys/class/drm/card*/device")):
+        u, v = read(d + "/mem_info_gtt_used"), read(d + "/mem_info_vram_used")
+        if u is not None:
+            return int(u), int(v or 0)
+    return None
+
+
+class MemorySampler:
+    """Polls the device's GTT/VRAM use while a child runs; keeps the peak."""
+
+    def __init__(self, period=2.0):
+        self.period, self.peak_gtt, self.peak_vram, self.samples = period, 0, 0, 0
+        self.peak_utc = None
+        self.base = gtt_used()
+        self.stop_flag = threading.Event()
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+
+    def loop(self):
+        while not self.stop_flag.wait(self.period):
+            m = gtt_used()
+            if m:
+                if m[0] > self.peak_gtt:
+                    self.peak_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                self.peak_gtt, self.peak_vram = max(self.peak_gtt, m[0]), max(self.peak_vram, m[1])
+                self.samples += 1
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop_flag.set()
+        self.thread.join(5)
+
+    def report(self):
+        gib = 1 << 30
+        return {"gtt_used_before_gib": round(self.base[0] / gib, 2) if self.base else None,
+                "peak_gtt_used_gib": round(self.peak_gtt / gib, 2),
+                "peak_vram_used_gib": round(self.peak_vram / gib, 2), "samples": self.samples,
+                "peak_gtt_utc": self.peak_utc}
+
+
+LONG_DEPTHS = "131072,194432,259968"
+
+
+def long_stage(a, extra, label):
+    """pp2048+tg128 at 128k/190k/254k (the model maximum is 262,144) with the in-binary
+    op_profile records; device memory is sampled over the whole run, whose last
+    phase is the deepest point."""
+    with MemorySampler() as mem:
+        body = bench_stage(a, ["-p", "2048", "-n", "128", "-d", LONG_DEPTHS, "--max-batch", "512", "--op-profile", *extra],
+                           repetitions=1)
+    body["expanded_kv"] = label
+    body["device_memory"] = mem.report()
+    body["note"] = ("peak_gtt_used includes the model (about 67.5 GiB), latent cache (1.97 GiB at "
+                    "262,144 rows), the expanded K/V store (up to its budget), scratch and state")
+    return body
+
+
+def stage_long(a):
+    return long_stage(a, [], "default 12 GiB")
+
+
+def stage_long24(a):
+    return long_stage(a, ["--expanded-kv-bytes", str(24 << 30)], "24 GiB")
+
+
+def stage_profile(a):
+    results = []
+    workloads = [("decode_d0", ["-n", "128", "-d", "0"]), ("pp2048_d0", ["-p", "2048", "-d", "0"])]
+    os.makedirs(os.path.join(WORK, "prof"), exist_ok=True)
+    for name, args in workloads:
+        out_dir = os.path.join(WORK, "prof", name)
+        cmd = ["python3", PROF, "run", "-o", out_dir, "--tag", name, "--stages", "ling",
+               "--top", "40", "--json", "--passes", "200", "--",
+               GUFO, "bench", "-m", a.model, *args, "-r", "1", "-o", "jsonl", "--speculative", "off"]
+        # AMD's HIP/HSA (hooked for rocprofiler) are used for profiling runs only.
+        env = {**os.environ, "LD_LIBRARY_PATH": "/opt/rocm-7.1.1/lib"}
+        code, out, err, secs = run(cmd, a.bench_timeout, env=env)
+        db = os.path.join(out_dir, name + "_results.db")
+        entry = {"name": name, "command": cmd, "exit": code, "seconds": secs,
+                 "db": db if os.path.exists(db) else None,
+                 "db_bytes": os.path.getsize(db) if os.path.exists(db) else None,
+                 "stderr_tail": err[-1500:]}
+        start = out.find("{")
+        if start >= 0:
+            try:
+                entry["summary"] = json.loads(out[start:])
+            except ValueError:
+                entry["summary_text"] = out[-8000:]
+        else:
+            entry["summary_text"] = out[-8000:]
+        results.append(entry)
+    return {"note": "rocprofv3 kernel trace: each profile covers weight upload, one untimed warmup "
+                    "repetition and one timed repetition of a gufo bench run. If a run fails here, the "
+                    "bench stage's stage_ms_per_rep (device-event time per block class) is the fallback "
+                    "breakdown.",
+            "runs": results}
+
+
+FIT_DEPTHS = "0,65536,131072,194432"
+FIT_CORPUS = ("/opt/gufo/corpus/prose.txt", "/opt/gufo/corpus/code.txt")
+
+
+def utc():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def hip_mem_info():
+    """hipMemGetInfo of device 0 from this process (device-wide free/total)."""
+    try:
+        hip = ctypes.CDLL("libamdhip64.so.7")
+        free, total = ctypes.c_size_t(0), ctypes.c_size_t(0)
+        code = hip.hipMemGetInfo(ctypes.byref(free), ctypes.byref(total))
+        if code != 0:
+            return {"error": "hipMemGetInfo returned %d" % code}
+        gib = 1 << 30
+        return {"free_gib": round(free.value / gib, 3), "total_gib": round(total.value / gib, 3),
+                "used_gib": round((total.value - free.value) / gib, 3)}
+    except Exception as e:  # noqa
+        return {"error": repr(e)}
+
+
+def fit_corpus():
+    """Docs then sources, written once to $TMPDIR; well over 196,481 tokens."""
+    path = os.path.join(os.environ.get("TMPDIR", os.path.join(WORK, "tmp")), "fit-corpus.txt")
+    if not os.path.exists(path):
+        parts = [open(p, encoding="utf-8").read() for p in FIT_CORPUS if os.path.exists(p)]
+        if not parts:
+            raise RuntimeError("no corpus under /opt/gufo/corpus")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n\n".join(parts))
+    return path
+
+
+def fit_run(a, store, mtp, corpus):
+    cmd = [GUFO, "bench", "-m", a.model, "-p", "2048", "-n", "128", "-d", FIT_DEPTHS,
+           "-r", str(a.fit_repetitions), "--max-batch", "512", "--expanded-kv-bytes", str(store),
+           "--text-file", corpus, "-o", "jsonl"]
+    cmd += ["--speculative", "mtp" if mtp else "off"]
+    log("run: " + " ".join(cmd))
+    body = {"expanded_kv_bytes": store, "expanded_kv_gib": round(store / (1 << 30), 2),
+            "speculative": "mtp" if mtp else "off", "command": cmd, "start_utc": utc(),
+            "note": ("after_load.hip_mem_info is hipMemGetInfo called from this driver process "
+                     "when the bench prints its ready line; whether it includes the bench's "
+                     "allocations depends on the driver. after_load.gtt_used_gib and "
+                     "device_memory (sysfs, sampled every 2 s) are device-wide.")}
+    t0 = time.monotonic()
+    after_load = {}
+    err_lines = []
+    with MemorySampler() as mem:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             errors="replace", start_new_session=True)
+
+        def pump():
+            for line in p.stderr:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+                err_lines.append(line)
+                if len(err_lines) > 600:
+                    del err_lines[:100]
+                if line.startswith("[ling] ready:") and not after_load:
+                    m = gtt_used()
+                    after_load.update(
+                        ready_line=line.strip(), utc=utc(), hip_mem_info=hip_mem_info(),
+                        gtt_used_gib=round(m[0] / (1 << 30), 3) if m else None,
+                        vram_used_gib=round(m[1] / (1 << 30), 3) if m else None)
+
+        th = threading.Thread(target=pump, daemon=True)
+        th.start()
+        out, code = read_stdout(p, a.bench_timeout)
+        th.join(5)
+    records = bench_records(out)
+    err = "".join(err_lines)
+    body.update(end_utc=utc(), exit=code, seconds=round(time.monotonic() - t0, 1),
+                after_load=after_load, device_memory=mem.report(), records=records,
+                acceptance=[r for r in records if r.get("record") == "mtp"],
+                depth_fill_log=[l for l in err.splitlines() if l.startswith("[depth ")],
+                stderr_tail=err[-2500:])
+    return body
+
+
+def stage_fit(a):
+    corpus = fit_corpus()
+    stores = [int(v) for v in a.fit_stores.split(",")]
+    runs = []
+    for mtp in (False, True):
+        for store in stores:
+            body = fit_run(a, store, mtp, corpus)
+            emit({"stage": "fit-run", **body})
+            runs.append({k: body[k] for k in ("expanded_kv_bytes", "speculative", "exit", "seconds",
+                                              "start_utc", "end_utc")})
+    return {"corpus": corpus, "depths": FIT_DEPTHS, "repetitions": a.fit_repetitions,
+            "runs": runs}
+
+
+STAGES = {"env": stage_env, "peak": stage_peak, "bench": stage_bench, "small": stage_small,
+          "maxbatch": stage_maxbatch, "long": stage_long, "long24": stage_long24,
+          "profile": stage_profile, "fit": stage_fit, "small_ab": stage_small_ab,
+          "kernels_ab": stage_kernels_ab, "mtp_profile": stage_mtp_profile,
+          "decode_ab": stage_decode_ab, "digest_ab": stage_digest_ab,
+          "mtp_head_ab": stage_mtp_head_ab}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--stages", default=os.environ.get("LING_BENCH_STAGES", "env,peak,bench,small,maxbatch"))
+    ap.add_argument("--model", default=os.environ.get("MODEL",
+                    "/models/Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf"))
+    ap.add_argument("--depths", default="0,4096,16384,65536")
+    ap.add_argument("--repetitions", type=int, default=3)
+    ap.add_argument("--bench-timeout", type=float, default=4 * 3600)
+    ap.add_argument("--fit-stores", default="0,%d,%d" % (4 << 30, 12 << 30),
+                    help="fit stage: expanded-K/V budgets in bytes")
+    ap.add_argument("--fit-repetitions", type=int, default=2)
+    ap.add_argument("--hold", type=float, default=float(os.environ.get("LING_BENCH_HOLD", 0)),
+                    help="sleep this many seconds at the end so /work can be copied out")
+    a = ap.parse_args()
+    for v in ("XDG_CACHE_HOME", "TMPDIR"):
+        os.makedirs(os.environ.get(v, os.path.join(WORK, v.lower())), exist_ok=True)
+    status = {}
+    for name in a.stages.split(","):
+        name = name.strip()
+        if name not in STAGES:
+            raise SystemExit("unknown stage " + name)
+        log("stage " + name)
+        t0 = time.monotonic()
+        try:
+            body = STAGES[name](a)
+            codes = [body.get("exit")] + [r.get("exit") for r in body.get("runs", [])]
+            status[name] = "ok" if all(c in (None, 0) for c in codes) else "failed"
+        except Exception as e:  # noqa
+            body = {"error": repr(e)}
+            status[name] = "error"
+        emit({"stage": name, "seconds": round(time.monotonic() - t0, 1), **body})
+    emit({"stage": "done", "image": os.environ.get("GUFO_IMAGE"), "status": status})
+    if a.hold > 0:
+        log("holding %.0f s; copy /work/prof now" % a.hold)
+        time.sleep(a.hold)
+    return 0 if all(v == "ok" for v in status.values()) else 1
+
+
+sys.exit(main())

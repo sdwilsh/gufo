@@ -1,0 +1,5 @@
+{
+ "category": "bugfix",
+ "expected_tests": 6,
+ "prompt": "cache.LRUCache is meant to be a least-recently-used cache: both get() and put() count as a use, and when a new key is inserted into a full cache the least recently used key is evicted. One test fails, and the implementation has more than one problem. Fix cache.py so it behaves as described (do not change the tests). get(key, default=None) returns default for missing keys; len(cache) is the number of stored keys; capacity < 1 raises ValueError."
+}

@@ -73,6 +73,9 @@ endif()
 # Qwen3.8-Flash-Next — model-private CPU reference plus ROCm runtime.
 add_subdirectory(src/models/qwen38_flash_next)
 
+# Ling-3.0-flash (bailingmoe3).
+add_subdirectory(src/models/ling_3_flash)
+
 # Qwen3-TTS — CPU reference + HIP kernels (CustomVoice 12Hz).
 add_subdirectory(src/models/qwen3_tts)
 
@@ -147,6 +150,7 @@ add_library(gufo_core STATIC
   src/core/image.cpp
   src/core/crypto/sha256.cpp
   src/core/gguf_reader.cpp
+  src/core/runtime_environment.cpp
   src/core/gguf_identity.cpp
   src/core/json_constraint.cpp
   src/core/json_schema_lexeme.cpp
@@ -222,8 +226,12 @@ add_library(gufo_llm_cli STATIC
   src/cli/prompt/prompt.cpp)
 target_link_libraries(gufo_llm_cli PUBLIC gufo_core gufo_qwen38_flash_next)
 if(ENGINE_ENABLE_HIP)
-  target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash)
+  target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash
+    gufo_ling_3_flash)
 endif()
+
+target_compile_definitions(gufo_llm_cli PRIVATE
+  GUFO_REVISION="${GUFO_REVISION}")
 
 add_library(gufo_logging STATIC src/cli/serve/logging.cpp src/cli/serve/trace.cpp)
 target_include_directories(gufo_logging PUBLIC ${PROJECT_SOURCE_DIR})
@@ -249,9 +257,11 @@ add_library(gufo_http STATIC
   src/cli/serve/asr_websocket.cpp
   src/cli/serve/tts_websocket.cpp
   src/cli/serve/openai_chat.cpp
-  # The DeepSeek tool-call scanner lives with its model; its renderer stays in
-  # the engine library, so no translation unit is linked twice.
+  # The DeepSeek and Bailing tool-call scanners live with their models; their
+  # renderers stay in the engine libraries, so no translation unit is linked
+  # twice.
   src/models/deepseek_v4_flash/tool_calls.cpp
+  src/models/ling_3_flash/tool_calls.cpp
 )
 target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21)
 
@@ -280,7 +290,8 @@ target_compile_definitions(gufo PRIVATE
   GUFO_H3_INSTALLED_SOURCE_MANIFEST="${CMAKE_INSTALL_PREFIX}/share/gufo/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json")
 
 if (ENGINE_ENABLE_HIP)
-  target_link_libraries(gufo PRIVATE gufo_cache_hip gufo_deepseek_v4_flash)
+  target_link_libraries(gufo PRIVATE gufo_cache_hip gufo_deepseek_v4_flash
+    gufo_ling_3_flash)
 endif()
 target_link_libraries(gufo PRIVATE gufo_qwen3_tts gufo_qwen3_asr)
 
@@ -434,11 +445,22 @@ if (BUILD_TESTING)
     src/cli/serve/openai_chat.cpp
     src/models/deepseek_v4_flash/chat_template.cpp
     src/models/deepseek_v4_flash/tool_calls.cpp
+    src/models/ling_3_flash/chat_template.cpp
+    src/models/ling_3_flash/tool_calls.cpp
   )
   target_link_libraries(openai_chat_test PRIVATE gufo_core)
   add_test(NAME openai_chat_test COMMAND openai_chat_test)
   set_tests_properties(openai_chat_test PROPERTIES
     LABELS "cpu;server;api;openai;streaming;tools")
+
+  add_executable(bailing_tool_calls_test
+    tests/cli/bailing_tool_calls_test.cpp
+    src/models/ling_3_flash/tool_calls.cpp
+  )
+  target_link_libraries(bailing_tool_calls_test PRIVATE gufo_core)
+  add_test(NAME bailing_tool_calls_test COMMAND bailing_tool_calls_test)
+  set_tests_properties(bailing_tool_calls_test PROPERTIES
+    LABELS "cpu;server;api;tools;ling")
 
   add_executable(quote_tracker_test tests/cli/quote_tracker_test.cpp)
   target_link_libraries(quote_tracker_test PRIVATE gufo_core)
@@ -498,6 +520,7 @@ if (BUILD_TESTING)
 
   add_subdirectory(tests/models/deepseek_v4_flash)
   add_subdirectory(tests/models/qwen38_flash_next)
+  add_subdirectory(tests/models/ling_3_flash)
 
   if(ENGINE_ENABLE_HIP)
     add_executable(chat_template_hf_token_golden_test
@@ -536,7 +559,10 @@ if (BUILD_TESTING)
     src/cli/serve/continuation_disk_store.cpp
     src/cli/serve/component_text_cache.cpp
   src/cli/serve/text_model_runner.cpp)
-  target_link_libraries(text_model_runner_test PRIVATE gufo_logging gufo_core gufo_cache)
+  target_link_libraries(text_model_runner_test PRIVATE gufo_logging gufo_core gufo_cache
+    gufo_ling_3_flash)
+  target_compile_definitions(text_model_runner_test PRIVATE
+    GUFO_LING_VOCAB_GGUF="${CMAKE_CURRENT_SOURCE_DIR}/tests/models/ling_3_flash/fixtures/ling-vocab.gguf.fixture")
   add_test(NAME text_model_runner_test COMMAND text_model_runner_test)
   set_tests_properties(text_model_runner_test PROPERTIES
     LABELS "cpu;server;runner;cache;state;lifecycle")
@@ -710,6 +736,11 @@ if (BUILD_TESTING)
 
   add_test(NAME gguf_reader_test COMMAND gguf_reader_test)
   set_tests_properties(gguf_reader_test PROPERTIES LABELS "cpu;core;gguf;model_config")
+
+  add_executable(runtime_environment_test tests/core/runtime_environment_test.cpp)
+  target_link_libraries(runtime_environment_test PRIVATE gufo_core)
+  add_test(NAME runtime_environment_test COMMAND runtime_environment_test)
+  set_tests_properties(runtime_environment_test PROPERTIES LABELS "cpu;core")
 
   add_executable(gguf_identity_test tests/core/gguf_identity_test.cpp)
   target_link_libraries(gguf_identity_test PRIVATE gufo_core)

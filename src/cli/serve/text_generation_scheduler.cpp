@@ -1214,6 +1214,23 @@ struct TextGenerationScheduler::Impl {
           }
         }
 
+        request->result.request_seq = request->id;
+        for (auto it = recent_prompts.rbegin(); it != recent_prompts.rend();
+             ++it) {
+          const auto common = static_cast<std::size_t>(
+              std::mismatch(it->tokens.begin(), it->tokens.end(),
+                            request->prompt.begin(), request->prompt.end())
+                  .first -
+              it->tokens.begin());
+          if (it == recent_prompts.rbegin()) {
+            request->result.previous_prompt_tokens = it->tokens.size();
+            request->result.previous_common_prefix_tokens = common;
+          }
+          request->result.recent_prefix_overlaps.emplace_back(it->id, common);
+        }
+        recent_prompts.push_back({request->id, request->prompt});
+        if (recent_prompts.size() > 8)
+          recent_prompts.pop_front();
         const std::weak_ptr<ScheduledRequest> weak_request = request;
         request->runner_request = runner_pool->Acquire(
             std::move(request->prompt), request->sampling,
@@ -1813,6 +1830,7 @@ struct TextGenerationScheduler::Impl {
           step.lookup_accepted_tokens;
 
       bool published = true;
+      const auto publish_start = Clock::now();
       try {
         CheckPreviewResult(item.request, step);
       } catch (...) {
@@ -1827,10 +1845,17 @@ struct TextGenerationScheduler::Impl {
         if (item.request->stop_filter.stopped())
           break;
       }
+      // A runner that times each lane reports it in TextDecodeStep::decode_ms,
+      // and the publish time is added. Otherwise the whole call counts.
+      const auto now = Clock::now();
       item.request->result.decode_ms +=
-          std::chrono::duration<double, std::milli>(Clock::now() -
-                                                    item.decode_start)
-              .count();
+          step.decode_ms.has_value()
+              ? *step.decode_ms + std::chrono::duration<double, std::milli>(
+                                      now - publish_start)
+                                      .count()
+              : std::chrono::duration<double, std::milli>(now -
+                                                          item.decode_start)
+                    .count();
       LogDecodeProgress(item.request);
       if (!published || IsTerminal(item.request)) {
         continue;
@@ -2087,6 +2112,13 @@ struct TextGenerationScheduler::Impl {
   }
 
   std::shared_ptr<TextRunnerPool> runner_pool;
+  /// Prompts of the last few admitted requests (admission thread only), for
+  /// the prompt-overlap diagnostics of the request log.
+  struct RecentPrompt {
+    std::uint64_t id;
+    std::vector<TextRunnerToken> tokens;
+  };
+  std::deque<RecentPrompt> recent_prompts;
   TextPrefillPolicy prefill_policy;
   TextSchedulerPolicy scheduler_policy;
   detail::PublicationWaitEstimate publication_prefill;

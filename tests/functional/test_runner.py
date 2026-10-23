@@ -89,6 +89,76 @@ class FunctionalRunnerTest(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(AssertionError):
                 assert_prompt_count(318, {"input_tokens": value})
 
+    def test_messages_count_tokens_lifts_plain_prompt_above_snapshot_floor(self):
+        # A Ling-like server keeps no snapshot below 128 prompt tokens, so the
+        # unchanged plain repeat can read the cache only behind the neutral
+        # system context the ling3 preset passes.
+        import types
+        import messages_count_tokens as counting
+
+        class APIStatusError(Exception):
+            def __init__(self, status, body):
+                super().__init__(status)
+                self.status_code, self.body = status, body
+
+        class Metrics:
+            def __init__(self, base_url):
+                pass
+
+            def read(self):
+                return {key: 0 for key in (*COUNTERS, PROCESSING, counting.DEFERRED)}
+
+            def wait(self, predicate, label):
+                return self.read()
+
+        class Client:
+            base_url = "http://fake/v1"
+
+            def __init__(self):
+                self.seen, self.bodies = set(), []
+
+            @staticmethod
+            def tokens(body):
+                prompt = {key: body.get(key) for key in (
+                    "system", "messages", "tools", "tool_choice", "thinking", "output_config")}
+                if isinstance(prompt["system"], list):
+                    prompt["system"] = "".join(block["text"] for block in prompt["system"])
+                return len(json.dumps(prompt, ensure_ascii=False)) // 4
+
+            def post(self, path, body, cast_to):
+                self.bodies.append((path, body))
+                if not body.get("messages") or body.get("thinking") is True or body.get("stream"):
+                    raise APIStatusError(400, {})
+                if body["model"] != "m":
+                    raise APIStatusError(404, {})
+                total = self.tokens(body)
+                if path == "/messages/count_tokens":
+                    return {"input_tokens": total}
+                if total > 4096:
+                    raise APIStatusError(400, {})
+                key = json.dumps({k: v for k, v in body.items() if k != "max_tokens"},
+                                 sort_keys=True)
+                cached = total - 9 if key in self.seen and total >= 128 else 0
+                self.seen.add(key)
+                return {"content": [{"type": "text", "text": "COUNT_OK"}],
+                        "timings": {"prompt_n": total - cached},
+                        "usage": {"input_tokens": total - cached,
+                                  "cache_read_input_tokens": cached,
+                                  "cache_creation_input_tokens": 0, "output_tokens": 3}}
+
+        fake_openai = types.SimpleNamespace(APIStatusError=APIStatusError)
+        context = "Reference note: the build uses CMake presets.\n" * 16
+        with patch.dict(sys.modules, {"openai": fake_openai}), \
+                patch.object(counting, "ServerMetrics", Metrics), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(AssertionError):
+                counting.check_messages_count_tokens(Client(), "m", {}, 4096)
+            client, checks = Client(), {}
+            counting.check_messages_count_tokens(client, "m", checks, 4096, context)
+        self.assertEqual(client.bodies[0][1]["system"], context)
+        self.assertGreater(checks["messages_count_tokens_plain_cached"]
+                           ["usage"]["cache_read_input_tokens"], 0)
+
     def test_harness_hash_covers_imported_modules(self):
         # Baselines are matched by harness_sha256, so modules reached only
         # through imports must change the hash too.
@@ -308,6 +378,34 @@ class FunctionalRunnerTest(unittest.TestCase):
                        {"tools": [{"function": {"name": "edit", "arguments": "{}"}}]}):
             with self.subTest(change=change), self.assertRaises(AssertionError):
                 assert_edit({**result, **change})
+
+    def test_tool_reasoning_records_an_unexercised_marker_when_allowed(self):
+        result = {"text": "", "reasoning": "The suffix is corrupt.",
+                  "finish": "tool_calls", "tools": [{"function": {
+                      "name": "edit", "arguments": json.dumps(ARGUMENTS)}}]}
+        self.assertFalse(assert_edit(result, require_marker=False))
+        self.assertTrue(assert_edit({**result, "reasoning": "Quoted <tool_call>."}, False))
+        for change in ({"text": "leaked reasoning"}, {"tools": []},
+                       {"tools": [{"function": {"name": "edit", "arguments": "{}"}}]}):
+            with self.subTest(change=change), self.assertRaises(AssertionError):
+                assert_edit({**result, **change}, require_marker=False)
+
+    def test_cache_edits_names_checkpoints_the_ram_budget_refused(self):
+        from cache_edits import refused_checkpoints
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "server.log"
+            log.write_text(
+                "[WARN] [cache] event=snapshot action=skipped reason=byte_capacity "
+                "bytes=98081728 tokens=2048 retained_bytes=1\n")
+            start = log.stat().st_size
+            with log.open("a") as out:
+                out.write("[WARN] [cache] event=snapshot action=skipped reason=entry_capacity "
+                          "bytes=5 tokens=3253 retained_bytes=1\n"
+                          "[WARN] [cache] event=snapshot action=skipped reason=capture_failure "
+                          "bytes=5 tokens=7 retained_bytes=1\n")
+            self.assertEqual(refused_checkpoints(log, 0), [2048, 3253])
+            self.assertEqual(refused_checkpoints(log, start), [3253])
+            self.assertEqual(refused_checkpoints(None, 0), [])
 
     def test_envelope_workflow_rejects_missing_calls_and_damaged_arguments(self):
         command = "printf '%s' '</invoke>'"
@@ -690,7 +788,7 @@ class FunctionalRunnerTest(unittest.TestCase):
                                      replay in ("keep_reasoning", "discard_reasoning"))
 
     def test_cache_growth_rejects_a_frozen_checkpoint(self):
-        with self.assertRaisesRegex(AssertionError, "cache did not advance"):
+        with self.assertRaisesRegex(AssertionError, "check=.*_turn_\\d+ expected=cached >= \\d+ and > previous cached"):
             self.run_cache_growth(pinned=True)
 
     def test_cache_growth_requires_actual_reasoning(self):
@@ -775,7 +873,7 @@ class FunctionalRunnerTest(unittest.TestCase):
             self.run_cache_concurrency(regress="prefill")
 
     def test_cache_concurrency_rejects_waiting_without_a_shared_prefix(self):
-        with self.assertRaisesRegex(AssertionError, "waited without a shared prefix"):
+        with self.assertRaisesRegex(AssertionError, "check=short_shared_wait expected=no request waits .*actual=requests \\[.*\\] waited"):
             self.run_cache_concurrency(regress="wait")
 
     def run_cache_shared_prefix(self, regress=False):
@@ -821,7 +919,7 @@ class FunctionalRunnerTest(unittest.TestCase):
         self.assertEqual(len(warm), 8)
 
     def test_cache_shared_prefix_rejects_grid_only_reuse(self):
-        with self.assertRaisesRegex(AssertionError, "of the shared system prompt"):
+        with self.assertRaisesRegex(AssertionError, "check=long_tasks_2_reuse expected=cached_tokens >= \\d+ \\(shared system prompt\\)"):
             self.run_cache_shared_prefix(regress=True)
 
     def run_cache_compaction(self, regression=None):
@@ -1764,6 +1862,39 @@ p.with_suffix(".requests.json").write_text(json.dumps({"version": 1, "requests":
                 self.assertEqual(report["status"], expected)
                 self.assertEqual(status, 0 if expected == "passed" else 1)
 
+    def test_loaded_mode_mismatch_after_passing_suites_is_printed(self):
+        # A model whose default is a draft mode, served without --speculative:
+        # every suite passes, yet the run fails on the loaded-mode check. The
+        # reason must reach stdout, not only report.json.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "openai_sdk.py").write_text(
+                'import json,sys; from pathlib import Path; '
+                'p=Path(sys.argv[sys.argv.index("--output")+1]); '
+                'p.write_text(json.dumps({"status":"passed"})); '
+                'p.with_suffix(".requests.json").write_text(json.dumps({"version":1,'
+                '"requests":[{"status":"complete","wall_ms":1,"endpoint":"/v1/models",'
+                '"request_sha256":"fixture"}]}))')
+            args = ["run.py", "--record-baseline", "--output", str(root / "report"),
+                    "--sampling-preset", "ling3", "--suite", "stream-start", "--",
+                    sys.executable, "serve", "llm", "--model", "fixture.gguf"]
+            out = io.StringIO()
+            mismatch = ValueError("server.log: requested off, loaded modes ['mtp']")
+            with patch.object(sys, "argv", args), patch.object(functional, "TESTS", root), \
+                 patch.object(functional, "server", return_value=contextlib.nullcontext()), \
+                 patch.object(functional, "provenance", return_value={}), \
+                 patch.object(functional, "join_server_timings"), \
+                 patch.object(functional, "execution_coverage", side_effect=mismatch), \
+                 contextlib.redirect_stdout(out):
+                status = functional.main()
+            report = json.loads((root / "report/report.json").read_text())
+            self.assertEqual(status, 1)
+            self.assertEqual(report["suites"]["stream-start"]["status"], "passed")
+            self.assertIn("loaded modes", report["measurements_error"])
+            self.assertIn("check=execution expected=loaded mode and per-request "
+                          "measurements are valid actual=server.log: requested off, "
+                          "loaded modes ['mtp']", out.getvalue())
+
     def test_disk_cache_is_removed_after_restart_checks(self):
         for exit_code, continuation_report, spacing_exact, expected in (
             (0, {"status": "passed", "exact": True}, True, "passed"),
@@ -1904,6 +2035,52 @@ class PiWatchdogTest(unittest.TestCase):
         self.assertEqual(repeated_actions(history([
             "missing module", "case 1 fails", "case 2 fails", "ok"])), 1)
 
+
+class FailureReportTest(unittest.TestCase):
+    def test_assertion_names_condition_and_observation(self):
+        from check_report import failure_lines
+        result = {"text": "ALPHA.699", "finish": "stop"}
+        try:
+            assert result["text"] == "ALPHA", result
+        except AssertionError as error:
+            (line,) = failure_lines(error, "long_tasks_0")
+        self.assertRegex(line, r"^check=long_tasks_0@\S+:\d+ expected=result\['text'\] == 'ALPHA' "
+                               r"actual=false; \{.*ALPHA\.699")
+        self.assertNotIn("\n", line)
+
+    def test_check_lines_pass_through_and_exceptions_name_the_root_cause(self):
+        from check_report import check_line, describe, failure_lines
+        own = [check_line("a", "x", "y"), check_line("b", "p", "q")]
+        self.assertEqual(failure_lines(AssertionError("\n".join(own))), own)
+        try:
+            try:
+                raise ModuleNotFoundError("No module named 'jsonschema'")
+            except ImportError as cause:
+                raise ConnectionError("Connection error.") from cause
+        except ConnectionError as error:
+            self.assertIn("root cause: ModuleNotFoundError", describe(error))
+            (line,) = failure_lines(error, "long_schema_cold")
+        self.assertTrue(line.startswith("check=long_schema_cold expected=the request completes "))
+        self.assertIn("jsonschema", line)
+
+    def test_suite_failure_prints_checks_and_server_tail_on_connection_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "long-context.log").write_text(
+                "CHECK x\ncheck=long_schema_cold expected=a actual=b\n")
+            (root / "server.log").write_text("".join(f"line {n}\n" for n in range(100)))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                functional.report_failure("long-context", root, "exit 1; see long-context.log")
+                self.assertNotIn("server.log tail", out.getvalue())
+                (root / "long-context.log").write_text(
+                    "check=long_schema_cold expected=a actual=Connection error.\n")
+                functional.report_failure("long-context", root, "exit 1; see long-context.log")
+            text = out.getvalue()
+            self.assertIn("check=long_schema_cold expected=a actual=b", text)
+            self.assertIn("server.log tail (long-context)", text)
+            self.assertIn("line 99", text)
+            self.assertNotIn("line 39\n", text)
 
 
 class ClaudeCodeAgentTest(unittest.TestCase):

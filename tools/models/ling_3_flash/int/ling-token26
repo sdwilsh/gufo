@@ -1,0 +1,141 @@
+#!/usr/bin/python3
+"""Token-26 tie-break study, G (int2r5, WS11 merged) vs G0 (int2r4, pre-WS11).
+
+usage: ling-token26 [--suite FILE]      (normally run as: ling-int-suite --part token26)
+
+1. run-suite --suite /opt/gufo/suites/token26.txt: for each of G and G0, layer_check
+   against the F64 reference (R3_gpu_ref, teacher ids story_teacher_ids.txt; dumps
+   router_ids per layer into free/, teacher_prefill/, teacher_decode/) and a
+   logit_dump of position 55 (the logits that predict story token 26).
+2. compare_routing.py --ref R3_gpu_ref over all six dump dirs. Its stderr passes
+   through, and the full stdout table goes into the token26-compare record as lines.
+3. Print JSON lines on stdout only: {"stage":"token26-step",...} per step,
+   {"stage":"token26-routing", ...} per run, then
+   {"stage":"token26","R3":...,"G":...,"G0":...}.
+Reference values: R3 (F64) picks 464 (-0.541) over 259 (-1.085); R2 (CPU, F16 cache)
+picks 259 and first differs at position 0 layers 5/41 and at position 55 layer 30
+(expert 253->146, R3 margin 6.3e-4).
+"""
+import argparse, array, json, math, os, subprocess, sys
+
+HOME = os.environ.get("HOME", "/work")
+F64 = os.environ.get("LING_F64_DIR", "/opt/gufo/f64")
+OUT = os.path.join(HOME, "tmp", "token26")
+TOP = 5
+
+
+def out(d):
+    print(json.dumps(d, separators=(",", ":")), flush=True)
+
+
+def top_logprobs(path, row=0, vocab=None):
+    a = array.array("f")
+    with open(path, "rb") as f:
+        a.frombytes(f.read())
+    if sys.byteorder != "little":
+        a.byteswap()
+    if vocab is None:
+        vocab = len(a)
+    r = a[row * vocab:(row + 1) * vocab]
+    m = max(r)
+    lse = m + math.log(sum(math.exp(x - m) for x in r))
+    idx = sorted(range(len(r)), key=lambda i: -r[i])[:TOP]
+    return [{"id": i, "logit": round(r[i], 4), "logprob": round(r[i] - lse, 4)} for i in idx]
+
+
+def prune(root):
+    """Keep only router_ids.lNN.i32 and index.json in every layer_check dump dir."""
+    for d, _, files in os.walk(root):
+        if os.path.basename(d) not in ("free", "teacher_prefill", "teacher_decode",
+                                       "teacher_prefill_split", "teacher_chunks_of_5"):
+            continue
+        for f in files:
+            if not (f.startswith("router_ids.") or f == "index.json"):
+                os.remove(os.path.join(d, f))
+
+
+def token26(path):
+    t = top_logprobs(path)
+    return {"top": t, "top1": t[0]["id"], "top2": t[1]["id"],
+            "gap_logprob": round(t[0]["logprob"] - t[1]["logprob"], 4),
+            "picks_464": t[0]["id"] == 464}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--suite", default="/opt/gufo/suites/token26.txt")
+    a = ap.parse_args()
+    os.makedirs(OUT, exist_ok=True)
+    raw = os.path.join(HOME, "reports", "token26-run-suite.raw")
+    os.makedirs(os.path.dirname(raw), exist_ok=True)
+    # Run one run-suite per step. A layer_check writes about 1.1 GB of per-layer
+    # tensors, so prune each dump tree to router_ids and index.json before the
+    # next step. That keeps /work under 2 GB.
+    steps = [l for l in open(a.suite) if l.split("#")[0].strip()]
+    res = []
+    for i, line in enumerate(steps):
+        one = os.path.join(OUT, "step%d.txt" % i)
+        with open(one, "w") as f:
+            f.write(line)
+        with open(raw, "wb") as f:
+            subprocess.run(["run-suite", "--suite", one], stdout=f)
+        try:
+            res += json.load(open(raw)).get("results", [])
+        except ValueError:
+            res.append({"name": "step%d" % i, "status": "FAIL", "tail": open(raw, errors="replace").read()[-1500:]})
+        prune(OUT)
+    for r in res:
+        j = r.get("json") or {}
+        out({"stage": "token26-step", "name": r.get("name"), "status": r.get("status"),
+             "seconds": r.get("seconds"), "tail": r.get("tail", "")[-1500:],
+             "report": {k: j.get(k) for k in ("status", "summary", "last_token_top1", "free_run_ms",
+                                              "dump", "error") if k in j}})
+
+    cands = []
+    for run in ("G", "G0"):
+        base = os.path.join(OUT, run + "_lc")
+        for kind, sub in (("prefill", "teacher_prefill"), ("decode", "teacher_decode"), ("free", "free")):
+            cands.append("%s_%s=%s" % (run, kind, os.path.join(base, sub)))
+    cmp_json = os.path.join(OUT, "compare.json")
+    cp = subprocess.run([sys.executable, "/opt/gufo/compare_routing.py", "--ref", F64 + "/R3_gpu_ref",
+                         "--json", cmp_json, *cands], capture_output=True, text=True)
+    sys.stderr.write(cp.stderr)
+    out({"stage": "token26-compare", "exit": cp.returncode, "lines": cp.stdout.splitlines()})
+    cmp = json.load(open(cmp_json)) if os.path.exists(cmp_json) else {}
+    r2 = json.load(open(F64 + "/compare.json")).get("R2", {}).get("differences", [])
+    r2_at = {(d["layer"], d["pos"]): d for d in r2}
+    summary = {}
+    for name, v in cmp.items():
+        diffs = v["differences"]
+        first = diffs[0] if diffs else None
+        row = {"compared": v["compared"], "n_diff": len(diffs), "first": first}
+        if first:
+            m = r2_at.get((first["layer"], first["pos"]))
+            row["first_also_in_R2"] = bool(m) and m["ref_only"] == first["ref_only"] \
+                and m["cand_only"] == first["cand_only"]
+            row["first_set_diff_in_R2_any_experts"] = bool(m)
+        row["n_diff_also_in_R2"] = sum(1 for d in diffs if (d["layer"], d["pos"]) in r2_at)
+        at55 = [d for d in diffs if d["pos"] == 55]
+        row["pos55_diffs"] = at55
+        row["pos55_in_R2"] = [bool(r2_at.get((d["layer"], d["pos"]))) for d in at55]
+        out({"stage": "token26-routing", "run": name, **row})
+        summary[name] = row
+    study = {"stage": "token26", "R3": None, "R2_first_diffs": [(d["layer"], d["pos"]) for d in r2[:3]],
+             "routing_first_diff": {k: v["first"] for k, v in summary.items()}}
+    try:
+        study["R3"] = token26(F64 + "/R3_gpu_ref/logits.f32")
+    except OSError as e:
+        study["R3"] = {"error": str(e)}
+    for run in ("G", "G0"):
+        try:
+            study[run] = token26(os.path.join(OUT, run + "_logits", "logits.f32"))
+        except OSError as e:
+            study[run] = {"error": str(e)}
+    out(study)
+    ok = len(res) == 4 and all(r.get("status") in ("PASS", "FAIL") for r in res) \
+        and "error" not in study["G"] and "error" not in study["G0"] and len(cmp) == 6
+    out({"stage": "token26-done", "ok": ok, "steps": {r.get("name"): r.get("status") for r in res}})
+    return 0 if ok else 1
+
+
+sys.exit(main())
