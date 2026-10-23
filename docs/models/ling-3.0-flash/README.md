@@ -95,8 +95,8 @@ expanded K/V store, the sessions, and the working buffers.
 | | AD-Q4_K_S | AD-Q5_K_M |
 | --- | ---: | ---: |
 | Weights | 70.76 GiB | 85.29 GiB |
-| GTT peak, one session, AR (measured, default store, context 199296) | 83.34 GiB | 97.52 GiB |
-| GTT peak, one session, MTP (measured) | 85.56 GiB | 100.09 GiB |
+| GTT peak, one session, AR (measured, default store, context 199296) | 83.96 GiB | 98.14 GiB |
+| GTT peak, one session, MTP (measured) | 86.18 GiB | 100.71 GiB |
 
 - Each session at `--context 196608` takes about 1.76 GiB with MTP and 1.55 GiB
   without. That is a 75.5 MiB recurrent state plus 8,068 bytes per context
@@ -106,11 +106,11 @@ expanded K/V store, the sessions, and the working buffers.
   served (`--expanded-kv-bytes`, 12 GiB by default, 0 disables). It holds the
   expanded MLA keys and values that prefill reads. A smaller pool only slows
   deep-context speed, and outputs stay bit for bit identical.
-- AD-Q5_K_M needs more than 100 GiB at the default store. I measured 97.5 GiB
-  with AR and 100.1 GiB with MTP on a 108 GiB limit. On a 96 GiB limit, pass
+- AD-Q5_K_M needs more than 100 GiB at the default store. I measured 98.1 GiB
+  with AR and 100.7 GiB with MTP on a 108 GiB limit. On a 96 GiB limit, pass
   `--expanded-kv-bytes 4294967296`. That frees about 8 GiB. On the earlier
   Q4_K_S file, cutting the store from 12 to 4 GiB cut the peak from 81.7 to
-  73.8 GiB. Q5_K_M should therefore peak near 90 GiB (AR) and 92 GiB (MTP)
+  73.8 GiB. Q5_K_M should therefore peak near 90 GiB (AR) and 93 GiB (MTP)
   there, but this figure is an estimate, not a measurement.
 - AD-Q4_K_S fits both a 96 and a 108 GiB limit at the defaults.
 - A RAM cache checkpoint is 79.19 MB of private state plus 8,068 B per token
@@ -139,10 +139,10 @@ expanded K/V store, the sessions, and the working buffers.
   echoes, quotes), the tokens that followed are verified as the draft without
   running the drafter, up to seven per step. Greedy output is unchanged and
   sampled output keeps the target distribution. With the MTP drafts, the
-  repetitive workload decodes at 2.2 to 3.0 times the autoregressive rate. On
-  prose, where long copies are rare, MTP alone gives 0 to 1.4 times, depending
-  on draft acceptance (AD-Q4_K_S 1.4 times at depth 0 and none at 131k;
-  AD-Q5_K_M 1.12 and 1.16 times)
+  repetitive workload decodes at 2.2 to 3.2 times the autoregressive rate. On
+  prose, where long copies are rare, MTP alone gives 0.98 to 1.45 times,
+  depending on draft acceptance and depth (AD-Q4_K_S 1.45 times at depth 0 and
+  0.98 at 131k; AD-Q5_K_M 1.29 and 1.02 times)
   ([Benchmarks](BENCHMARKS.md#single-user-mtp)).
 - Up to eight decoding requests (at most `--sessions`) share one forward pass,
   with or without MTP. Each request's tokens, logits, and state stay
@@ -163,7 +163,7 @@ the component cache (shared latent-row chunks, copied recurrent state) with a
   its adapter in `src/models/ling_3_flash/continuation_adapter.*`. Disk cache
   directories written by the earlier snapshot format are rebuilt cold. The
   benchmark figures on this card were measured on the component cache, with
-  the v0.17.1 build.
+  the v0.21.0.0 build.
 - **Tool-call streaming.** The Bailing parser publishes a tool call only after
   its first argument value opens or an argument finishes. A header-only call (a
   function name with no argument) is never published, and an end of stream there

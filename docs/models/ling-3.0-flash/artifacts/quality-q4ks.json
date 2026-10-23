@@ -3,11 +3,11 @@
   "model": "Ling-3.0-flash-AD-Q4_K_S-00001-of-00002.gguf",
   "variant": "q4ks",
   "source": {
-    "revision": "3186127220b071a884270ef5004d34bf6d675038",
+    "revision": "b1c4b4129327c0c5ce2a100b09f80137d6f0ff41",
     "dirty": "0",
-    "image": "ephemeral-container-registry.hogs.tswn.us/gufo-ling-426:n173-q4ks-24h"
+    "image": "ephemeral-container-registry.hogs.tswn.us/gufo-ling-426:n174-q4ks-24h"
   },
-  "measuredOn": "2026-10-20",
+  "measuredOn": "2026-10-23",
   "bases": {
     "chat128.kl": "087096abe9313b2df74d01d3c2c0d277c46793620d73e2b2e32534c4313a5e6e",
     "window512.kl": "059db4f6b2534d2f614e17a9c61a8ae4545f755503338207620dfaf22b0d02e0"

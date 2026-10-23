@@ -22,7 +22,7 @@
     "fingerprintId": "f3bf7553454ce41947a30c5f7df2bd7a4018ccb2681fad2196c008ddd511c8aa",
     "schemaVersion": "1.0.0"
   },
-  "measuredOn": "2026-10-19",
+  "measuredOn": "2026-10-23",
   "mode": "mtp",
   "model": {
     "id": "Ling-3.0-flash",
@@ -39,7 +39,7 @@
       "acceptance_sd": null,
       "accepted_per_step": 5.4,
       "accepted_per_step_sd": null,
-      "command": "gufo serve --port 53367 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
+      "command": "gufo serve --port 53407 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
       "counts": [
         {
           "cache_n": 0,
@@ -50,10 +50,10 @@
           "prompt_n": 2025
         }
       ],
-      "pp": 1008.34,
+      "pp": 998.98,
       "pp_sd": null,
       "samples": 1,
-      "tg": 109.64,
+      "tg": 109.08,
       "tg_sd": null,
       "workload": "repetition"
     },
@@ -62,7 +62,7 @@
       "acceptance_sd": null,
       "accepted_per_step": 5.1,
       "accepted_per_step_sd": null,
-      "command": "gufo serve --port 53367 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
+      "command": "gufo serve --port 53407 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
       "counts": [
         {
           "cache_n": 131224,
@@ -73,10 +73,10 @@
           "prompt_n": 2045
         }
       ],
-      "pp": 459.37,
+      "pp": 459.88,
       "pp_sd": null,
       "samples": 1,
-      "tg": 63.03,
+      "tg": 63.12,
       "tg_sd": null,
       "workload": "repetition"
     },
@@ -85,7 +85,7 @@
       "acceptance_sd": null,
       "accepted_per_step": 4.82,
       "accepted_per_step_sd": null,
-      "command": "gufo serve --port 53367 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
+      "command": "gufo serve --port 53407 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
       "counts": [
         {
           "cache_n": 32761,
@@ -96,10 +96,10 @@
           "prompt_n": 2043
         }
       ],
-      "pp": 795.27,
+      "pp": 801.29,
       "pp_sd": null,
       "samples": 1,
-      "tg": 88.18,
+      "tg": 88.17,
       "tg_sd": null,
       "workload": "repetition"
     },
@@ -108,7 +108,7 @@
       "acceptance_sd": null,
       "accepted_per_step": 4.82,
       "accepted_per_step_sd": null,
-      "command": "gufo serve --port 53367 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
+      "command": "gufo serve --port 53407 --sessions 1 llm --model Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --cache-ram-bytes 2147483648 --speculative mtp",
       "counts": [
         {
           "cache_n": 65553,
@@ -119,10 +119,10 @@
           "prompt_n": 2048
         }
       ],
-      "pp": 660.49,
+      "pp": 665.07,
       "pp_sd": null,
       "samples": 1,
-      "tg": 76.82,
+      "tg": 77.12,
       "tg_sd": null,
       "workload": "repetition"
     }
@@ -133,7 +133,7 @@
       "gufo",
       "serve",
       "--port",
-      "53367",
+      "53407",
       "--sessions",
       "1",
       "llm",
@@ -156,7 +156,7 @@
   "source": {
     "buildMode": "nix-release",
     "dirty": false,
-    "revision": "3186127220b071a884270ef5004d34bf6d675038"
+    "revision": "b1c4b4129327c0c5ce2a100b09f80137d6f0ff41"
   },
   "table": "single-mtp-repetition-q5km",
   "target": "gufo"

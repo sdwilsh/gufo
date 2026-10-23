@@ -39,15 +39,13 @@ gave bit-identical results for every Gufo and llama.cpp step.
 
 One step fails its gate. The raw AD-Q4_K_S Gufo bulk-prefill step on the novel
 text fails `logit_dump`'s top-1 gate (at least 0.98; measured 0.9765, 6 of 255
-positions), although its mean KL is 0.00092. The previous card showed the same
-step failing at 0.9686. The flips are near-ties between tokens, not
-distribution error. The status stays `fail` in
+positions), although its mean KL is 0.00092. The flips are near-ties between
+tokens, not distribution error. The status stays `fail` in
 [quality-q4ks.json](artifacts/quality-q4ks.json). Every other step passed.
 
-The prefill rows changed from the previous card because the v0.17.1 build pins
-the order of the dot products in the KDA prefill kernels. The decode rows are
-unchanged. The Q5_K_M novel-text prefill row has the highest Gufo mean KL on
-this page, 0.00156.
+Prefill and decode KL are unchanged from the previous card, which was measured
+on the v0.17.1 build. All 14 steps match that round bit for bit. The Q5_K_M
+novel-text prefill row has the highest Gufo mean KL on this page, 0.00156.
 
 Reading the numbers:
 
@@ -131,14 +129,15 @@ The sessions, prompts and per-cell counts stay private.
 
 ## Benchmark method
 
-I measured Gufo on October 19 and 20, 2026 on the v0.17.1 build (gufo 0.17.1.0,
-0cbd54d) with the evidence kit (nix-release build mode), Fedora 44 kernel
-7.2.9, ROCm 7.2.3, AMD clang 22, Gufo binary SHA-256
-`e5d1dfc7e8a0c36069d3bfaffd0cf51f0ed62e22057a3195c4b3bab0bc2a0f11`. Each Gufo
-artifact in [artifacts](artifacts/) records the evidence-kit revision
-`3186127220b071a884270ef5004d34bf6d675038`, which is 0cbd54d plus kit files
-only. The speed tables ran on the machine of each llama.cpp reference. The KL
-steps ran on October 19 (AD-Q5_K_M) and October 20 (AD-Q4_K_S). I measured
+I measured Gufo on October 23, 2026 on the v0.21.0.0 build (gufo 0.21.0.0 at
+00eea62, built with Nix) with the evidence kit (nix-release build mode), Fedora
+44 kernel 7.2.9, ROCm 7.2.3, and AMD clang 22. The Gufo binary is the ELF
+`.gufo-wrapped` (SHA-256
+`ae863666ee5c9e8d45722cda87cda38f6fad2985b0ae721344d3c9522e2454f8`) behind a Nix
+wrapper script. Each Gufo artifact in [artifacts](artifacts/) records the
+evidence-kit revision `b1c4b4129327c0c5ce2a100b09f80137d6f0ff41`, which is
+00eea62 plus kit files only. The speed tables ran on the machine of each
+llama.cpp reference. The KL steps for both files ran on October 23. I measured
 llama.cpp on October 12, 2026 with the `server-vulkan-v0.5.0` image (build
 11146, commit 7fe450e19, Mesa 26.0.8 RADV).
 

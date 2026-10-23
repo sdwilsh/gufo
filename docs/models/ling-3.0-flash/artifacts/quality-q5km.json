@@ -3,11 +3,11 @@
   "model": "Ling-3.0-flash-AD-Q5_K_M-00001-of-00003.gguf",
   "variant": "q5km",
   "source": {
-    "revision": "3186127220b071a884270ef5004d34bf6d675038",
+    "revision": "b1c4b4129327c0c5ce2a100b09f80137d6f0ff41",
     "dirty": "0",
-    "image": "ephemeral-container-registry.hogs.tswn.us/gufo-ling-426:n173-q5km-24h"
+    "image": "ephemeral-container-registry.hogs.tswn.us/gufo-ling-426:n174-q5km-24h"
   },
-  "measuredOn": "2026-10-19",
+  "measuredOn": "2026-10-23",
   "bases": {
     "chat128.kl": "4132b92c7c6d22255d498f15c7865ee90a50c6e8cec171f5907ae5afb8251f26",
     "window512.kl": "24d157ed78308379d8b142687752c2e76f2f56175f0f9a910ad2cf892bb4e4e1"
