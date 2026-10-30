@@ -12,6 +12,9 @@ function(add_qwen27b_test target source labels)
 endfunction()
 
 add_qwen27b_test(qwen27b_vision_test vision_test.cpp "cpu;vision;correctness")
+# The test encodes WebP fixtures with libwebp. Production decodes WebP in Rust.
+pkg_check_modules(WEBP REQUIRED IMPORTED_TARGET libwebp)
+target_link_libraries(qwen27b_vision_test PRIVATE PkgConfig::WEBP)
 add_qwen27b_test(qwen27b_continuation_layout_test continuation_layout_test.cpp
   "cpu;correctness")
 

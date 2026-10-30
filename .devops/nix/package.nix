@@ -15,6 +15,9 @@
   openssl,
   ffmpeg-headless,
   ccache,
+  cargo,
+  rustc,
+  rustPlatform,
   rocmPackages,
   releaseVersion ? null,
   revision,
@@ -28,6 +31,7 @@ let
   rocmRuntime = rocmPackages.rocm-runtime.overrideAttrs (old: {
     patches = (old.patches or [ ]) ++ [ ./patches/rocr-fixed-cwsr-rocm10.patch ];
   });
+  cargoSetup = import ./image-decode-cargo.nix { inherit rustPlatform; };
   versionLabel = if releaseVersion == null then "development" else releaseVersion;
   packageVersion =
     if releaseVersion == null then "0-unstable-${revision}" else releaseVersion;
@@ -66,6 +70,8 @@ stdenv.mkDerivation {
     ninja
     pkg-config
     makeWrapper
+    cargo
+    rustc
     rocmPackages.clr
   ];
 
@@ -74,6 +80,9 @@ stdenv.mkDerivation {
     curl
     libpng
     libjpeg
+    # Unused by this tree, which decodes WebP in Rust. Devlab builds the
+    # baseline source with this package definition (tools/ci/linux-baseline.nix),
+    # and baselines before the Rust decoder still link libwebp.
     libwebp
     libsndfile
     soxr
@@ -102,7 +111,7 @@ stdenv.mkDerivation {
   # C/C++ sources. Keep HIP uncached: Clang emits a bundled preprocessor output
   # whose included headers ccache 4.13.6 does not record. A header-only change
   # can then reuse a stale HIP object, including one from the timing baseline.
-  preConfigure = ''
+  preConfigure = cargoSetup + ''
     ccache_dir=/tmp/gufo-ccache
     if [[ -d "$ccache_dir" && -w "$ccache_dir" ]]; then
       export CCACHE_DIR="$ccache_dir"

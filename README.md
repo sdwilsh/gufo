@@ -196,7 +196,9 @@ limits disallow those pins. Gufo leaves `HSA_USERPTR_FOR_PAGED_MEM` unchanged.
 | --- | --- |
 | ROCm HIP compiler/runtime, hipBLAS, hipBLASLt, rocBLAS | GPU execution and matrix multiplication |
 | hipCUB, rocPRIM, rocWMMA headers | Compiled GPU kernels |
-| ICU, libcurl, OpenSSL, libpng, libjpeg, libwebp | Tokenization, HTTPS, hashing and images |
+| ICU, libcurl, OpenSSL, libpng, libjpeg | Tokenization, HTTPS, hashing and images |
+| Rust 1.88 or newer (`cargo`, `rustc`) | PNG and WebP decoding; cargo fetches the crates in `src/core/image_decode/Cargo.lock` |
+| libwebp | WebP test fixtures (`BUILD_TESTING` only) |
 | FFmpeg development libraries | Video embedding decoding and RGB conversion |
 | libsndfile, libsoxr | Audio decoding and reference-compatible resampling |
 | FFmpeg and ffprobe | Video/audio output; invoked as separate executables |
@@ -210,6 +212,9 @@ For example, on Debian/Ubuntu the ordinary system libraries are:
 ```sh
 sudo apt install build-essential cmake ninja-build pkg-config \
   libicu-dev libcurl4-openssl-dev libssl-dev libpng-dev libjpeg-dev libwebp-dev libsndfile1-dev libsoxr-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev ffmpeg
+
+# Distribution cargo packages are often older than Rust 1.88; rustup is current.
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # ROCm libraries from the table, named as AMD's repository ships them.
 sudo apt install hipblas-dev hipblaslt-dev rocblas-dev \

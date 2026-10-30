@@ -1,0 +1,17 @@
+[package]
+name = "gufo-image-decode"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+debug = 1
+
+[dependencies]
+image-webp = "0.2.4"
+png = "0.18.1"
