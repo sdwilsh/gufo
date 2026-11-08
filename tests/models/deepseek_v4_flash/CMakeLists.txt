@@ -119,6 +119,16 @@ if(ENGINE_ENABLE_HIP)
     RESOURCE_LOCK ds4_model
     SKIP_RETURN_CODE 77)
 
+  add_executable(ds4_prefill_tail_test prefill_tail_test.cpp)
+  target_compile_definitions(ds4_prefill_tail_test PRIVATE
+    GUFO_DS4_BOUNDARY_PROMPT="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/indexer-boundary-prompt.txt")
+  target_link_libraries(ds4_prefill_tail_test PRIVATE gufo_deepseek_v4_flash_hip hip::host)
+  add_test(NAME ds4.prefill_tail COMMAND ds4_prefill_tail_test)
+  set_tests_properties(ds4.prefill_tail PROPERTIES
+    LABELS "gpu;hip;gfx1151;ds4;quality;external-model;slow"
+    RESOURCE_LOCK ds4_model
+    SKIP_RETURN_CODE 77)
+
   add_executable(ds4_continuation_adapter_test continuation_adapter_test.cpp)
   target_link_libraries(ds4_continuation_adapter_test PRIVATE
     gufo_deepseek_v4_flash_hip gufo_cache_hip hip::host)
