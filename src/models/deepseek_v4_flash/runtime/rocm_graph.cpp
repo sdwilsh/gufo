@@ -7405,6 +7405,14 @@ bool ds4_rocm_graph_dspark_inject(ds4_rocm_graph *graph,
     return ok;
 }
 
+bool ds4_rocm_graph_dspark_inject_verified(ds4_rocm_graph* graph, uint32_t pos0,
+                                           uint32_t n_rows) {
+  ds4_gpu_set_small_batch_mode(1);
+  const bool ok = ds4_rocm_graph_dspark_inject(graph, pos0, n_rows);
+  ds4_gpu_set_small_batch_mode(0);
+  return ok;
+}
+
 uint32_t ds4_rocm_graph_dspark_context_len(const ds4_rocm_graph *graph) {
     return graph ? graph->dspark_context_len : 0u;
 }

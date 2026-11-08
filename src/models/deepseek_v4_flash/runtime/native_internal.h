@@ -214,6 +214,8 @@ uint32_t ds4_rocm_graph_dspark_batch_capture_rows(const ds4_rocm_graph *graph,
 bool ds4_rocm_graph_dspark_inject(ds4_rocm_graph *graph,
                                   uint32_t pos0,
                                   uint32_t n_rows);
+bool ds4_rocm_graph_dspark_inject_verified(ds4_rocm_graph* graph, uint32_t pos0,
+                                           uint32_t n_rows);
 uint32_t ds4_rocm_graph_dspark_context_len(const ds4_rocm_graph *graph);
 void ds4_rocm_graph_dspark_truncate_context(ds4_rocm_graph* graph,
                                             uint32_t length);

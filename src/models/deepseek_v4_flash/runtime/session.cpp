@@ -177,6 +177,26 @@ static bool session_commit_and_extend(ds4_session *session, int token) {
     return true;
 }
 
+static bool session_verify_known_suffix(ds4_session* session,
+                                        const ds4_tokens* prompt,
+                                        uint32_t count) {
+  const auto start = static_cast<uint32_t>(session->checkpoint.len);
+  std::array<int32_t, DS4_SPEC_SESSION_MAX_ROWS> row_tops{};
+  session_before_write(session, start, start + count);
+  if (!ds4_rocm_graph_verify_suffix(session->graph, session->engine, prompt,
+                                    start, count, row_tops.data()) ||
+      !ds4_rocm_graph_read_spec_logits_row(session->graph, count - 1u,
+                                           session->logits.get())) {
+    return false;
+  }
+  ds4_tokens_copy(&session->checkpoint, prompt);
+  if (ds4_rocm_graph_dspark_block_size(session->graph) != 0 &&
+      ds4_rocm_graph_dspark_capture_ready(session->graph)) {
+    return ds4_rocm_graph_dspark_inject_verified(session->graph, start, count);
+  }
+  return true;
+}
+
 static bool sessions_commit_and_extend_batch(
     const ds4_session_dspark_batch_item* items,
     const std::array<int, 8>& tokens, size_t item_count) {
@@ -331,6 +351,21 @@ int ds4_session_sync(ds4_session *session,
         }
         ds4_tokens_copy(&session->checkpoint, prompt);
         session->checkpoint_valid = true;
+        return 0;
+      }
+      if (suffix >= 2 && (uint32_t)suffix <= DS4_SPEC_SESSION_MAX_ROWS &&
+          ds4_rocm_graph_spec_prepare(session->graph, session->engine,
+                                      (uint32_t)suffix)) {
+        if (session_cancelled(session)) {
+          set_error(error, error_capacity, "prefill cancelled");
+          return DS4_SESSION_SYNC_INTERRUPTED;
+        }
+        if (!session_verify_known_suffix(session, prompt, (uint32_t)suffix)) {
+          set_error(error, error_capacity,
+                    "ROCm verification pass failed while extending checkpoint");
+          session->checkpoint_valid = false;
+          return 1;
+        }
         return 0;
       }
 
