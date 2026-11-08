@@ -106,6 +106,25 @@ divergence `KL(p_seq || p_batched)` from the sequential to the batched token
 distribution, together with the maximum error over the 64 highest sequential
 logits. That check is future work.
 
+## Prompt tail
+
+The HTTP runner prefills a chat prompt to its stable frontier, captures that
+state, and then syncs the last two or three framing tokens. Those tokens run
+as one verification pass, the batched path that DSpark uses.
+`ds4.prefill_tail` checks that this pass leaves the same state as one-token
+decodes. It runs AR and DSpark sessions at about 2K, 32K and 131K tokens, with
+tails of two and three tokens. It compares the frontier logits and the session
+snapshot byte for byte, then 128 greedy steps, and names each snapshot section
+that differs.
+
+Two checks show that the comparison can fail. The test adds 1 to the row that
+the last prompt token wrote into a ratio-128 compressor state. The tail logits
+do not read that row, so the test fails unless it reports a state difference
+and a greedy divergence (`state_fault=separates`). A four-token suffix runs as
+a resumed prefill, which differs from one-token decodes, so the test prints it
+as a control. `control=blind` means that the comparison did not detect that
+different pass.
+
 ## Reproduce
 
 Use the smallest affected [maintained suite](../../../../tools/ds4/README.md):
